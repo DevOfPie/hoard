@@ -125,6 +125,9 @@ impl Daemon {
         let slots = engine::slot_status(&self.engine).await;
         if engine_status.running {
             engine_status.watched = slots.len();
+            // The open questions too: the HUD reads them from here, since it
+            // was not there when `WorldClaimWanted` went out.
+            engine_status.prompts = engine::prompt_status(&self.engine).await;
         }
         DaemonStatus {
             daemon_version: self.version.clone(),

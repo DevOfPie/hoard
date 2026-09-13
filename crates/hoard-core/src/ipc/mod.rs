@@ -787,6 +787,31 @@ pub struct EngineStatus {
     /// which is what it showed before this field existed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub keyring: Option<KeyringFault>,
+    /// The claim prompts still waiting for an answer, one per game
+    /// ([`events::AgentEvent::WorldClaimWanted`] as state rather than as an
+    /// event). A surface that reads the status instead of listening (the
+    /// desktop's HUD, born after the event went out) draws the prompt from
+    /// here. Empty is not serialised, so an older client keeps parsing.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub prompts: Vec<WorldPrompt>,
+}
+
+/// One claim prompt the engine is still waiting on: the game started, it has
+/// shared worlds here, and nothing says which one this machine plays. It
+/// leaves the status on the answer (`ClaimWorld`, `DismissWorld`), on the
+/// engine hosting by itself, or on the game closing.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorldPrompt {
+    pub game_slug: String,
+    /// The worlds still unanswered, in the same shape the event offered.
+    pub worlds: Vec<WorldChoice>,
+    /// When the engine will host on its own if nobody answers. Only set while
+    /// the clock is armed: exactly one world of the game, its lease free.
+    #[serde(default, with = "time::serde::rfc3339::option")]
+    pub auto_host_at: Option<OffsetDateTime>,
+    /// When the prompt went out.
+    #[serde(with = "time::serde::rfc3339")]
+    pub raised_at: OffsetDateTime,
 }
 
 /// Why there is no engine, classified at source.
@@ -1037,6 +1062,48 @@ mod tests {
         })
         .unwrap();
         assert_eq!(writing["type"], "view_session_writing");
+    }
+
+    /// The pending prompts ride on the engine status. Empty ones are left out
+    /// of the JSON and a status without the field still parses, so a client
+    /// and a daemon of different ages keep talking (C.6, append only).
+    #[test]
+    fn the_engine_status_carries_its_pending_prompts() {
+        let status: EngineStatus = serde_json::from_str(r#"{"running":true}"#).unwrap();
+        assert!(status.prompts.is_empty());
+        let json = serde_json::to_value(&status).unwrap();
+        assert!(json.get("prompts").is_none());
+
+        let raised = OffsetDateTime::from_unix_timestamp(1_760_000_000).unwrap();
+        let status = EngineStatus {
+            running: true,
+            prompts: vec![WorldPrompt {
+                game_slug: "valheim".into(),
+                worlds: vec![WorldChoice {
+                    save_id: "s1".into(),
+                    label: "Midgard".into(),
+                    group_name: "friends".into(),
+                    holder: None,
+                    lease: WorldLease::Free,
+                }],
+                auto_host_at: Some(raised + time::Duration::seconds(60)),
+                raised_at: raised,
+            }],
+            ..EngineStatus::default()
+        };
+        let json = serde_json::to_value(&status).unwrap();
+        assert_eq!(json["prompts"][0]["game_slug"], "valheim");
+        assert_eq!(json["prompts"][0]["worlds"][0]["lease"], "free");
+        assert_eq!(json["prompts"][0]["raised_at"], "2025-10-09T08:53:20Z");
+        assert_eq!(json["prompts"][0]["auto_host_at"], "2025-10-09T08:54:20Z");
+        let back: EngineStatus = serde_json::from_value(json).unwrap();
+        assert_eq!(back.prompts, status.prompts);
+        // The clock is optional on the way in: two worlds arm none.
+        let back: EngineStatus = serde_json::from_str(
+            r#"{"running":true,"prompts":[{"game_slug":"valheim","worlds":[],"raised_at":"2025-10-09T08:53:20Z"}]}"#,
+        )
+        .unwrap();
+        assert!(back.prompts[0].auto_host_at.is_none());
     }
 
     /// The goodbye carries its reason, so the client can show it ("`hoard sync

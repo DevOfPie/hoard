@@ -234,6 +234,7 @@ pub fn run() {
             commands::overlay::overlay_set_visible,
             commands::overlay::overlay_is_visible,
             commands::misc::open_external,
+            commands::misc::open_folder,
             commands::misc::ui_log,
             commands::covers::cover_bytes,
             commands::covers::steam_app_id_for_slug,

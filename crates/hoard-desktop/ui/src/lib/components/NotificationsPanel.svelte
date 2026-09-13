@@ -28,7 +28,27 @@
     clearNotifications,
     renderMarkdown,
     type AppNotification,
+    type NotificationOp,
   } from "../stores/notifications";
+  import * as api from "../api";
+  import { showError } from "../stores/error_dialog";
+
+  /** An in-app button: the verb goes to the service, the entry stays until
+   *  the user dismisses it (the outcome arrives as its own event). */
+  async function run(op: NotificationOp): Promise<void> {
+    try {
+      switch (op.kind) {
+        case "claim_world":
+          await api.claimWorld(op.save_id, op.role);
+          break;
+        case "open_folder":
+          await api.openFolder(op.path);
+          break;
+      }
+    } catch (e) {
+      showError(e);
+    }
+  }
 
   function relativeTime(at: number): string {
     const seconds = Math.round((Date.now() - at) / 1000);
@@ -178,19 +198,29 @@
             {#if n.actions?.length}
               <div class="mt-2 flex flex-wrap gap-2">
                 {#each n.actions as action (action.url)}
-                  <a
-                    href={action.url}
-                    target="_blank"
-                    rel="noopener noreferrer"
-                    class={actionClass(action.icon)}
-                  >
-                    {#if action.icon === "star"}
-                      <Star size={12} class="shrink-0 fill-current text-amber-400" />
-                    {:else if action.icon === "heart"}
-                      <Heart size={12} class="shrink-0 fill-current" />
-                    {/if}
-                    {action.label}
-                  </a>
+                  {#if action.op}
+                    <button
+                      type="button"
+                      onclick={() => void run(action.op!)}
+                      class={actionClass(action.icon)}
+                    >
+                      {action.label}
+                    </button>
+                  {:else}
+                    <a
+                      href={action.url}
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      class={actionClass(action.icon)}
+                    >
+                      {#if action.icon === "star"}
+                        <Star size={12} class="shrink-0 fill-current text-amber-400" />
+                      {:else if action.icon === "heart"}
+                        <Heart size={12} class="shrink-0 fill-current" />
+                      {/if}
+                      {action.label}
+                    </a>
+                  {/if}
                 {/each}
               </div>
             {/if}

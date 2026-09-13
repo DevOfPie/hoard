@@ -226,6 +226,14 @@ async function ensureNotificationPermission() {
  *  was closed. */
 let replaying = false;
 
+/** Whether the journal is being replayed right now. The world stores ask
+ *  before raising anything from an event: a claim prompt or a hold that
+ *  happened while the app was closed is history, and the engine's status
+ *  says whether it is still open. */
+export function isReplaying(): boolean {
+  return replaying;
+}
+
 function notify(title: string, body: string) {
   if (replaying) return;
   // The service notifies by itself where it can (Linux today; ADR 0021 D.14.1).

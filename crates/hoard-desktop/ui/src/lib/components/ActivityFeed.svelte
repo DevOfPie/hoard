@@ -32,6 +32,7 @@
     AlertTriangle,
     Lock,
     LockOpen,
+    Radio,
     X,
   } from "@lucide/svelte";
 
@@ -71,6 +72,8 @@
     storage_grace: Clock,
     gate_locked: Lock,
     gate_unlocked: LockOpen,
+    world_claimed: Radio,
+    world_released: Radio,
   } as const;
 
   const TINTS = {
@@ -101,6 +104,8 @@
     storage_grace: "text-sky-300",
     gate_locked: "text-red-400",
     gate_unlocked: "text-emerald-400",
+    world_claimed: "text-emerald-300",
+    world_released: "text-zinc-400",
   } as const;
 
   // Alert rows get a tinted "card" so plan-limit / storage-pressure events

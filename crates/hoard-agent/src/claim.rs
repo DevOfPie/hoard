@@ -21,7 +21,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-use hoard_core::ipc::{AgentEvent, WorldChoice, WorldLease, WorldRole};
+use hoard_core::ipc::{AgentEvent, WorldChoice, WorldLease, WorldPrompt, WorldRole};
 use hoard_core::kernel::fileclass::Scope;
 use hoard_core::kernel::LeaseObs;
 use time::OffsetDateTime;
@@ -40,6 +40,9 @@ pub const AUTO_HOST_DELAY_SECS: u64 = 60;
 #[derive(Debug, Clone)]
 pub(crate) struct WorldSession {
     pub started_at: Instant,
+    /// `started_at` on the wall clock, for the status: an `Instant` means
+    /// nothing outside this process.
+    pub raised_at: OffsetDateTime,
     /// The prompt for this game went out with this slot in it.
     pub prompted: bool,
     /// "Not playing": no auto-host, no second prompt. Evidence still claims.
@@ -66,6 +69,7 @@ impl WorldSession {
     fn new(started_at: Instant) -> Self {
         Self {
             started_at,
+            raised_at: OffsetDateTime::now_utc(),
             prompted: false,
             dismissed: false,
             claimed: false,
@@ -85,7 +89,7 @@ impl WorldSession {
     }
 }
 
-fn lease_for_prompt(obs: LeaseObs) -> WorldLease {
+pub(crate) fn lease_for_prompt(obs: LeaseObs) -> WorldLease {
     match obs {
         LeaseObs::Unknown => WorldLease::Unknown,
         LeaseObs::Free => WorldLease::Free,
@@ -195,6 +199,70 @@ pub(crate) fn on_dismiss(slot: &mut SaveSlot) {
         session.dismissed = true;
         session.auto_host_deadline = None;
     }
+}
+
+/// A role taken on `save_id` answers the game's prompt for its other worlds
+/// too: choosing one is "not playing" the rest, and the prompt leaves the
+/// status whole instead of lingering with the leftovers. Evidence still
+/// claims a dismissed world, as always.
+pub(crate) fn dismiss_siblings(slots: &mut HashMap<String, SaveSlot>, save_id: &str) {
+    let Some(game_slug) = slots.get(save_id).map(|s| s.save.game_slug.clone()) else {
+        return;
+    };
+    for slot in slots.values_mut() {
+        if slot.save.save_id == save_id || slot.save.game_slug != game_slug {
+            continue;
+        }
+        if let Some(session) = slot.session.as_mut() {
+            if session.live() && session.prompted && !session.claimed && !session.dismissed {
+                session.dismissed = true;
+                session.auto_host_deadline = None;
+            }
+        }
+    }
+}
+
+/// The prompts still waiting for an answer, one per game, for the status.
+/// A world is in it while its session is live, was prompted, and nobody
+/// answered for it: the answer, the clock, a write or GameStopped all take it
+/// out. `auto_host_at` is the clock on the wall, from the one slot that has
+/// it armed.
+pub(crate) fn pending_prompts(slots: &HashMap<String, SaveSlot>, now: Instant) -> Vec<WorldPrompt> {
+    let wall = OffsetDateTime::now_utc();
+    let mut by_game: HashMap<String, WorldPrompt> = HashMap::new();
+    let mut ids: Vec<&String> = slots.keys().collect();
+    ids.sort();
+    for id in ids {
+        let slot = &slots[id];
+        let Some(session) = slot.session.as_ref() else {
+            continue;
+        };
+        if !session.live() || !session.prompted || session.claimed || session.dismissed {
+            continue;
+        }
+        let prompt = by_game
+            .entry(slot.save.game_slug.clone())
+            .or_insert_with(|| WorldPrompt {
+                game_slug: slot.save.game_slug.clone(),
+                worlds: Vec::new(),
+                auto_host_at: None,
+                raised_at: session.raised_at,
+            });
+        prompt.raised_at = prompt.raised_at.min(session.raised_at);
+        if let Some(deadline) = session.auto_host_deadline {
+            prompt.auto_host_at = Some(wall + deadline.saturating_duration_since(now));
+        }
+        prompt.worlds.push(WorldChoice {
+            save_id: slot.save.save_id.clone(),
+            label: slot.save.label.clone(),
+            group_name: slot.save.group_name.clone().unwrap_or_default(),
+            holder: slot.lease_holder.clone(),
+            lease: lease_for_prompt(slot.lease),
+        });
+    }
+    let mut out: Vec<WorldPrompt> = by_game.into_values().collect();
+    out.sort_by(|a, b| a.game_slug.cmp(&b.game_slug));
+    out
 }
 
 /// A write landed on the folder during a session: evidence. A host with no
@@ -519,6 +587,58 @@ mod tests {
             .unwrap()
             .auto_host_deadline
             .is_none());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_prompted_session_is_in_the_status_until_it_is_answered() {
+        let (tx, _rx) = mpsc::channel(8);
+        let mut s = slots(vec![
+            world("w1", "valheim"),
+            world("w2", "valheim"),
+            world("f1", "factorio"),
+        ]);
+        s.get_mut("w1").unwrap().lease = LeaseObs::Free;
+        s.get_mut("w2").unwrap().lease = LeaseObs::Other;
+        s.get_mut("w2").unwrap().lease_holder = Some("bob".into());
+        let now = Instant::now();
+        assert!(pending_prompts(&s, now).is_empty());
+
+        on_game_started(&mut s, "w1", now, &tx);
+        let prompts = pending_prompts(&s, now);
+        assert_eq!(prompts.len(), 1, "{prompts:?}");
+        assert_eq!(prompts[0].game_slug, "valheim");
+        assert_eq!(prompts[0].worlds.len(), 2);
+        assert_eq!(prompts[0].worlds[1].holder.as_deref(), Some("bob"));
+        assert_eq!(prompts[0].worlds[1].lease, WorldLease::Other);
+        // Two worlds: no clock, so no deadline on the wire.
+        assert!(prompts[0].auto_host_at.is_none());
+
+        // Hosting one world answers for the game: the other is "not playing".
+        on_claim(s.get_mut("w1").unwrap());
+        dismiss_siblings(&mut s, "w1");
+        assert!(pending_prompts(&s, now).is_empty());
+        assert!(s["w2"].session.as_ref().unwrap().dismissed);
+
+        // One free world of another game: the clock is armed and it is on the
+        // wall, sixty seconds out.
+        s.get_mut("f1").unwrap().lease = LeaseObs::Free;
+        on_game_started(&mut s, "f1", now, &tx);
+        let prompts = pending_prompts(&s, now);
+        assert_eq!(prompts.len(), 1);
+        assert_eq!(prompts[0].game_slug, "factorio");
+        let at = prompts[0].auto_host_at.expect("the clock is armed");
+        let secs = (at - OffsetDateTime::now_utc()).whole_seconds();
+        assert!((58..=60).contains(&secs), "{secs}");
+        assert!(prompts[0].raised_at <= OffsetDateTime::now_utc());
+
+        // "Not playing" takes it out too, and so does the game closing.
+        on_dismiss(s.get_mut("f1").unwrap());
+        assert!(pending_prompts(&s, now).is_empty());
+        let mut again = slots(vec![world("g1", "grounded")]);
+        on_game_started(&mut again, "g1", now, &tx);
+        assert_eq!(pending_prompts(&again, now).len(), 1);
+        on_game_stopped(again.get_mut("g1").unwrap());
+        assert!(pending_prompts(&again, now).is_empty());
     }
 
     #[tokio::test(start_paused = true)]

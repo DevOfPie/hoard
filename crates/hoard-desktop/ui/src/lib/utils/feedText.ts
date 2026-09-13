@@ -164,5 +164,14 @@ export function feedSummary(e: FeedEntry, $_: Translate): string {
           reason: $_(e.reason_key ?? "activity.gate_reason_pro"),
         },
       });
+    case "world_claimed": {
+      const text =
+        e.role === "view"
+          ? $_("activity.world_viewing", { values: { name } })
+          : $_("activity.world_hosting", { values: { name } });
+      return e.auto ? $_("activity.world_engine_choice", { values: { text } }) : text;
+    }
+    case "world_released":
+      return $_("activity.world_released", { values: { name } });
   }
 }
