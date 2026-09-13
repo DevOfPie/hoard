@@ -259,6 +259,18 @@ export type TrackedSave = {
    *  `.cfg`, settings) instead of skipping them. `null` = undecided: they are
    *  not written and the restore dialog keeps asking each time. */
   allow_device_local: boolean | null;
+  /** The group this save is shared into, from the server's row. Absent when
+   *  not shared. Set together with `orphan` it is another member's world this
+   *  machine has not adopted yet: offer adopt, not "no local state". */
+  shared?: SharedRef;
+};
+
+/** Where a shared save lives: the group and its owner. */
+export type SharedRef = {
+  group_id: string;
+  group_name: string;
+  owner_user_id: string;
+  owner_username: string;
 };
 
 /** Run a full auto-detection sweep. Subscribe to `library://scan-progress`

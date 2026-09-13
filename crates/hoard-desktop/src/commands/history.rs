@@ -114,13 +114,17 @@ pub async fn list_save_snapshots(
 /// The preview and the restore compute it the same way, so the dialog does not
 /// promise one thing and the button do another.
 fn restore_gate(save_id: &str, allow_config: bool) -> hoard_core::kernel::fileclass::RestoreGate {
-    let shields = CliState::load_default()
+    let row = CliState::load_default()
         .ok()
-        .and_then(|(st, _)| st.saves.get(save_id).map(|s| s.game_slug.clone()))
-        .map(|slug| hoard_agent::savefilter::shields_for_slug(&slug))
+        .and_then(|(st, _)| st.saves.get(save_id).cloned());
+    let shields = row
+        .as_ref()
+        .map(|s| hoard_agent::savefilter::shields_for_slug(&s.game_slug))
         .unwrap_or_default();
     hoard_core::kernel::fileclass::RestoreGate {
         shields,
+        // A shared save writes only its world's files, the list its backup walks.
+        include: row.map(|s| s.include).unwrap_or_default(),
         allow_device_local: allow_config,
     }
 }
@@ -417,6 +421,12 @@ pub async fn restore_snapshot(
             .map(|s| (s.game_slug.clone(), s.label.clone()))
             .unwrap_or_default(),
     };
+    // The safety copy walks what the save consists of, like every other backup.
+    let include = cli_state
+        .saves
+        .get(&save_id)
+        .map(|s| s.include.clone())
+        .unwrap_or_default();
 
     // 1) Optional pre-restore backup. Done synchronously so the user can be
     //    sure the safety net exists before we start overwriting files.
@@ -436,6 +446,7 @@ pub async fn restore_snapshot(
                 &client,
                 &save_id,
                 &game_slug,
+                &include,
                 &label,
                 &local_path,
                 // Pre-restore safety backup is an explicit user action; don't
@@ -489,8 +500,11 @@ pub async fn restore_snapshot(
             // The shields go by game, and `restore_gate` reads the game from the
             // row, which a save new to this machine does not have yet.
             gate: match &home {
+                // New to this machine, so not shared here yet either: the
+                // include list arrives with the row at adopt.
                 Some(home) => hoard_core::kernel::fileclass::RestoreGate {
                     shields: hoard_agent::savefilter::shields_for_slug(&home.game_slug),
+                    include: Vec::new(),
                     allow_device_local: allow_config,
                 },
                 None => restore_gate(&save_id, allow_config),

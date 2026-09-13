@@ -64,10 +64,17 @@ pub async fn run(save_id: String, source: Option<PathBuf>, remember: bool) -> Re
         .get(&save_id)
         .map(|s| s.label.clone())
         .unwrap_or_default();
+    // A shared save's include list: the same walk the service does.
+    let include = state
+        .saves
+        .get(&save_id)
+        .map(|s| s.include.clone())
+        .unwrap_or_default();
     let result = upload_directory_checked(
         &client,
         &save_id,
         &game_slug,
+        &include,
         &label,
         &source,
         prev_sig.as_deref(),

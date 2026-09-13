@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "INSERT INTO shared_saves (save_id, group_id, include_json) VALUES (?, ?, ?)",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 3
+    },
+    "nullable": []
+  },
+  "hash": "7bf27b40ed764eadc8e6ee31f7dee379989aee89a5342463496f928eab3402ce"
+}

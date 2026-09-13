@@ -1,6 +1,6 @@
 {
   "db_name": "SQLite",
-  "query": "SELECT s.id, s.game_slug, s.label, s.local_path_hint, s.client_os,\n                      s.latest_version_num, s.created_at, s.updated_at,\n                      COALESCE(COUNT(sn.id), 0) as \"snapshot_count: i64\",\n                      COALESCE(SUM(sn.total_size_bytes), 0) as \"total_size_bytes: i64\",\n                      ss.group_id as \"group_id?\", g.name as \"group_name?\",\n                      g.owner_user_id as \"group_owner_id?\", u.username as \"group_owner_name?\"\n               FROM saves s\n               LEFT JOIN shared_saves ss ON ss.save_id = s.id\n               LEFT JOIN groups g ON g.id = ss.group_id\n               LEFT JOIN users u ON u.id = g.owner_user_id\n               LEFT JOIN group_members gm ON gm.group_id = ss.group_id AND gm.user_id = ?\n               LEFT JOIN snapshots sn ON sn.save_id = s.id AND sn.deleted_at IS NULL\n               WHERE s.user_id = ? OR gm.user_id IS NOT NULL\n               GROUP BY s.id ORDER BY s.created_at",
+  "query": "SELECT s.id, s.game_slug, s.label, s.local_path_hint, s.client_os,\n                  s.latest_version_num, s.created_at, s.updated_at,\n                  COALESCE(COUNT(sn.id), 0) as \"snapshot_count: i64\",\n                  COALESCE(SUM(sn.total_size_bytes), 0) as \"total_size_bytes: i64\",\n                  ss.group_id as \"group_id?\", g.name as \"group_name?\",\n                  g.owner_user_id as \"group_owner_id?\", u.username as \"group_owner_name?\",\n                  ss.include_json as \"include_json?\"\n           FROM saves s\n           LEFT JOIN shared_saves ss ON ss.save_id = s.id\n           LEFT JOIN groups g ON g.id = ss.group_id\n           LEFT JOIN users u ON u.id = g.owner_user_id\n           LEFT JOIN group_members gm ON gm.group_id = ss.group_id AND gm.user_id = ?\n           LEFT JOIN snapshots sn ON sn.save_id = s.id AND sn.deleted_at IS NULL\n           WHERE s.id = ? AND (s.user_id = ? OR gm.user_id IS NOT NULL)\n           GROUP BY s.id",
   "describe": {
     "columns": [
       {
@@ -46,12 +46,12 @@
       {
         "name": "snapshot_count: i64",
         "ordinal": 8,
-        "type_info": "Integer"
+        "type_info": "Null"
       },
       {
         "name": "total_size_bytes: i64",
         "ordinal": 9,
-        "type_info": "Integer"
+        "type_info": "Null"
       },
       {
         "name": "group_id?",
@@ -72,10 +72,15 @@
         "name": "group_owner_name?",
         "ordinal": 13,
         "type_info": "Text"
+      },
+      {
+        "name": "include_json?",
+        "ordinal": 14,
+        "type_info": "Text"
       }
     ],
     "parameters": {
-      "Right": 2
+      "Right": 3
     },
     "nullable": [
       false,
@@ -86,13 +91,14 @@
       false,
       false,
       false,
+      null,
+      null,
       false,
       false,
       false,
-      true,
-      true,
+      false,
       true
     ]
   },
-  "hash": "638a10656efc62f6ba65d94f48556d67660daff8b200ce79f1577f0f610e8956"
+  "hash": "013b7938abc82dc14445ae8d1df742f16b1e6a4277727a1ae894bb2bb59acfa2"
 }

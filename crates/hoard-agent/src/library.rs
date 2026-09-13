@@ -20,7 +20,7 @@ use crate::detection::{Confidence, DetectedGame, DetectionReport};
 use crate::junkdirs;
 use crate::manifest::Os;
 use crate::presets::{self, SavePolicy};
-use crate::state::{CliState, SaveState};
+use crate::state::{CliState, SaveState, SharedRef};
 use crate::{launchers, playtime_catalog, steam};
 
 // ---- tipos de wire compartidos ---------------------------------------------
@@ -82,6 +82,11 @@ pub struct TrackedSave {
     /// [`crate::state::SaveState::allow_device_local`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub allow_device_local: Option<bool>,
+    /// The group this save is shared into, from the server's row. A row with
+    /// `shared` set and an empty `local_path` is another member's world this
+    /// machine has not adopted yet: the UI offers adopt, never "lost state".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shared: Option<SharedRef>,
 }
 
 /// Args para [`add_to_tracking`].
@@ -574,6 +579,7 @@ fn playtime_watched_save(slug: &str, install_dir: Option<PathBuf>) -> WatchedSav
         set_hash: None,
         track_only: true,
         shared: false,
+        include: Vec::new(),
     }
 }
 
@@ -729,6 +735,7 @@ pub fn watched_saves_from_state(
             set_hash: s.set_hash.clone(),
             track_only: false,
             shared: s.shared.is_some(),
+            include: s.include.clone(),
         });
     }
     out.extend(playtime_saves);
@@ -748,6 +755,8 @@ pub fn watched_save_from(
     processes_override: Vec<String>,
     shared_processes: bool,
     allow_device_local: Option<bool>,
+    shared: bool,
+    include: Vec<String>,
 ) -> WatchedSave {
     let steam_apps = steam::list_installed_steam_games(Os::current()).unwrap_or_default();
     let steam_install_dir = steam_apps
@@ -774,7 +783,8 @@ pub fn watched_save_from(
         known_version: None,
         set_hash: None,
         track_only: false,
-        shared: false,
+        shared,
+        include,
     }
 }
 
@@ -1230,6 +1240,7 @@ pub async fn add_to_tracking(client: &ApiClient, args: AddGameArgs) -> Result<Tr
                 shared_processes: args.shared_processes,
                 allow_device_local: None,
                 shared: None,
+                include: Vec::new(),
             },
         );
         cli_state.save(&path)?;
@@ -1244,6 +1255,8 @@ pub async fn add_to_tracking(client: &ApiClient, args: AddGameArgs) -> Result<Tr
             pinned_processes.clone(),
             args.shared_processes,
             None,
+            false,
+            Vec::new(),
         );
         return Ok(TrackOutcome {
             tracked: TrackedSave {
@@ -1262,6 +1275,7 @@ pub async fn add_to_tracking(client: &ApiClient, args: AddGameArgs) -> Result<Tr
                 local_size_bytes: None,
                 preset: preset_name,
                 allow_device_local: None,
+                shared: None,
             },
             watched,
         });
@@ -1330,6 +1344,7 @@ pub async fn add_to_tracking(client: &ApiClient, args: AddGameArgs) -> Result<Tr
             shared_processes: args.shared_processes,
             allow_device_local: None,
             shared: None,
+            include: Vec::new(),
         },
     );
     cli_state.save(&path)?;
@@ -1344,6 +1359,8 @@ pub async fn add_to_tracking(client: &ApiClient, args: AddGameArgs) -> Result<Tr
         pinned_processes.clone(),
         args.shared_processes,
         None,
+        false,
+        Vec::new(),
     );
 
     Ok(TrackOutcome {
@@ -1366,6 +1383,7 @@ pub async fn add_to_tracking(client: &ApiClient, args: AddGameArgs) -> Result<Tr
             local_size_bytes: None,
             preset: preset_name,
             allow_device_local: None,
+            shared: None,
         },
         watched,
     })
@@ -1379,9 +1397,29 @@ pub async fn adopt(client: &ApiClient, args: AdoptArgs) -> Result<TrackOutcome> 
     // Same door, same guard: adopting a cloud row is still how a bad slug
     // enters this machine's state.
     reject_degenerate_slug(&args.game_slug)?;
-    // The session has to exist (the caller already built `client`); there is no
-    // server call here, since the cloud row already exists.
-    let _ = client;
+    // The row already exists on the server; what is read back is whether it is
+    // shared and, if so, of what it consists, so the first walk of the folder
+    // already takes the world's files and nothing else. Cloud has no groups.
+    // Best-effort: a server that cannot be reached right now still lets the
+    // folder be adopted, and `reconcile_with_server` fills the pair in at the
+    // engine's next start.
+    let (shared, include) = if client.is_cloud().await {
+        (None, Vec::new())
+    } else {
+        match client.get_save(&args.save_id).await {
+            Ok(row) => (
+                row.shared.as_ref().map(shared_ref_from),
+                row.shared.map(|s| s.include).unwrap_or_default(),
+            ),
+            Err(e) => {
+                tracing::warn!(
+                    save_id = %args.save_id, error = %format!("{e:#}"),
+                    "adopt: couldn't read the server's row; sharing is settled at reconcile"
+                );
+                (None, Vec::new())
+            }
+        }
+    };
     let local_path = PathBuf::from(&args.local_path);
     // Adopting is repointing a save that already exists in the cloud: overlapping
     // with itself is not a "one folder, one game" conflict.
@@ -1435,7 +1473,8 @@ pub async fn adopt(client: &ApiClient, args: AdoptArgs) -> Result<TrackOutcome> 
             processes: Vec::new(),
             shared_processes: false,
             allow_device_local: None,
-            shared: None,
+            shared: shared.clone(),
+            include: include.clone(),
         },
     );
     cli_state.save(&path)?;
@@ -1450,6 +1489,8 @@ pub async fn adopt(client: &ApiClient, args: AdoptArgs) -> Result<TrackOutcome> 
         Vec::new(),
         false,
         None,
+        shared.is_some(),
+        include,
     );
 
     Ok(TrackOutcome {
@@ -1469,6 +1510,7 @@ pub async fn adopt(client: &ApiClient, args: AdoptArgs) -> Result<TrackOutcome> 
             local_size_bytes: None,
             preset,
             allow_device_local: None,
+            shared,
         },
         watched,
     })
@@ -1803,11 +1845,14 @@ pub struct Reconciliation {
     pub relinked: usize,
     /// Filas tiradas: el servidor no sabe nada de ese juego.
     pub dropped: usize,
+    /// Rows whose `shared` or `include` the server changed (a share, an
+    /// unshare, a new include list).
+    pub reshared: usize,
 }
 
 impl Reconciliation {
     pub fn changed(&self) -> bool {
-        self.relinked > 0 || self.dropped > 0
+        self.relinked > 0 || self.dropped > 0 || self.reshared > 0
     }
 }
 
@@ -1844,7 +1889,10 @@ pub async fn reconcile_with_server(client: &ApiClient) -> Result<Reconciliation>
         })
         .collect();
 
-    let mut out = Reconciliation::default();
+    let mut out = Reconciliation {
+        reshared: sync_shared_from_server(&mut state, &server),
+        ..Reconciliation::default()
+    };
     for (id, reissued) in reconcile_plan(&state, &rows) {
         let Some(row) = state.saves.get(&id).cloned() else {
             continue;
@@ -1994,6 +2042,7 @@ pub async fn list_tracked(client: &ApiClient) -> Result<(Vec<TrackedSave>, Vec<S
                 local_size_bytes: None,
                 preset: st.preset.clone(),
                 allow_device_local: st.allow_device_local,
+                shared: st.shared.clone(),
             });
         }
 
@@ -2020,6 +2069,7 @@ pub async fn list_tracked(client: &ApiClient) -> Result<(Vec<TrackedSave>, Vec<S
                 local_size_bytes: None,
                 preset: None,
                 allow_device_local: None,
+                shared: None,
             });
         }
         fill_local_sizes(&mut out);
@@ -2053,47 +2103,101 @@ pub async fn list_tracked(client: &ApiClient) -> Result<(Vec<TrackedSave>, Vec<S
         cli_state.save(&state_path)?;
         detached = pruned;
     }
-    let mut out = Vec::with_capacity(saves.len());
-    for s in saves {
-        match cli_state.saves.get(s.id.as_str()) {
-            Some(st) => out.push(TrackedSave {
-                save_id: s.id.into_inner(),
-                game_slug: s.game_slug.into_inner(),
-                name: slots::name_of(&s.label).map(str::to_string),
-                slot: slots::slot_of(&s.label),
-                label: s.label,
-                local_path: st.local_path.to_string_lossy().into_owned(),
-                cloud_version_num: s.latest_version_num,
-                local_version_num: st.last_version_num,
-                last_backup_at: format_optional_time(Some(s.updated_at)),
-                paused: st.paused,
-                total_size_bytes: s.total_size_bytes.unwrap_or(0),
-                orphan: false,
-                local_size_bytes: None,
-                preset: st.preset.clone(),
-                allow_device_local: st.allow_device_local,
-            }),
-            None => out.push(TrackedSave {
-                save_id: s.id.into_inner(),
-                game_slug: s.game_slug.into_inner(),
-                name: slots::name_of(&s.label).map(str::to_string),
-                slot: slots::slot_of(&s.label),
-                label: s.label,
-                local_path: String::new(),
-                cloud_version_num: s.latest_version_num,
-                local_version_num: None,
-                last_backup_at: format_optional_time(Some(s.updated_at)),
-                paused: false,
-                total_size_bytes: s.total_size_bytes.unwrap_or(0),
-                orphan: true,
-                local_size_bytes: None,
-                preset: None,
-                allow_device_local: None,
-            }),
-        }
-    }
+    let mut out: Vec<TrackedSave> = saves
+        .into_iter()
+        .map(|s| {
+            let st = cli_state.saves.get(s.id.as_str());
+            tracked_from_server_row(s, st)
+        })
+        .collect();
     fill_local_sizes(&mut out);
     Ok((out, detached))
+}
+
+/// One server row as the library draws it, enriched with this machine's row
+/// when it has one.
+///
+/// Without a local row the save is an orphan: the server has it, this machine
+/// does not. For a save shared into one of the caller's groups that is the
+/// normal state of every member who has not adopted it yet, so `shared` rides
+/// along and the UI reads the pair (`orphan`, `shared`) as "adopt this world"
+/// rather than "your state is gone". The row is never pruned: the server
+/// listed it, so [`rows_unknown_to_server`] counts it as known.
+fn tracked_from_server_row(s: hoard_core::wire::Save, st: Option<&SaveState>) -> TrackedSave {
+    let shared = s.shared.as_ref().map(shared_ref_from);
+    match st {
+        Some(st) => TrackedSave {
+            save_id: s.id.into_inner(),
+            game_slug: s.game_slug.into_inner(),
+            name: slots::name_of(&s.label).map(str::to_string),
+            slot: slots::slot_of(&s.label),
+            label: s.label,
+            local_path: st.local_path.to_string_lossy().into_owned(),
+            cloud_version_num: s.latest_version_num,
+            local_version_num: st.last_version_num,
+            last_backup_at: format_optional_time(Some(s.updated_at)),
+            paused: st.paused,
+            total_size_bytes: s.total_size_bytes.unwrap_or(0),
+            orphan: false,
+            local_size_bytes: None,
+            preset: st.preset.clone(),
+            allow_device_local: st.allow_device_local,
+            shared,
+        },
+        None => TrackedSave {
+            save_id: s.id.into_inner(),
+            game_slug: s.game_slug.into_inner(),
+            name: slots::name_of(&s.label).map(str::to_string),
+            slot: slots::slot_of(&s.label),
+            label: s.label,
+            local_path: String::new(),
+            cloud_version_num: s.latest_version_num,
+            local_version_num: None,
+            last_backup_at: format_optional_time(Some(s.updated_at)),
+            paused: false,
+            total_size_bytes: s.total_size_bytes.unwrap_or(0),
+            orphan: true,
+            local_size_bytes: None,
+            preset: None,
+            allow_device_local: None,
+            shared,
+        },
+    }
+}
+
+/// The on-disk twin of the server's [`hoard_core::wire::SharedInfo`].
+pub fn shared_ref_from(info: &hoard_core::wire::SharedInfo) -> SharedRef {
+    SharedRef {
+        group_id: info.group_id.clone(),
+        group_name: info.group_name.clone(),
+        owner_user_id: info.owner_user_id.clone(),
+        owner_username: info.owner_username.to_string(),
+    }
+}
+
+/// Copies `shared` and `include` from the server's rows onto the local rows
+/// that have them, and clears them where the server no longer shares. How a
+/// re-share, an unshare or a changed include list reaches a member's machine.
+/// Returns how many rows changed.
+fn sync_shared_from_server(state: &mut CliState, server: &[hoard_core::wire::Save]) -> usize {
+    let mut changed = 0;
+    for row in server {
+        let Some(st) = state.saves.get_mut(row.id.as_str()) else {
+            continue;
+        };
+        let shared = row.shared.as_ref().map(shared_ref_from);
+        let include = row
+            .shared
+            .as_ref()
+            .map(|s| s.include.clone())
+            .unwrap_or_default();
+        if st.shared != shared || st.include != include {
+            st.shared = shared;
+            st.include = include;
+            changed += 1;
+        }
+    }
+    changed
 }
 
 /// Renames a save's label on the server and in the local state. A 409 (another save
@@ -2180,35 +2284,20 @@ pub async fn rename_label(
     let updated = client.rename_save_label(save_id, trimmed).await?;
 
     let (mut cli_state, path) = CliState::load_default()?;
-    let (local_path_string, preset, processes, shared_processes, local_cursor, allow_device_local) =
-        if let Some(entry) = cli_state.saves.get_mut(save_id) {
-            entry.label = updated.label.clone();
-            (
-                entry.local_path.to_string_lossy().into_owned(),
-                entry.preset.clone(),
-                entry.processes.clone(),
-                entry.shared_processes,
-                entry.last_version_num,
-                entry.allow_device_local,
-            )
-        } else {
-            (String::new(), None, Vec::new(), false, None, None)
-        };
+    let entry = cli_state.saves.get_mut(save_id).map(|entry| {
+        entry.label = updated.label.clone();
+        entry.clone()
+    });
     cli_state.save(&path)?;
 
-    let watched = (!local_path_string.is_empty()).then(|| {
-        watched_save_from(
-            updated.id.to_string(),
-            updated.game_slug.to_string(),
-            updated.game_slug.to_string(),
-            updated.label.clone(),
-            PathBuf::from(&local_path_string),
-            preset.as_deref(),
-            processes,
-            shared_processes,
-            allow_device_local,
-        )
-    });
+    let local_path_string = entry
+        .as_ref()
+        .map(|e| e.local_path.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let watched = entry
+        .as_ref()
+        .filter(|_| !local_path_string.is_empty())
+        .map(|e| watched_from_snapshot(updated.id.to_string(), e));
 
     Ok((
         TrackedSave {
@@ -2219,14 +2308,15 @@ pub async fn rename_label(
             label: updated.label,
             local_path: local_path_string,
             cloud_version_num: updated.latest_version_num,
-            local_version_num: local_cursor,
+            local_version_num: entry.as_ref().and_then(|e| e.last_version_num),
             last_backup_at: None,
             paused: false,
             total_size_bytes: updated.total_size_bytes.unwrap_or(0),
             orphan: false,
             local_size_bytes: None,
-            preset,
-            allow_device_local,
+            preset: entry.as_ref().and_then(|e| e.preset.clone()),
+            allow_device_local: entry.as_ref().and_then(|e| e.allow_device_local),
+            shared: updated.shared.as_ref().map(shared_ref_from),
         },
         watched,
     ))
@@ -2361,6 +2451,8 @@ fn watched_from_snapshot(save_id: String, s: &SaveState) -> WatchedSave {
         s.processes.clone(),
         s.shared_processes,
         s.allow_device_local,
+        s.shared.is_some(),
+        s.include.clone(),
     )
 }
 
@@ -2539,6 +2631,82 @@ pub fn set_local_path(save_id: &str, new_path: &str) -> Result<LiveReseat> {
     })
 }
 
+/// Why a share could not even be asked for. Typed so the daemon can tell the
+/// client the request is wrong rather than that the server failed.
+#[derive(Debug, thiserror::Error)]
+pub enum ShareError {
+    #[error("`{0}` has no world layout Hoard knows; share the whole folder instead")]
+    NoTemplate(String),
+    #[error(transparent)]
+    BadWorld(#[from] crate::worldfiles::BadWorld),
+}
+
+/// The include list a share of a `game_slug` save carries: `world`'s files
+/// from the game's template, or everything when no world is named.
+pub fn include_for_share(game_slug: &str, world: Option<&str>) -> Result<Vec<String>, ShareError> {
+    match world {
+        None => Ok(Vec::new()),
+        Some(w) => crate::worldfiles::template(game_slug, w)?
+            .ok_or_else(|| ShareError::NoTemplate(game_slug.to_string())),
+    }
+}
+
+/// Shares `save_id` into `group_id`, naming `world` when the game shares by
+/// world (see [`crate::worldfiles`]). On success this machine's row takes the
+/// server's `shared` and `include`, and the `WatchedSave` to reseat comes back
+/// so the owner's next push already carries only the world's files. `None`
+/// when the save is not tracked here (the server row is still shared).
+pub async fn share_save(
+    client: &ApiClient,
+    save_id: &str,
+    group_id: &str,
+    world: Option<&str>,
+) -> Result<(hoard_core::wire::Save, Option<WatchedSave>)> {
+    let (mut state, path) = CliState::load_default()?;
+    let include = match world {
+        None => Vec::new(),
+        Some(w) => {
+            // The template goes by game, and the row is the cheapest place to
+            // read it; a save not tracked here still has a game on the server.
+            let slug = match state.saves.get(save_id) {
+                Some(st) => st.game_slug.clone(),
+                None => client.get_save(save_id).await?.game_slug.into_inner(),
+            };
+            include_for_share(&slug, Some(w))?
+        }
+    };
+    let save = client.share_save(save_id, group_id, &include).await?;
+    let watched = state.saves.get_mut(save_id).map(|st| {
+        st.shared = save.shared.as_ref().map(shared_ref_from);
+        st.include = save
+            .shared
+            .as_ref()
+            .map(|s| s.include.clone())
+            .unwrap_or_default();
+        watched_from_snapshot(save_id.to_string(), st)
+    });
+    if watched.is_some() {
+        state.save(&path)?;
+    }
+    Ok((save, watched))
+}
+
+/// Moves `save_id` back to its owner and clears `shared` and `include` on this
+/// machine's row. The `WatchedSave` to reseat, when the save is tracked here.
+pub async fn unshare_save(client: &ApiClient, save_id: &str) -> Result<Option<WatchedSave>> {
+    client.unshare_save(save_id).await?;
+    let (mut state, path) = CliState::load_default()?;
+    let watched = state.saves.get_mut(save_id).map(|st| {
+        st.shared = None;
+        st.include.clear();
+        watched_from_snapshot(save_id.to_string(), st)
+    });
+    if watched.is_some() {
+        state.save(&path)?;
+    }
+    Ok(watched)
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -2566,6 +2734,7 @@ mod tests {
             preset: None,
             allow_device_local: None,
             shared: None,
+            include: Vec::new(),
             set_hash: None,
             processes: Vec::new(),
             shared_processes: false,
@@ -3780,5 +3949,161 @@ mod slug_gate_tests {
         let msg = err.to_string();
         assert!(msg.contains("user"), "names the offending slug: {msg}");
         assert!(msg.contains("folder"), "points at the folder flow: {msg}");
+    }
+}
+
+#[cfg(test)]
+mod sharing_tests {
+    use super::{include_for_share, sync_shared_from_server, tracked_from_server_row, ShareError};
+    use crate::state::{CliState, SaveState, SharedRef};
+    use hoard_core::wire::{Save, SharedInfo};
+    use std::path::PathBuf;
+    use time::OffsetDateTime;
+
+    const ID: &str = "66666666-7777-4888-8999-aaaaaaaaaaaa";
+
+    fn shared_info(include: &[&str]) -> SharedInfo {
+        SharedInfo {
+            group_id: "g1".into(),
+            group_name: "the boys".into(),
+            owner_user_id: "u-owner".into(),
+            owner_username: "jacka".parse().unwrap(),
+            include: include.iter().map(|s| s.to_string()).collect(),
+        }
+    }
+
+    fn server_row(shared: Option<SharedInfo>) -> Save {
+        Save {
+            id: ID.parse().unwrap(),
+            user_id: None,
+            game_slug: "valheim".parse().unwrap(),
+            label: "main".into(),
+            local_path_hint: None,
+            client_os: None,
+            latest_version_num: Some(4),
+            snapshot_count: Some(4),
+            total_size_bytes: Some(1234),
+            created_at: OffsetDateTime::UNIX_EPOCH,
+            updated_at: OffsetDateTime::UNIX_EPOCH,
+            shared,
+        }
+    }
+
+    fn local_row() -> SaveState {
+        SaveState {
+            local_path: PathBuf::from("/home/u/.config/unity3d/IronGate/Valheim"),
+            game_slug: "valheim".into(),
+            label: "main".into(),
+            last_backup_at: None,
+            last_version_num: Some(3),
+            paused: false,
+            preset: None,
+            set_hash: None,
+            processes: Vec::new(),
+            shared_processes: false,
+            allow_device_local: None,
+            shared: None,
+            include: Vec::new(),
+        }
+    }
+
+    /// Another member's world, not adopted here: it is listed with the group
+    /// on it and no folder, and it is not confused with a lost row.
+    #[test]
+    fn a_member_only_shared_row_is_an_orphan_that_carries_its_group() {
+        let row = tracked_from_server_row(
+            server_row(Some(shared_info(&["worlds_local/Alpha.db"]))),
+            None,
+        );
+        assert!(row.orphan);
+        assert!(row.local_path.is_empty());
+        assert_eq!(
+            row.shared.as_ref().map(|s| s.group_name.as_str()),
+            Some("the boys")
+        );
+        assert_eq!(row.cloud_version_num, Some(4));
+        assert_eq!(row.local_version_num, None);
+
+        // The plain orphan keeps looking like one.
+        let plain = tracked_from_server_row(server_row(None), None);
+        assert!(plain.orphan);
+        assert!(plain.shared.is_none());
+
+        // And the owner's own row, tracked here, carries the group too.
+        let mine = tracked_from_server_row(server_row(Some(shared_info(&[]))), Some(&local_row()));
+        assert!(!mine.orphan);
+        assert_eq!(mine.local_version_num, Some(3));
+        assert!(mine.shared.is_some());
+    }
+
+    /// The server's share reaches the local row, and so does its going away.
+    #[test]
+    fn reconcile_copies_shared_and_include_from_the_server() {
+        let mut state = CliState::default();
+        state.saves.insert(ID.into(), local_row());
+
+        let rows = vec![server_row(Some(shared_info(&[
+            "worlds_local/Alpha.db",
+            "worlds_local/Alpha.fwl",
+        ])))];
+        assert_eq!(sync_shared_from_server(&mut state, &rows), 1);
+        let st = &state.saves[ID];
+        assert_eq!(
+            st.shared,
+            Some(SharedRef {
+                group_id: "g1".into(),
+                group_name: "the boys".into(),
+                owner_user_id: "u-owner".into(),
+                owner_username: "jacka".into(),
+            })
+        );
+        assert_eq!(
+            st.include,
+            vec!["worlds_local/Alpha.db", "worlds_local/Alpha.fwl"]
+        );
+        // Same again: nothing to change.
+        assert_eq!(sync_shared_from_server(&mut state, &rows), 0);
+
+        // A new include list is a change; so is the unshare.
+        let rows = vec![server_row(Some(shared_info(&["worlds_local/Beta.db"])))];
+        assert_eq!(sync_shared_from_server(&mut state, &rows), 1);
+        assert_eq!(state.saves[ID].include, vec!["worlds_local/Beta.db"]);
+        let rows = vec![server_row(None)];
+        assert_eq!(sync_shared_from_server(&mut state, &rows), 1);
+        assert!(state.saves[ID].shared.is_none());
+        assert!(state.saves[ID].include.is_empty());
+
+        // A server row this machine does not track is nobody's business here.
+        let mut other = CliState::default();
+        assert_eq!(sync_shared_from_server(&mut other, &rows), 0);
+    }
+
+    /// What the daemon sends for a share: the template for a named world, the
+    /// whole folder for none, and a refusal the client can show for the rest.
+    #[test]
+    fn a_share_resolves_its_include_list_from_the_world() {
+        assert!(include_for_share("valheim", None).unwrap().is_empty());
+        assert_eq!(
+            include_for_share("valheim", Some("Alpha")).unwrap(),
+            vec![
+                "worlds_local/Alpha.db",
+                "worlds_local/Alpha.fwl",
+                "worlds_local/Alpha.db.old",
+                "worlds_local/Alpha.fwl.old",
+                "worlds_local/Alpha_backup_*",
+            ]
+        );
+        assert!(matches!(
+            include_for_share("stardew-valley", Some("Alpha")),
+            Err(ShareError::NoTemplate(_))
+        ));
+        assert!(matches!(
+            include_for_share("valheim", Some("../Alpha")),
+            Err(ShareError::BadWorld(_))
+        ));
+        // A folder game with no world named shares whole, like before.
+        assert!(include_for_share("stardew-valley", None)
+            .unwrap()
+            .is_empty());
     }
 }

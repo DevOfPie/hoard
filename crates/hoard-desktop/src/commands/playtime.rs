@@ -113,6 +113,7 @@ fn playtime_watched_save(slug: &str, install_dir: Option<PathBuf>) -> WatchedSav
         set_hash: None,
         track_only: true,
         shared: false,
+        include: Vec::new(),
     }
 }
 

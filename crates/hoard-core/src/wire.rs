@@ -274,6 +274,11 @@ pub struct SharedInfo {
     pub group_name: String,
     pub owner_user_id: String,
     pub owner_username: Username,
+    /// What the shared save consists of, as `/`-separated patterns relative to
+    /// its root; empty means everything. Set at share time and the same for
+    /// every member, so every machine walks the same files.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub include: Vec<String>,
 }
 
 // ---- /v1/groups
@@ -336,6 +341,41 @@ pub struct JoinGroupRequest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ShareSaveRequest {
     pub group_id: String,
+    /// See [`SharedInfo::include`]. Checked with [`validate_include`]; the
+    /// server answers 400 to a list that fails it.
+    #[serde(default)]
+    pub include: Vec<String>,
+}
+
+/// The most patterns a share may name.
+pub const MAX_INCLUDE_PATTERNS: usize = 64;
+
+/// Is this an include list the server will store? Each pattern is non-empty,
+/// `/`-separated with no empty segment, no `..`, no leading `/`, no `\`; the
+/// list has at most [`MAX_INCLUDE_PATTERNS`] entries. The rule lives here so
+/// the client refuses what the server would.
+pub fn validate_include(include: &[String]) -> Result<(), String> {
+    if include.len() > MAX_INCLUDE_PATTERNS {
+        return Err(format!(
+            "too many include patterns: {} (at most {MAX_INCLUDE_PATTERNS})",
+            include.len()
+        ));
+    }
+    for p in include {
+        if p.is_empty() {
+            return Err("an include pattern is empty".to_string());
+        }
+        if p.starts_with('/') {
+            return Err(format!("include pattern starts with `/`: {p}"));
+        }
+        if p.contains('\\') {
+            return Err(format!("include pattern uses `\\`; separate with `/`: {p}"));
+        }
+        if p.split('/').any(|seg| seg.is_empty() || seg == "..") {
+            return Err(format!("include pattern has an empty or `..` segment: {p}"));
+        }
+    }
+    Ok(())
 }
 
 // ---- /v1/saves/{id}/lease
@@ -981,5 +1021,50 @@ mod tests {
         )
         .expect("the new body parses");
         assert!(new.blob_zstd);
+    }
+
+    fn strs(list: &[&str]) -> Vec<String> {
+        list.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn a_share_body_without_include_still_parses_and_means_everything() {
+        let req: ShareSaveRequest = serde_json::from_str(r#"{"group_id":"g1"}"#).unwrap();
+        assert!(req.include.is_empty());
+        let info: SharedInfo = serde_json::from_str(
+            r#"{"group_id":"g1","group_name":"n","owner_user_id":"u","owner_username":"jacka"}"#,
+        )
+        .unwrap();
+        assert!(info.include.is_empty());
+        // And an empty list is not emitted, so an older reader sees the old shape.
+        let json = serde_json::to_value(&info).unwrap();
+        assert!(json.get("include").is_none(), "{json}");
+    }
+
+    #[test]
+    fn include_validation_admits_the_valheim_template_and_refuses_escapes() {
+        assert!(validate_include(&[]).is_ok());
+        assert!(validate_include(&strs(&[
+            "worlds_local/Alpha.db",
+            "worlds_local/Alpha_backup_*",
+            "slot?.sav",
+        ]))
+        .is_ok());
+        for bad in [
+            "",
+            "/abs/path",
+            "a//b",
+            "../up",
+            "worlds_local/..",
+            "a\\b",
+            "a/",
+        ] {
+            assert!(validate_include(&strs(&[bad])).is_err(), "{bad:?}");
+        }
+        let many: Vec<String> = (0..=MAX_INCLUDE_PATTERNS)
+            .map(|i| format!("f{i}"))
+            .collect();
+        assert!(validate_include(&many).is_err());
+        assert!(validate_include(&many[..MAX_INCLUDE_PATTERNS]).is_ok());
     }
 }

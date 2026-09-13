@@ -27,7 +27,7 @@ use crate::api::{
 };
 use crate::state::{CliState, SaveState};
 use hoard_core::ids::SaveId;
-use hoard_core::kernel::fileclass;
+use hoard_core::kernel::fileclass::{self, Scope};
 use hoard_core::wire::VersionOrigin;
 
 /// Bounded fan-out for per-file work in the cloud path (hashing local files,
@@ -609,25 +609,27 @@ fn join_signature(cheap: &str, content: &str) -> String {
 
 /// Walks `root` and returns the files that are save data.
 ///
-/// `shields` are the file patterns the manifest declares for this game
-/// ([`crate::savefilter::shields_for_slug`]); passing `&[]` leaves the kernel
-/// deciding by name alone. Whatever
+/// `scope.shields` are the file patterns the manifest declares for this game
+/// ([`crate::savefilter::shields_for_slug`]); `scope.include` is what a shared
+/// save consists of (`SaveState::include`, empty for everything). A default
+/// scope leaves the kernel deciding by name alone. Whatever
 /// [`fileclass::classify`](hoard_core::kernel::fileclass::classify) marks as
 /// [`Junk`](hoard_core::kernel::fileclass::FileClass::Junk) (OS litter,
-/// temporaries, crash dumps, engine telemetry, locks the game holds open) does not
-/// go into the snapshot. Config does: it is on the restore that whether to write
-/// it gets decided (see `RestoreOptions::gate`).
+/// temporaries, crash dumps, engine telemetry, locks the game holds open, and
+/// every file outside the include list) does not go into the snapshot. Config
+/// does: it is on the restore that whether to write it gets decided (see
+/// `RestoreOptions::gate`).
 ///
-/// Everybody has to come through here with the same `shields`.
-/// [`compute_set_signature`]'s cheap signature is computed over this list, and the
-/// engine's L1 sampling (`observe_local_fingerprint`) compares it against the one
-/// the backup stored: two different filters give two different signatures for the
-/// same quiet folder, the reducer sees a pending change that never resolves, and
-/// there is a hot loop.
+/// Everybody has to come through here with the same `scope`, shields and
+/// include both. [`compute_set_signature`]'s cheap signature is computed over
+/// this list, and the engine's L1 sampling (`observe_local_fingerprint`) compares
+/// it against the one the backup stored: two different filters give two
+/// different signatures for the same quiet folder, the reducer sees a pending
+/// change that never resolves, and there is a hot loop.
 ///
 /// Symlinks are skipped on purpose: we don't want to follow links out of the save
 /// directory, and tar archives with symlinks make restore ambiguous.
-pub fn walk_source(root: &Path, shields: &[String]) -> Result<Vec<UploadFile>> {
+pub fn walk_source(root: &Path, scope: Scope<'_>) -> Result<Vec<UploadFile>> {
     // A single-file save: the `local_path` IS the file. One `UploadFile` comes out
     // with its base name as the relative path, so the snapshot has exactly the
     // same shape as one from a folder with one file in it, and everything
@@ -642,9 +644,9 @@ pub fn walk_source(root: &Path, shields: &[String]) -> Result<Vec<UploadFile>> {
             .and_then(|s| s.to_str())
             .ok_or_else(|| anyhow!("save file has no usable name: {}", root.display()))?;
         // A single-file save IS the file: the path was chosen by pointing at it,
-        // so nothing is classified here. Filtering it would leave the save empty
-        // and the whole backup in `EmptySource`. The user pointed at that file,
-        // and that outweighs any rule by name.
+        // so nothing is classified here, the include list included. Filtering it
+        // would leave the save empty and the whole backup in `EmptySource`. The
+        // user pointed at that file, and that outweighs any rule by name.
         return Ok(vec![UploadFile {
             relative_path: name.to_string(),
             absolute_path: root.to_path_buf(),
@@ -692,7 +694,7 @@ pub fn walk_source(root: &Path, shields: &[String]) -> Result<Vec<UploadFile>> {
                     .to_string_lossy()
                     .replace('\\', "/");
                 // What is not save data does not go into the snapshot.
-                if !fileclass::classify(&rel, shields).is_backed_up() {
+                if !fileclass::classify(&rel, scope).is_backed_up() {
                     tracing::debug!(path = %rel, "skipping non-save file");
                     continue;
                 }
@@ -729,7 +731,9 @@ pub fn walk_source(root: &Path, shields: &[String]) -> Result<Vec<UploadFile>> {
 ///
 /// `game_slug` and `label` are only consulted on the Hoard Cloud path, where the
 /// server keys the save row on `(user_id, game_slug, label)` and the snapshot list
-/// endpoints don't exist. They're ignored self-hosted.
+/// endpoints don't exist. They're ignored self-hosted. `include` is the save's
+/// own list (`SaveState::include`), the same one every other walk of the folder
+/// uses; see [`walk_source`].
 ///
 /// A file whose bytes will not be read is left out and reported, rather than
 /// losing the whole snapshot. Of the two possible outcomes, skipping the file or
@@ -753,6 +757,7 @@ pub async fn upload_directory<F>(
     client: &ApiClient,
     save_id: &str,
     game_slug: &str,
+    include: &[String],
     label: &str,
     source: &Path,
     base_version: Option<i64>,
@@ -774,7 +779,13 @@ where
         bail!("source must be a folder or a file: {}", source.display());
     }
 
-    let files = walk_source(&source, &crate::savefilter::shields_for_slug(game_slug))?;
+    let files = walk_source(
+        &source,
+        Scope {
+            shields: &crate::savefilter::shields_for_slug(game_slug),
+            include,
+        },
+    )?;
     if files.is_empty() {
         return Err(EmptySource { path: source }.into());
     }
@@ -1990,6 +2001,7 @@ pub async fn upload_directory_checked<F, G>(
     client: &ApiClient,
     save_id: &str,
     game_slug: &str,
+    include: &[String],
     label: &str,
     source: &Path,
     prev_signature: Option<&str>,
@@ -2028,7 +2040,13 @@ where
         }
         .into());
     }
-    let files = walk_source(&canonical, &crate::savefilter::shields_for_slug(game_slug))?;
+    let files = walk_source(
+        &canonical,
+        Scope {
+            shields: &crate::savefilter::shields_for_slug(game_slug),
+            include,
+        },
+    )?;
     if files.is_empty() {
         return Err(EmptySource { path: canonical }.into());
     }
@@ -2060,6 +2078,7 @@ where
         client,
         save_id,
         game_slug,
+        include,
         label,
         &canonical,
         base_version,
@@ -2131,6 +2150,7 @@ pub async fn remember_save(
                 shared_processes: prev_shared,
                 allow_device_local: prev_allow_device_local,
                 shared: None,
+                include: Vec::new(),
             },
         );
     } else if let Some(existing) = state.saves.get(save_id).cloned() {
@@ -2466,7 +2486,7 @@ mod tests {
         std::fs::write(&bad, b"placeholder").unwrap();
         std::fs::set_permissions(&bad, std::fs::Permissions::from_mode(0o000)).unwrap();
 
-        let files = walk_source(root, &[]).unwrap();
+        let files = walk_source(root, Scope::default()).unwrap();
         assert_eq!(files.len(), 2, "the walk does see the file: it can stat it");
         let sig = compute_content_signature(&files).await;
         // And it is stable while it stays unreadable: if it were not, every pass
@@ -2475,7 +2495,7 @@ mod tests {
 
         // The readable one's bytes do count.
         std::fs::write(root.join("good.sav"), b"moved on").unwrap();
-        let moved = walk_source(root, &[]).unwrap();
+        let moved = walk_source(root, Scope::default()).unwrap();
         assert_ne!(sig, compute_content_signature(&moved).await);
 
         std::fs::set_permissions(&bad, std::fs::Permissions::from_mode(0o644)).unwrap();
@@ -2493,9 +2513,11 @@ mod tests {
         let root = tmp.path();
         let f = root.join("a.sav");
         std::fs::write(&f, b"").unwrap();
-        let as_empty = compute_content_signature(&walk_source(root, &[]).unwrap()).await;
+        let as_empty =
+            compute_content_signature(&walk_source(root, Scope::default()).unwrap()).await;
         std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o000)).unwrap();
-        let as_unreadable = compute_content_signature(&walk_source(root, &[]).unwrap()).await;
+        let as_unreadable =
+            compute_content_signature(&walk_source(root, Scope::default()).unwrap()).await;
         std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o644)).unwrap();
         assert_ne!(as_empty, as_unreadable);
     }
@@ -2515,7 +2537,7 @@ mod tests {
         std::fs::write(&bad, b"two").unwrap();
         std::fs::set_permissions(&bad, std::fs::Permissions::from_mode(0o000)).unwrap();
 
-        let (ok, skipped) = split_unreadable(walk_source(root, &[]).unwrap()).await;
+        let (ok, skipped) = split_unreadable(walk_source(root, Scope::default()).unwrap()).await;
         std::fs::set_permissions(&bad, std::fs::Permissions::from_mode(0o644)).unwrap();
 
         assert_eq!(
@@ -2549,7 +2571,8 @@ mod tests {
         std::fs::write(locked.join("inner.dat"), b"x").unwrap();
         std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
 
-        let files = walk_source(root, &[]).expect("un subdir ilegible no debe abortar el walk");
+        let files = walk_source(root, Scope::default())
+            .expect("un subdir ilegible no debe abortar el walk");
         // Restore the permissions so the tempdir can be cleaned up.
         std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
 
@@ -2568,7 +2591,7 @@ mod tests {
     #[test]
     fn an_unreadable_root_is_still_an_error() {
         let missing = std::path::Path::new("/definitely/not/here/hoard-test");
-        assert!(walk_source(missing, &[]).is_err());
+        assert!(walk_source(missing, Scope::default()).is_err());
     }
 
     /// A single-file save: 4,900 games in the catalogue have only templates
@@ -2600,6 +2623,7 @@ mod tests {
             &client,
             "save-1",
             "furi",
+            &[],
             "main",
             &prefix_root,
             None,
@@ -2632,6 +2656,7 @@ mod tests {
             &client,
             "save-1",
             "furi",
+            &[],
             "main",
             &save_dir,
             None,
@@ -2669,7 +2694,7 @@ mod tests {
         std::fs::create_dir_all(&analytics).unwrap();
         std::fs::write(analytics.join("values"), "telemetry").unwrap();
 
-        let files = walk_source(root, &[]).unwrap();
+        let files = walk_source(root, Scope::default()).unwrap();
         let names: Vec<&str> = files.iter().map(|f| f.relative_path.as_str()).collect();
         assert_eq!(names, vec!["savedGames.gd", "savedGames2.gd"], "{names:?}");
     }
@@ -2683,7 +2708,7 @@ mod tests {
         std::fs::write(root.join("slot1.sav"), "partida").unwrap();
         std::fs::write(root.join("graphics.ini"), "res=1920x1080").unwrap();
 
-        let files = walk_source(root, &[]).unwrap();
+        let files = walk_source(root, Scope::default()).unwrap();
         let names: Vec<&str> = files.iter().map(|f| f.relative_path.as_str()).collect();
         assert_eq!(names, vec!["graphics.ini", "slot1.sav"], "{names:?}");
     }
@@ -2696,17 +2721,17 @@ mod tests {
         let root = dir.path();
         std::fs::write(root.join("slot1.sav"), "partida").unwrap();
         std::fs::write(root.join("Player.log"), "arranque 1").unwrap();
-        let before = compute_set_signature(&walk_source(root, &[]).unwrap());
+        let before = compute_set_signature(&walk_source(root, Scope::default()).unwrap());
 
         std::fs::write(root.join("Player.log"), "launch 2, longer").unwrap();
-        let after = compute_set_signature(&walk_source(root, &[]).unwrap());
+        let after = compute_set_signature(&walk_source(root, Scope::default()).unwrap());
         assert_eq!(before, after, "the log must not move the signature");
 
         // And the save does move it, which is what has to keep happening.
         std::fs::write(root.join("slot1.sav"), "partida avanzada").unwrap();
         assert_ne!(
             before,
-            compute_set_signature(&walk_source(root, &[]).unwrap())
+            compute_set_signature(&walk_source(root, Scope::default()).unwrap())
         );
     }
 
@@ -2718,8 +2743,15 @@ mod tests {
         let root = dir.path();
         std::fs::write(root.join("player.log"), "this one really is the save").unwrap();
 
-        assert!(walk_source(root, &[]).unwrap().is_empty());
-        let shielded = walk_source(root, &["*.log".to_string()]).unwrap();
+        assert!(walk_source(root, Scope::default()).unwrap().is_empty());
+        let shielded = walk_source(
+            root,
+            Scope {
+                shields: &["*.log".to_string()],
+                include: &[],
+            },
+        )
+        .unwrap();
         assert_eq!(shielded.len(), 1);
     }
 
@@ -2739,7 +2771,7 @@ mod tests {
             std::fs::write(dir.join("metadata.9.json"), b"{}").unwrap();
         }
 
-        let files = walk_source(&game, &[]).unwrap();
+        let files = walk_source(&game, Scope::default()).unwrap();
         let paths: Vec<&str> = files.iter().map(|f| f.relative_path.as_str()).collect();
         assert_eq!(
             paths,
@@ -2754,6 +2786,73 @@ mod tests {
         );
     }
 
+    /// A shared world: the walk takes the named world and nothing else, not the
+    /// other world beside it and not a character, and the cheap signature only
+    /// moves when one of the named files does.
+    #[test]
+    fn an_include_list_narrows_the_walk_to_the_named_world() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let worlds = root.join("worlds_local");
+        let chars = root.join("characters_local");
+        std::fs::create_dir_all(&worlds).unwrap();
+        std::fs::create_dir_all(&chars).unwrap();
+        for f in [
+            "Alpha.db",
+            "Alpha.fwl",
+            "Alpha.db.old",
+            "Alpha_backup_auto-1.db",
+            "Beta.db",
+            "Beta.fwl",
+        ] {
+            std::fs::write(worlds.join(f), f).unwrap();
+        }
+        std::fs::write(chars.join("Me.fch"), "me").unwrap();
+        let include: Vec<String> = [
+            "worlds_local/Alpha.db",
+            "worlds_local/Alpha.fwl",
+            "worlds_local/Alpha.db.old",
+            "worlds_local/Alpha.fwl.old",
+            "worlds_local/Alpha_backup_*",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        let scope = Scope {
+            shields: &[],
+            include: &include,
+        };
+
+        let files = walk_source(root, scope).unwrap();
+        let names: Vec<&str> = files.iter().map(|f| f.relative_path.as_str()).collect();
+        assert_eq!(
+            names,
+            vec![
+                "worlds_local/Alpha.db",
+                "worlds_local/Alpha.db.old",
+                "worlds_local/Alpha.fwl",
+                "worlds_local/Alpha_backup_auto-1.db",
+            ]
+        );
+
+        // The other world and the character never move the signature.
+        let before = compute_set_signature(&files);
+        std::fs::write(worlds.join("Beta.db"), "Beta, a longer world").unwrap();
+        std::fs::write(chars.join("Me.fch"), "me, levelled up").unwrap();
+        assert_eq!(
+            before,
+            compute_set_signature(&walk_source(root, scope).unwrap())
+        );
+        // The named world does.
+        std::fs::write(worlds.join("Alpha.db"), "Alpha, a longer world").unwrap();
+        assert_ne!(
+            before,
+            compute_set_signature(&walk_source(root, scope).unwrap())
+        );
+        // And without the list the whole folder is back.
+        assert_eq!(walk_source(root, Scope::default()).unwrap().len(), 7);
+    }
+
     /// A single-file save uploads even when its name looks like config: the user
     /// pointed at that file, and that outweighs any rule.
     #[test]
@@ -2761,9 +2860,20 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let file = dir.path().join("settings.ini");
         std::fs::write(&file, "en realidad es la partida").unwrap();
-        let files = walk_source(&file, &[]).unwrap();
+        let files = walk_source(&file, Scope::default()).unwrap();
         assert_eq!(files.len(), 1);
         assert_eq!(files[0].relative_path, "settings.ini");
+        // Nor does an include list that names something else take it away.
+        let elsewhere = ["worlds_local/Alpha.db".to_string()];
+        let scoped = walk_source(
+            &file,
+            Scope {
+                shields: &[],
+                include: &elsewhere,
+            },
+        )
+        .unwrap();
+        assert_eq!(scoped.len(), 1);
     }
 
     #[test]
@@ -2772,7 +2882,7 @@ mod tests {
         let file = tmp.path().join("ssr_save.bin");
         std::fs::write(&file, b"0123456789").unwrap();
 
-        let files = walk_source(&file, &[]).unwrap();
+        let files = walk_source(&file, Scope::default()).unwrap();
         assert_eq!(files.len(), 1);
         assert_eq!(files[0].relative_path, "ssr_save.bin");
         assert_eq!(files[0].absolute_path, file);
@@ -2787,11 +2897,11 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let file = tmp.path().join("save.dat");
         std::fs::write(&file, b"a").unwrap();
-        let before = compute_set_signature(&walk_source(&file, &[]).unwrap());
+        let before = compute_set_signature(&walk_source(&file, Scope::default()).unwrap());
         // A different size moves the signature even when the mtime has little
         // resolution on this filesystem.
         std::fs::write(&file, b"bbbb").unwrap();
-        let after = compute_set_signature(&walk_source(&file, &[]).unwrap());
+        let after = compute_set_signature(&walk_source(&file, Scope::default()).unwrap());
         assert_ne!(before, after);
     }
 }

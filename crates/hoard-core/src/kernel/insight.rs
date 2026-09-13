@@ -32,7 +32,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use super::fileclass::{classify, FileClass};
+use super::fileclass::{classify, FileClass, Scope};
 
 /// Current shape of the serialised insight. Bumped when a field changes
 /// meaning; readers that see a higher number than they know render what they
@@ -290,9 +290,19 @@ pub fn insight_from_manifests(
 /// Pick the file the row leads with. `None` when the version holds no player
 /// data at all (an all-config, all-junk folder).
 pub fn pick_protagonist(files: &[FileFacts], shields: &[String]) -> Option<Protagonist> {
+    // No include list here: these are a version's own files, which the upload
+    // already filtered through it.
     let saves: Vec<&FileFacts> = files
         .iter()
-        .filter(|f| classify(&f.relative_path, shields) == FileClass::SaveData)
+        .filter(|f| {
+            classify(
+                &f.relative_path,
+                Scope {
+                    shields,
+                    include: &[],
+                },
+            ) == FileClass::SaveData
+        })
         .collect();
     if saves.is_empty() {
         return None;
@@ -337,7 +347,14 @@ fn rank(f: &FileFacts) -> (bool, i64, i64) {
 fn count_entries(files: &[FileFacts], shields: &[String]) -> u32 {
     let mut seen: Vec<&str> = Vec::new();
     for f in files {
-        if classify(&f.relative_path, shields) != FileClass::SaveData {
+        if classify(
+            &f.relative_path,
+            Scope {
+                shields,
+                include: &[],
+            },
+        ) != FileClass::SaveData
+        {
             continue;
         }
         let head = f.relative_path.split('/').next().unwrap_or("");

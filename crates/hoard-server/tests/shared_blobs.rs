@@ -6,7 +6,7 @@
 //! pays), and a plain member, so a charge that lands on the wrong one shows.
 
 use axum::body::Body;
-use axum::extract::{Extension, Path, State};
+use axum::extract::{Extension, Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::Json;
 use hoard_core::ids::Sha256 as Sha256Hex;
@@ -295,17 +295,38 @@ async fn share(
     who: &AuthUser,
     group_id: &str,
 ) -> Result<Save, (StatusCode, serde_json::Value)> {
+    share_with(h, who, group_id, &[]).await
+}
+
+async fn share_with(
+    h: &Harness,
+    who: &AuthUser,
+    group_id: &str,
+    include: &[&str],
+) -> Result<Save, (StatusCode, serde_json::Value)> {
     share::share(
         st(h),
         Extension(who.clone()),
         Path(SAVE.to_string()),
         Json(ShareSaveRequest {
             group_id: group_id.into(),
+            include: include.iter().map(|s| s.to_string()).collect(),
         }),
     )
     .await
     .map(|Json(s)| s)
     .map_err(|(code, Json(body))| (code, body))
+}
+
+async fn list_as(h: &Harness, who: &AuthUser) -> Vec<Save> {
+    saves::list(
+        st(h),
+        Extension(who.clone()),
+        Query(saves::ListQuery { game_slug: None }),
+    )
+    .await
+    .map(|Json(v)| v)
+    .expect("list")
 }
 
 async fn unshare(
@@ -649,6 +670,70 @@ async fn share_refuses_foreign_groups_and_double_shares() {
     let (code, _) = share(&h, &h.member, &gid).await.expect_err("not the owner");
     assert_eq!(code, StatusCode::FORBIDDEN);
     assert_eq!(used(&h.state.pool, PAYER).await, f.total(), "charged once");
+}
+
+/// The include list travels with the share: the owner's and every member's
+/// listing carry the same one, so every machine walks the same files.
+#[tokio::test]
+async fn the_include_list_is_stored_with_the_share_and_listed_to_everyone() {
+    let h = harness().await;
+    let f = Fixture::new();
+    two_versions(&h, &f).await;
+    let gid = group_with_everyone(&h).await;
+
+    let include = [
+        "worlds_local/Alpha.db",
+        "worlds_local/Alpha.fwl",
+        "worlds_local/Alpha_backup_*",
+    ];
+    let save = share_with(&h, &h.owner, &gid, &include)
+        .await
+        .expect("shared");
+    let want: Vec<String> = include.iter().map(|s| s.to_string()).collect();
+    assert_eq!(save.shared.as_ref().map(|s| &s.include), Some(&want));
+
+    for who in [&h.owner, &h.member, &h.payer] {
+        let rows = list_as(&h, who).await;
+        let row = rows
+            .iter()
+            .find(|s| s.id.as_str() == SAVE)
+            .unwrap_or_else(|| panic!("{} sees the save", who.username));
+        assert_eq!(
+            row.shared.as_ref().map(|s| &s.include),
+            Some(&want),
+            "{} reads the same list",
+            who.username
+        );
+    }
+
+    // Unsharing forgets it: the next share starts from its own body.
+    unshare(&h, &h.owner).await.expect("unshared");
+    let save = share(&h, &h.owner, &gid).await.expect("shared again");
+    assert!(save.shared.as_ref().unwrap().include.is_empty());
+}
+
+/// A list the client cannot have made from a world name is refused whole,
+/// before anything moves.
+#[tokio::test]
+async fn an_invalid_include_pattern_is_400_and_shares_nothing() {
+    let h = harness().await;
+    let f = Fixture::new();
+    two_versions(&h, &f).await;
+    let gid = group_with_everyone(&h).await;
+
+    for bad in [
+        "../worlds_local/Alpha.db",
+        "/worlds_local/Alpha.db",
+        "",
+        "a//b",
+    ] {
+        let (code, _) = share_with(&h, &h.owner, &gid, &[bad])
+            .await
+            .expect_err("refused");
+        assert_eq!(code, StatusCode::BAD_REQUEST, "{bad:?}");
+    }
+    assert_eq!(used(&h.state.pool, OWNER).await, f.total(), "nothing moved");
+    assert!(list_as(&h, &h.owner).await[0].shared.is_none());
 }
 
 /// Purging a trashed version of a shared save refunds the group's owner and

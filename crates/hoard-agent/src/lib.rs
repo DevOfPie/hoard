@@ -52,6 +52,7 @@ pub mod telemetry;
 pub mod tls;
 pub mod update;
 pub mod wine_prefixes;
+pub mod worldfiles;
 pub mod wrappers;
 
 pub use api::{ApiClient, ApiError};

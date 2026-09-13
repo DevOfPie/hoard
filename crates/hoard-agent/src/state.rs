@@ -134,6 +134,14 @@ pub struct SaveState {
     /// `default` keeps older `state.json` files loading.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub shared: Option<SharedRef>,
+    /// What this save consists of when it is shared: `/`-separated patterns
+    /// relative to `local_path`, copied from the server's row so every member
+    /// walks the same files (`fileclass::included`). Empty is everything, and
+    /// is what an unshared save always has. The row is the source of truth;
+    /// [`SharedRef`] only carries names for the UI. `default` keeps older
+    /// `state.json` files loading.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub include: Vec<String>,
 }
 
 /// Where a shared save lives: the group and its owner, as `state.json` keeps
@@ -645,6 +653,7 @@ mod tests {
             preset: None,
             allow_device_local: None,
             shared: None,
+            include: Vec::new(),
             set_hash: None,
             processes: vec![],
             shared_processes: false,
@@ -1074,5 +1083,34 @@ mod tests {
             leftovers.is_empty(),
             "temp files left behind: {leftovers:?}"
         );
+    }
+
+    /// A shared save's include list survives the file and an unshared save
+    /// keeps emitting the shape it always had, so an older build reads it.
+    #[test]
+    fn include_round_trips_and_is_absent_when_empty() {
+        let plain = save_state("valheim");
+        let json = serde_json::to_value(&plain).unwrap();
+        assert!(json.get("include").is_none(), "{json}");
+        let back: SaveState = serde_json::from_value(json).unwrap();
+        assert!(back.include.is_empty());
+
+        let shared = SaveState {
+            shared: Some(SharedRef {
+                group_id: "g1".into(),
+                group_name: "the boys".into(),
+                owner_user_id: "u1".into(),
+                owner_username: "jacka".into(),
+            }),
+            include: vec![
+                "worlds_local/Alpha.db".into(),
+                "worlds_local/Alpha.fwl".into(),
+            ],
+            ..plain
+        };
+        let json = serde_json::to_string(&shared).unwrap();
+        let back: SaveState = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.include, shared.include);
+        assert_eq!(back.shared, shared.shared);
     }
 }

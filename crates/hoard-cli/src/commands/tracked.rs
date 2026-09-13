@@ -26,6 +26,8 @@ pub struct SaveRow {
     /// RFC3339, or null when this save has never been backed up.
     pub last_backup_at: Option<String>,
     pub preset: Option<String>,
+    /// The group this save is shared into, or null.
+    pub group: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -59,6 +61,7 @@ pub async fn run() -> Result<()> {
                 last_version_num: s.last_version_num,
                 last_backup_at: s.last_backup_at.and_then(|t| t.format(&Rfc3339).ok()),
                 preset: s.preset.clone(),
+                group: s.shared.as_ref().map(|g| g.group_name.clone()),
             })
             .collect(),
         state_file: path.display().to_string(),
@@ -73,8 +76,8 @@ pub async fn run() -> Result<()> {
             return;
         }
         println!(
-            "{:<24}  {:<10}  {:>6}  {:<20}  {:<8}  PATH",
-            "GAME", "LABEL", "VER", "LAST", "STATE"
+            "{:<24}  {:<10}  {:>6}  {:<20}  {:<8}  {:<12}  PATH",
+            "GAME", "LABEL", "VER", "LAST", "STATE", "GROUP"
         );
         for s in &out.saves {
             let ver = s
@@ -87,13 +90,19 @@ pub async fn run() -> Result<()> {
                 .map(|t| t.chars().take(19).collect::<String>().replace('T', " "))
                 .unwrap_or_else(|| "—".to_string());
             let state_label = if s.paused { "paused" } else { "active" };
+            let group = s
+                .group
+                .as_deref()
+                .map(|g| truncate(g, 12))
+                .unwrap_or_else(|| "—".to_string());
             println!(
-                "{:<24}  {:<10}  {:>6}  {:<20}  {:<8}  {}",
+                "{:<24}  {:<10}  {:>6}  {:<20}  {:<8}  {:<12}  {}",
                 truncate(&s.game_slug, 24),
                 truncate(&s.label, 10),
                 ver,
                 last,
                 state_label,
+                group,
                 s.local_path
             );
         }

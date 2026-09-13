@@ -30,6 +30,7 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use hoard_core::kernel;
 use hoard_core::kernel::correlation::accept_correlation_signals;
+use hoard_core::kernel::fileclass::Scope;
 use hoard_core::wire::VersionOrigin;
 use notify_debouncer_mini::{new_debouncer, DebounceEventResult, Debouncer};
 use serde::{Deserialize, Serialize};
@@ -265,6 +266,11 @@ pub struct WatchedSave {
     /// which the reducer holds for until the lease task says it is ours.
     #[serde(default)]
     pub shared: bool,
+    /// What the shared save consists of (`SaveState::include`): every walk of
+    /// the folder on this slot, backup, fingerprint, restore and merge, goes
+    /// through the same list, or the fingerprint never settles.
+    #[serde(default)]
+    pub include: Vec<String>,
 }
 
 /// The event and per-slot status contract lives in the leaf kernel: with the engine
@@ -975,11 +981,18 @@ fn fingerprint_from_set_hash(composite: &str) -> u64 {
 /// uses) hashed to a `u64`. Only called when L0 moved or a hint focused the save.
 /// `None` when the folder could not be walked (the reducer then falls back to
 /// `has_pending`).
-fn observe_local_fingerprint(path: &Path, game_slug: &str) -> Option<u64> {
-    // The same shields the backup uses, or the two signatures diverge forever and
-    // the reducer sees a pending change that never resolves.
+fn observe_local_fingerprint(path: &Path, game_slug: &str, include: &[String]) -> Option<u64> {
+    // The same shields and include list the backup uses, or the two signatures
+    // diverge forever and the reducer sees a pending change that never resolves.
     let shields = crate::savefilter::shields_for_slug(game_slug);
-    let files = crate::backup::walk_source(path, &shields).ok()?;
+    let files = crate::backup::walk_source(
+        path,
+        Scope {
+            shields: &shields,
+            include,
+        },
+    )
+    .ok()?;
     Some(fingerprint_of(&crate::backup::compute_set_signature(
         &files,
     )))
@@ -1415,7 +1428,11 @@ fn observe_slot(slot: &mut SaveSlot, cloud: &CloudHeads) -> kernel::Observation 
     let compute_l1 = !slot.save.track_only && !local_empty && (l0_changed || slot.needs_l1);
     slot.needs_l1 = false;
     let local_fingerprint = if compute_l1 {
-        observe_local_fingerprint(&slot.save.local_path, &slot.save.game_slug)
+        observe_local_fingerprint(
+            &slot.save.local_path,
+            &slot.save.game_slug,
+            &slot.save.include,
+        )
     } else {
         None
     };
@@ -2668,7 +2685,11 @@ fn mark_pending_if_diverged(slot: &mut SaveSlot) {
     if slot.save.track_only || is_path_empty_or_missing(&slot.save.local_path) {
         return;
     }
-    let fp = observe_local_fingerprint(&slot.save.local_path, &slot.save.game_slug);
+    let fp = observe_local_fingerprint(
+        &slot.save.local_path,
+        &slot.save.game_slug,
+        &slot.save.include,
+    );
     if fp.is_some() && fp != slot.synced_fingerprint {
         slot.has_pending = true;
         slot.needs_l1 = true;
@@ -3354,6 +3375,7 @@ async fn run_auto_restore(
             // the same file, and there keeping it shut restores half a save.
             gate: hoard_core::kernel::fileclass::RestoreGate {
                 shields: crate::savefilter::shields_for_slug(&save.game_slug),
+                include: save.include.clone(),
                 allow_device_local: save.allow_device_local.unwrap_or(false),
             },
         },
@@ -3383,11 +3405,16 @@ async fn run_auto_restore(
         root.join(&save.save_id).join(ts)
     });
 
+    let shields = crate::savefilter::shields_for_slug(&save.game_slug);
+    let scope = Scope {
+        shields: &shields,
+        include: &save.include,
+    };
     let copy_result = restore_files_into(
         &save.local_path,
         &staging,
         conflict_backup_dir.as_deref(),
-        &crate::savefilter::shields_for_slug(&save.game_slug),
+        scope,
     )
     .await;
     cleanup_staging(&staging).await;
@@ -3416,12 +3443,9 @@ async fn run_auto_restore(
     // content half is fine because the fast-path skip only compares the cheap
     // half. Best-effort: a walk error just drops the redundant-upload
     // optimisation, never blocks the restore.
-    let disk_set_hash = crate::backup::walk_source(
-        &save.local_path,
-        &crate::savefilter::shields_for_slug(&save.game_slug),
-    )
-    .ok()
-    .map(|files| format!("{}:", crate::backup::compute_set_signature(&files)));
+    let disk_set_hash = crate::backup::walk_source(&save.local_path, scope)
+        .ok()
+        .map(|files| format!("{}:", crate::backup::compute_set_signature(&files)));
 
     Ok(AutoRestorePull::Merged(AutoRestoreOutcome {
         version_num: version,
@@ -3575,7 +3599,7 @@ pub(crate) async fn restore_files_into(
     target: &Path,
     source: &Path,
     conflict_backup_dir: Option<&Path>,
-    shields: &[String],
+    scope: Scope<'_>,
 ) -> Result<RestoreStats> {
     let mut stats = RestoreStats::default();
     let mut stack: Vec<PathBuf> = vec![source.to_path_buf()];
@@ -3729,7 +3753,7 @@ pub(crate) async fn restore_files_into(
             // are in sync" and the next backup would skip the file down the fast path
             // without ever having uploaded it.
             let rel_str = rel.to_string_lossy().replace('\\', "/");
-            if !kernel::fileclass::classify(&rel_str, shields).is_backed_up() {
+            if !kernel::fileclass::classify(&rel_str, scope).is_backed_up() {
                 continue;
             }
             if !source_rels.contains(rel) {
@@ -4029,6 +4053,7 @@ async fn run_backup_with_retry(
             &api,
             &save.save_id,
             &save.game_slug,
+            &save.include,
             &save.label,
             &save.local_path,
             prev_set_hash.as_deref(),
@@ -6081,6 +6106,7 @@ mod tests {
             set_hash: None,
             track_only: false,
             shared: false,
+            include: Vec::new(),
         }
     }
 
@@ -6205,6 +6231,7 @@ mod tests {
             set_hash: None,
             track_only: false,
             shared: false,
+            include: Vec::new(),
         };
         let mut slots = HashMap::new();
         slots.insert("abc".to_string(), test_slot(save));
@@ -6246,6 +6273,7 @@ mod tests {
             set_hash: None,
             track_only: false,
             shared: false,
+            include: Vec::new(),
         };
         let mut slots = HashMap::new();
         slots.insert("burst-1".to_string(), test_slot(save));
@@ -6369,6 +6397,7 @@ mod tests {
             set_hash: None,
             track_only: false,
             shared: false,
+            include: Vec::new(),
         };
 
         // Short debounce so the test completes well under the 10s timeout.
@@ -6445,6 +6474,7 @@ mod tests {
             set_hash: None,
             track_only: false,
             shared: true,
+            include: Vec::new(),
         };
         let config = AgentConfig {
             debounce_secs: 1,
@@ -6547,6 +6577,7 @@ mod tests {
             set_hash: None,
             track_only: false,
             shared: false,
+            include: Vec::new(),
         };
 
         // `max_retries: 0` → the first failure is already the last.
@@ -6599,6 +6630,83 @@ mod tests {
         std::fs::write(path, contents).unwrap();
     }
 
+    /// The L1 sample and the backup's skip signature are the same walk: with
+    /// and without an include list, the fingerprint the reducer sees equals the
+    /// one the upload stores, so a shared world's fingerprint settles the moment
+    /// the push lands. The merge count and the restore gate go through the same
+    /// `Scope`, so a file outside the list is invisible to all four.
+    #[tokio::test(flavor = "current_thread")]
+    async fn fingerprint_and_backup_signature_agree_with_and_without_include() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        write_file(&root.join("worlds_local/Alpha.db"), b"alpha");
+        write_file(&root.join("worlds_local/Alpha.fwl"), b"alpha meta");
+        write_file(&root.join("worlds_local/Beta.db"), b"beta");
+        write_file(&root.join("characters_local/Me.fch"), b"me");
+        let include: Vec<String> = ["worlds_local/Alpha.db", "worlds_local/Alpha.fwl"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let shields = crate::savefilter::shields_for_slug("valheim");
+
+        let stored = |include: &[String]| {
+            let files = crate::backup::walk_source(
+                root,
+                Scope {
+                    shields: &shields,
+                    include,
+                },
+            )
+            .unwrap();
+            fingerprint_from_set_hash(&format!(
+                "{}:content",
+                crate::backup::compute_set_signature(&files)
+            ))
+        };
+        let whole = observe_local_fingerprint(root, "valheim", &[]).unwrap();
+        let world = observe_local_fingerprint(root, "valheim", &include).unwrap();
+        assert_eq!(whole, stored(&[]));
+        assert_eq!(world, stored(&include));
+        assert_ne!(whole, world, "the list does narrow the walk");
+
+        // The other world moving is invisible to the world's fingerprint and
+        // visible to the whole folder's.
+        write_file(&root.join("worlds_local/Beta.db"), b"beta, grown");
+        assert_eq!(
+            observe_local_fingerprint(root, "valheim", &include).unwrap(),
+            world
+        );
+        assert_ne!(
+            observe_local_fingerprint(root, "valheim", &[]).unwrap(),
+            whole
+        );
+
+        // And the merge count agrees: a file outside the list is not local
+        // divergence, the way litter never was.
+        let staging = tempfile::tempdir().unwrap();
+        write_file(&staging.path().join("worlds_local/Alpha.db"), b"alpha");
+        write_file(
+            &staging.path().join("worlds_local/Alpha.fwl"),
+            b"alpha meta",
+        );
+        let stats = restore_files_into(
+            root,
+            staging.path(),
+            None,
+            Scope {
+                shields: &shields,
+                include: &include,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(stats.target_only, 0, "Beta and the character do not count");
+        let stats = restore_files_into(root, staging.path(), None, Scope::default())
+            .await
+            .unwrap();
+        assert_eq!(stats.target_only, 2, "without the list they do");
+    }
+
     /// Source has A, B, C. Target has only A (identical to source). The
     /// diff restore copies B and C and leaves A alone.
     #[tokio::test(flavor = "current_thread")]
@@ -6613,7 +6721,9 @@ mod tests {
         write_file(&source.join("nested/c.dat"), b"gamma");
         write_file(&target.join("a.dat"), b"alpha");
 
-        let stats = restore_files_into(target, source, None, &[]).await.unwrap();
+        let stats = restore_files_into(target, source, None, Scope::default())
+            .await
+            .unwrap();
 
         assert_eq!(stats.restored, 2, "B and C should be copied");
         assert_eq!(stats.skipped, 1, "A is identical, skipped silently");
@@ -6652,12 +6762,16 @@ mod tests {
         std::fs::write(target.join("Player.log"), b"log").unwrap();
         std::fs::write(target.join(".DS_Store"), b"junk").unwrap();
 
-        let stats = restore_files_into(target, source, None, &[]).await.unwrap();
+        let stats = restore_files_into(target, source, None, Scope::default())
+            .await
+            .unwrap();
         assert_eq!(stats.target_only, 0, "la basura no es divergencia");
 
         // But config does count: it exists only locally until it is uploaded.
         std::fs::write(target.join("graphics.ini"), b"res=1080").unwrap();
-        let stats = restore_files_into(target, source, None, &[]).await.unwrap();
+        let stats = restore_files_into(target, source, None, Scope::default())
+            .await
+            .unwrap();
         assert_eq!(stats.target_only, 1, "the config does have to count");
     }
 
@@ -6680,7 +6794,9 @@ mod tests {
         write_file(&target.join("local-only.sav"), b"unsynced");
         write_file(&target.join("nested/also-local.sav"), b"more");
 
-        let stats = restore_files_into(target, source, None, &[]).await.unwrap();
+        let stats = restore_files_into(target, source, None, Scope::default())
+            .await
+            .unwrap();
 
         assert_eq!(stats.restored, 0, "a.dat is identical, nothing copied");
         assert_eq!(stats.skipped, 1, "a.dat skipped");
@@ -6716,7 +6832,9 @@ mod tests {
         // Target only has a.dat (subset); b.dat will be copied in.
         write_file(&target.join("a.dat"), b"alpha");
 
-        let stats = restore_files_into(target, source, None, &[]).await.unwrap();
+        let stats = restore_files_into(target, source, None, Scope::default())
+            .await
+            .unwrap();
 
         assert_eq!(stats.restored, 1, "b.dat copied");
         assert_eq!(stats.skipped, 1, "a.dat identical");
@@ -6736,7 +6854,9 @@ mod tests {
         write_file(&source.join("a.dat"), b"remote-version");
         write_file(&target.join("a.dat"), b"LOCAL-WORK");
 
-        let stats = restore_files_into(target, source, None, &[]).await.unwrap();
+        let stats = restore_files_into(target, source, None, Scope::default())
+            .await
+            .unwrap();
 
         assert_eq!(stats.restored, 0, "nothing copied: A is a conflict");
         assert_eq!(stats.skipped, 0);
@@ -6765,7 +6885,9 @@ mod tests {
         write_file(&target.join("a.dat"), b"alpha");
         write_file(&target.join("sub/b.dat"), b"beta");
 
-        let stats = restore_files_into(target, source, None, &[]).await.unwrap();
+        let stats = restore_files_into(target, source, None, Scope::default())
+            .await
+            .unwrap();
 
         assert_eq!(stats.restored, 0);
         assert_eq!(stats.skipped, 2);
@@ -6788,7 +6910,9 @@ mod tests {
         write_file(&source.join("b.dat"), b"beta-bytes");
         write_file(&source.join("deep/nested/c.dat"), b"gamma!");
 
-        let stats = restore_files_into(target, source, None, &[]).await.unwrap();
+        let stats = restore_files_into(target, source, None, Scope::default())
+            .await
+            .unwrap();
 
         assert_eq!(stats.restored, 3);
         assert_eq!(stats.skipped, 0);
@@ -6832,7 +6956,7 @@ mod tests {
         set_mtime(&target.join("a.dat"), now - Duration::from_secs(10));
         set_mtime(&source.join("a.dat"), now + Duration::from_secs(10));
 
-        let stats = restore_files_into(target, source, Some(backup), &[])
+        let stats = restore_files_into(target, source, Some(backup), Scope::default())
             .await
             .unwrap();
 
@@ -6864,7 +6988,7 @@ mod tests {
         set_mtime(&source.join("a.dat"), now - Duration::from_secs(60));
         set_mtime(&target.join("a.dat"), now);
 
-        let stats = restore_files_into(target, source, Some(backup), &[])
+        let stats = restore_files_into(target, source, Some(backup), Scope::default())
             .await
             .unwrap();
 
@@ -6901,7 +7025,7 @@ mod tests {
         set_mtime(&source.join("clash.dat"), old + Duration::from_secs(20));
         set_mtime(&target.join("clash.dat"), old);
 
-        let stats = restore_files_into(target, source, Some(backup), &[])
+        let stats = restore_files_into(target, source, Some(backup), Scope::default())
             .await
             .unwrap();
         assert_eq!(stats.restored, 1);
@@ -6942,7 +7066,9 @@ mod tests {
         set_mtime(&target.join("a.dat"), now - Duration::from_secs(10));
         set_mtime(&source.join("a.dat"), now + Duration::from_secs(10));
 
-        let stats = restore_files_into(target, source, None, &[]).await.unwrap();
+        let stats = restore_files_into(target, source, None, Scope::default())
+            .await
+            .unwrap();
 
         assert_eq!(stats.conflicts_resolved_local, 1);
         assert_eq!(stats.conflicts_resolved_remote, 0);

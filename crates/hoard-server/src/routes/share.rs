@@ -24,7 +24,7 @@ use axum::{
     http::StatusCode,
     response::Json,
 };
-use hoard_core::wire::{Save, ShareSaveRequest};
+use hoard_core::wire::{validate_include, Save, ShareSaveRequest};
 use sqlx::{Sqlite, SqliteConnection, SqlitePool};
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -85,6 +85,7 @@ pub async fn share(
     Json(body): Json<ShareSaveRequest>,
 ) -> Result<Json<Save>, ApiError> {
     let user_id = user.user_id.to_string();
+    validate_include(&body.include).map_err(|m| err(StatusCode::BAD_REQUEST, &m))?;
     let access = owner_access(&state.pool, &save_id, &user_id).await?;
     if access.group_id.is_some() {
         return Err(conflict("already_shared", "the save is already shared"));
@@ -101,12 +102,22 @@ pub async fn share(
         return Err(err(StatusCode::NOT_FOUND, "group not found"));
     }
 
+    // An empty list is stored as NULL: "everything", the shape every share had
+    // before the column existed.
+    let include_json = if body.include.is_empty() {
+        None
+    } else {
+        Some(serde_json::to_string(&body.include).map_err(|e| internal_logged("include", e))?)
+    };
     move_content(
         &state.pool,
         &state.store,
         &user_id,
         &save_id,
-        Move::Share(&body.group_id),
+        Move::Share {
+            group_id: &body.group_id,
+            include_json: include_json.as_deref(),
+        },
     )
     .await
     .map_err(move_err)?;
@@ -147,8 +158,11 @@ pub async fn unshare(
 /// Which way the content goes.
 #[derive(Debug, Clone, Copy)]
 pub enum Move<'a> {
-    /// Into this group.
-    Share(&'a str),
+    /// Into this group, naming what the save consists of (`None` is everything).
+    Share {
+        group_id: &'a str,
+        include_json: Option<&'a str>,
+    },
     /// Back to the owner, at the owner's request: a live lease refuses it.
     Unshare,
     /// Back to the owner with nobody asking: a live lease is ended first.
@@ -315,7 +329,7 @@ pub async fn move_content(
         .await?
         .ok_or(MoveError::Changed)?;
     let (from, to, group_id) = match (mv, group.as_deref()) {
-        (Move::Share(g), None) => (
+        (Move::Share { group_id: g, .. }, None) => (
             Namespace::User(owner.clone()),
             Namespace::Group(g.to_string()),
             Some(g),
@@ -369,7 +383,7 @@ pub async fn move_content(
         }
 
         let ended = match mv {
-            Move::Share(_) => None,
+            Move::Share { .. } => None,
             Move::Unshare => {
                 if leases::live_lease(&mut *tx, save_id).await?.is_some() {
                     return Err(MoveError::LeaseHeld);
@@ -431,18 +445,22 @@ pub async fn move_content(
         from.charge(&mut tx, &from_billing, -from_freed_bytes)
             .await?;
 
-        let event = match group_id {
-            Some(gid) => {
+        let event = match mv {
+            Move::Share {
+                group_id: gid,
+                include_json,
+            } => {
                 sqlx::query!(
-                    "INSERT INTO shared_saves (save_id, group_id) VALUES (?, ?)",
+                    "INSERT INTO shared_saves (save_id, group_id, include_json) VALUES (?, ?, ?)",
                     save_id,
-                    gid
+                    gid,
+                    include_json
                 )
                 .execute(&mut *tx)
                 .await?;
                 "save.shared"
             }
-            None => {
+            Move::Unshare | Move::TakeBack => {
                 sqlx::query!("DELETE FROM shared_saves WHERE save_id = ?", save_id)
                     .execute(&mut *tx)
                     .await?;

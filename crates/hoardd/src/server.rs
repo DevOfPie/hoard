@@ -418,19 +418,47 @@ impl Daemon {
                 })
                 .await
             }
-            Request::ShareSave { save_id, group_id } => {
-                self.with_client(|c| async move {
-                    c.share_save(&save_id, &group_id)
-                        .await
-                        .map(|s| Payload::Save(Box::new(s)))
-                })
+            // Sharing changes what the owner's slot walks (the world's files and
+            // nothing else), so the row is rewritten and the slot re-seated here,
+            // the daemon being the one that owns both.
+            Request::ShareSave {
+                save_id,
+                group_id,
+                world,
+            } => {
+                let Some(client) = self.engine.client() else {
+                    return Reply::Error(IpcError::EngineDown {
+                        reason: self.engine.down_reason(),
+                    });
+                };
+                match hoard_agent::library::share_save(
+                    &client,
+                    &save_id,
+                    &group_id,
+                    world.as_deref(),
+                )
                 .await
+                {
+                    Ok((save, watched)) => {
+                        self.reseat(watched).await;
+                        Reply::Ok(Payload::Save(Box::new(save)))
+                    }
+                    Err(err) => self.share_error(err),
+                }
             }
             Request::UnshareSave { save_id } => {
-                self.with_client(|c| async move {
-                    c.unshare_save(&save_id).await.map(|()| Payload::Ack)
-                })
-                .await
+                let Some(client) = self.engine.client() else {
+                    return Reply::Error(IpcError::EngineDown {
+                        reason: self.engine.down_reason(),
+                    });
+                };
+                match hoard_agent::library::unshare_save(&client, &save_id).await {
+                    Ok(watched) => {
+                        self.reseat(watched).await;
+                        Reply::Ok(Payload::Ack)
+                    }
+                    Err(err) => self.share_error(err),
+                }
             }
             Request::GetLease { save_id } => {
                 self.with_client(|c| async move {
@@ -506,6 +534,31 @@ impl Daemon {
             Ok(payload) => Reply::Ok(payload),
             Err(err) => self.api_error(err),
         }
+    }
+
+    /// The slot picks up its rewritten row. The share already happened on the
+    /// server, so a slot that cannot be re-seated is logged, not reported: the
+    /// next `Reload` or restart seats it from the row.
+    async fn reseat(&self, watched: Option<hoard_agent::agent::WatchedSave>) {
+        let Some(watched) = watched else { return };
+        if let Err(err) = engine::reseat(&self.engine, watched).await {
+            tracing::warn!(error = %format!("{err:#}"), "hoardd: couldn't re-seat the shared save");
+        }
+    }
+
+    /// A share refused before the server was asked (a world name that is not a
+    /// stem, a game with no template) is the caller's to fix, so it is
+    /// `Invalid`; the rest is the server's answer.
+    fn share_error(&self, err: anyhow::Error) -> Reply {
+        if err
+            .downcast_ref::<hoard_agent::library::ShareError>()
+            .is_some()
+        {
+            return Reply::Error(IpcError::Invalid {
+                message: format!("{err:#}"),
+            });
+        }
+        self.api_error(err)
     }
 
     /// A 409 keeps its code: the client branches on `held`, `stale`, `pushed`

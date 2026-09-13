@@ -1550,9 +1550,17 @@ impl ApiClient {
     }
 
     /// `POST /v1/saves/{id}/share`: move the save into a group's namespace.
-    pub async fn share_save(&self, save_id: &str, group_id: &str) -> Result<Save> {
+    /// `include` names what the save consists of (empty for everything) and
+    /// comes back to every member on their listing.
+    pub async fn share_save(
+        &self,
+        save_id: &str,
+        group_id: &str,
+        include: &[String],
+    ) -> Result<Save> {
         let body = hoard_core::wire::ShareSaveRequest {
             group_id: group_id.to_string(),
+            include: include.to_vec(),
         };
         let resp = self
             .http

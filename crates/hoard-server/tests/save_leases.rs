@@ -372,7 +372,10 @@ async fn shared() -> Shared {
         st(&h),
         Extension(h.owner.clone()),
         path(),
-        Json(ShareSaveRequest { group_id: g.id }),
+        Json(ShareSaveRequest {
+            group_id: g.id,
+            include: Vec::new(),
+        }),
     )
     .await
     .expect("shared");

@@ -168,6 +168,41 @@ const CONFIG_STEMS: &[&str] = &[
     "hardware",
 ];
 
+/// The two lists every walk of a save folder has to agree on: what the manifest
+/// shields as save data, and what a shared save admits at all.
+///
+/// Borrowed rather than owned so the five places that classify (the backup
+/// walk, the fingerprint sample, the restore gate, the merge count, the preview)
+/// pass exactly the same pair and nobody can hand one without the other. Two
+/// walks with different lists give two different signatures for the same quiet
+/// folder, and the reducer sees a change that never settles.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Scope<'a> {
+    /// Manifest patterns that shield a file as save data.
+    pub shields: &'a [String],
+    /// Patterns naming what a shared save consists of, relative to its root
+    /// (`worlds_local/Alpha.db`). Empty means everything. See [`included`].
+    pub include: &'a [String],
+}
+
+/// Is `rel_path` one of the files a shared save names?
+///
+/// An empty list is no filter. Otherwise the path, `/`-separated as
+/// `walk_source` hands it out, matches when one pattern matches it segment by
+/// segment with [`glob_match`]: `*` and `?` stay inside a segment, there is no
+/// `**`, and a pattern with a different number of segments matches nothing. The
+/// match is exact in case: the patterns are made from names read off the disk.
+pub fn included(include: &[String], rel_path: &str) -> bool {
+    if include.is_empty() {
+        return true;
+    }
+    let path: Vec<&str> = rel_path.split('/').collect();
+    include.iter().any(|pattern| {
+        let pat: Vec<&str> = pattern.split('/').collect();
+        pat.len() == path.len() && pat.iter().zip(&path).all(|(p, s)| glob_match(p, s))
+    })
+}
+
 /// What a restore is allowed to write to disk.
 ///
 /// Travels inside `RestoreOptions` and rides along with the preview, so that
@@ -177,6 +212,9 @@ const CONFIG_STEMS: &[&str] = &[
 pub struct RestoreGate {
     /// Manifest patterns that shield a file as save data.
     pub shields: Vec<String>,
+    /// What a shared save consists of; empty for everything. A file outside it
+    /// is never written, whatever the switch below says.
+    pub include: Vec<String>,
     /// The user asked by hand for the snapshot's config to be written over this
     /// machine's (`--allow-ini`, the switch in the dialog). Off by default, and
     /// always off in auto-restore: writing PC A's config onto PC B is precisely
@@ -190,28 +228,44 @@ impl RestoreGate {
     pub fn permissive() -> Self {
         Self {
             shields: Vec::new(),
+            include: Vec::new(),
             allow_device_local: true,
+        }
+    }
+
+    /// The lists the walk on the other side of this gate has to use.
+    pub fn scope(&self) -> Scope<'_> {
+        Scope {
+            shields: &self.shields,
+            include: &self.include,
         }
     }
 
     /// Does this snapshot file get written to disk?
     pub fn allows(&self, rel_path: &str) -> bool {
-        classify(rel_path, &self.shields).is_restored(self.allow_device_local)
+        classify(rel_path, self.scope()).is_restored(self.allow_device_local)
     }
 }
 
 /// Classifies a file by its path relative to the save root, `/`-separated, the
 /// shape `walk_source` already produces.
 ///
-/// `shields` are filename patterns lifted from the manifest (`*.sav`, `save*`).
-/// Anything matching one is save data and leaves by the top door without
-/// meeting another rule.
-pub fn classify(rel_path: &str, shields: &[String]) -> FileClass {
+/// `scope.shields` are filename patterns lifted from the manifest (`*.sav`,
+/// `save*`). Anything matching one is save data and leaves by the top door
+/// without meeting another rule. `scope.include`, when set, is checked first:
+/// a file a shared save does not name is [`FileClass::Junk`], never backed up,
+/// never restored, never counted.
+pub fn classify(rel_path: &str, scope: Scope<'_>) -> FileClass {
+    // 0. A shared save is its named files and nothing else.
+    if !included(scope.include, rel_path) {
+        return FileClass::Junk;
+    }
+
     let lower = rel_path.to_ascii_lowercase();
     let name = lower.rsplit('/').next().unwrap_or(&lower);
 
     // 1. The manifest rules: if it says this is a save, it is a save.
-    if shields.iter().any(|p| glob_match(p, name)) {
+    if scope.shields.iter().any(|p| glob_match(p, name)) {
         return FileClass::SaveData;
     }
 
@@ -344,7 +398,17 @@ mod tests {
     use super::*;
 
     fn c(path: &str) -> FileClass {
-        classify(path, &[])
+        classify(path, Scope::default())
+    }
+
+    fn shielded(path: &str, shields: &[String]) -> FileClass {
+        classify(
+            path,
+            Scope {
+                shields,
+                include: &[],
+            },
+        )
     }
 
     #[test]
@@ -436,19 +500,19 @@ mod tests {
     #[test]
     fn the_manifest_shield_beats_every_rule_below_it() {
         let shields = vec!["*.ini".to_string()];
-        assert_eq!(classify("save01.ini", &shields), FileClass::SaveData);
-        assert_eq!(classify("save01.ini", &[]), FileClass::DeviceLocal);
+        assert_eq!(shielded("save01.ini", &shields), FileClass::SaveData);
+        assert_eq!(shielded("save01.ini", &[]), FileClass::DeviceLocal);
 
         let log_shield = vec!["*.log".to_string()];
-        assert_eq!(classify("player.log", &log_shield), FileClass::SaveData);
-        assert_eq!(classify("player.log", &[]), FileClass::Junk);
+        assert_eq!(shielded("player.log", &log_shield), FileClass::SaveData);
+        assert_eq!(shielded("player.log", &[]), FileClass::Junk);
     }
 
     #[test]
     fn shields_match_on_the_basename_at_any_depth() {
         let shields = vec!["*.bksav".to_string()];
         assert_eq!(
-            classify("Saves/slot3/quick.bksav", &shields),
+            shielded("Saves/slot3/quick.bksav", &shields),
             FileClass::SaveData
         );
     }
@@ -477,6 +541,7 @@ mod tests {
     fn the_gate_opens_for_config_when_asked_but_never_for_junk() {
         let gate = RestoreGate {
             shields: Vec::new(),
+            include: Vec::new(),
             allow_device_local: true,
         };
         assert!(gate.allows("graphics.ini"));
@@ -489,9 +554,95 @@ mod tests {
     fn a_shielded_config_file_still_goes_through_a_shut_gate() {
         let gate = RestoreGate {
             shields: vec!["*.ini".to_string()],
+            include: Vec::new(),
             allow_device_local: false,
         };
         assert!(gate.allows("save01.ini"));
+    }
+
+    fn inc(patterns: &[&str]) -> Vec<String> {
+        patterns.iter().map(|p| p.to_string()).collect()
+    }
+
+    #[test]
+    fn an_empty_include_list_is_no_filter() {
+        assert!(included(&[], "anything/at/all.bin"));
+        assert!(included(&[], ""));
+    }
+
+    /// The Valheim template: one world's files under `worlds_local/`, the
+    /// wildcard only inside the last segment.
+    #[test]
+    fn include_matches_segment_by_segment() {
+        let list = inc(&[
+            "worlds_local/Alpha.db",
+            "worlds_local/Alpha.fwl",
+            "worlds_local/Alpha_backup_*",
+        ]);
+        assert!(included(&list, "worlds_local/Alpha.db"));
+        assert!(included(
+            &list,
+            "worlds_local/Alpha_backup_auto-20260913.db"
+        ));
+        assert!(!included(&list, "worlds_local/Beta.db"));
+        assert!(!included(&list, "characters_local/Alpha.fch"));
+        // Same name, wrong depth: `*` never crosses a `/`.
+        assert!(!included(&list, "Alpha.db"));
+        assert!(!included(&list, "worlds_local/old/Alpha.db"));
+        assert!(!included(&inc(&["*"]), "worlds_local/Alpha.db"));
+        assert!(!included(&inc(&["*/*/*"]), "worlds_local/Alpha.db"));
+        assert!(included(&inc(&["*/*"]), "worlds_local/Alpha.db"));
+    }
+
+    /// Exact in case: the pattern was made from the name on disk.
+    #[test]
+    fn include_is_case_sensitive() {
+        assert!(!included(
+            &inc(&["worlds_local/alpha.db"]),
+            "worlds_local/Alpha.db"
+        ));
+    }
+
+    /// `?` is one character of one segment, like everywhere else in the module.
+    #[test]
+    fn include_question_mark_is_one_character() {
+        let list = inc(&["slot?.sav"]);
+        assert!(included(&list, "slot1.sav"));
+        assert!(!included(&list, "slot12.sav"));
+        assert!(!included(&list, "a/slot1.sav"));
+    }
+
+    /// Outside the list a file is litter to every consumer: not uploaded, not
+    /// restored, not counted, whatever the shields say about it.
+    #[test]
+    fn a_file_outside_the_include_list_is_junk_before_any_shield() {
+        let include = inc(&["worlds_local/Alpha.db"]);
+        let shields = inc(&["*.db"]);
+        let scope = Scope {
+            shields: &shields,
+            include: &include,
+        };
+        assert_eq!(
+            classify("worlds_local/Alpha.db", scope),
+            FileClass::SaveData
+        );
+        assert_eq!(classify("worlds_local/Beta.db", scope), FileClass::Junk);
+        assert!(!classify("worlds_local/Beta.db", scope).is_backed_up());
+        assert!(!classify("worlds_local/Beta.db", scope).is_restored(true));
+    }
+
+    #[test]
+    fn the_gate_carries_the_include_list() {
+        let gate = RestoreGate {
+            shields: Vec::new(),
+            include: inc(&["worlds_local/Alpha.db", "worlds_local/Alpha.fwl"]),
+            allow_device_local: true,
+        };
+        assert!(gate.allows("worlds_local/Alpha.db"));
+        assert!(!gate.allows("worlds_local/Beta.db"));
+        assert!(!gate.allows("characters_local/Me.fch"));
+        // Wide open still means wide open.
+        assert!(RestoreGate::permissive().allows("characters_local/Me.fch"));
     }
 
     #[test]

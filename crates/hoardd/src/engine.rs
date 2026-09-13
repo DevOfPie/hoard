@@ -33,7 +33,7 @@ use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use hoard_agent::agent::{self, AgentConfig, AgentEvent, AgentHandle};
+use hoard_agent::agent::{self, AgentConfig, AgentEvent, AgentHandle, WatchedSave};
 use hoard_agent::api::ApiClient;
 use hoard_agent::config::CliConfig;
 use hoard_agent::lease::LeaseHandle;
@@ -932,6 +932,18 @@ pub async fn reload(engine: &Engine) -> anyhow::Result<usize> {
     let watched = desired_ids.len();
     engine.set_watched(watched);
     Ok(watched)
+}
+
+/// Re-seats one save the way [`reload`] would if its row were new: out and back
+/// in, so the slot picks up what changed on the row (a share's include list, a
+/// cleared one). `reload` only diffs by id and would leave the old slot.
+pub async fn reseat(engine: &Engine, save: WatchedSave) -> anyhow::Result<()> {
+    let Some(handle) = engine.handle() else {
+        anyhow::bail!("the engine isn't running");
+    };
+    handle.remove_save(save.save_id.clone()).await?;
+    handle.add_save(save).await?;
+    Ok(())
 }
 
 #[cfg(test)]

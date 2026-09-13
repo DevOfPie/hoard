@@ -144,7 +144,8 @@ pub async fn list(
                       COALESCE(COUNT(sn.id), 0) as "snapshot_count: i64",
                       COALESCE(SUM(sn.total_size_bytes), 0) as "total_size_bytes: i64",
                       ss.group_id as "group_id?", g.name as "group_name?",
-                      g.owner_user_id as "group_owner_id?", u.username as "group_owner_name?"
+                      g.owner_user_id as "group_owner_id?", u.username as "group_owner_name?",
+                      ss.include_json as "include_json?"
                FROM saves s
                LEFT JOIN shared_saves ss ON ss.save_id = s.id
                LEFT JOIN groups g ON g.id = ss.group_id
@@ -167,7 +168,8 @@ pub async fn list(
                       COALESCE(COUNT(sn.id), 0) as "snapshot_count: i64",
                       COALESCE(SUM(sn.total_size_bytes), 0) as "total_size_bytes: i64",
                       ss.group_id as "group_id?", g.name as "group_name?",
-                      g.owner_user_id as "group_owner_id?", u.username as "group_owner_name?"
+                      g.owner_user_id as "group_owner_id?", u.username as "group_owner_name?",
+                      ss.include_json as "include_json?"
                FROM saves s
                LEFT JOIN shared_saves ss ON ss.save_id = s.id
                LEFT JOIN groups g ON g.id = ss.group_id
@@ -426,6 +428,7 @@ struct SaveRow {
     group_name: Option<String>,
     group_owner_id: Option<String>,
     group_owner_name: Option<String>,
+    include_json: Option<String>,
 }
 
 impl SaveRow {
@@ -438,11 +441,20 @@ impl SaveRow {
             self.group_owner_name,
         ) {
             (Some(group_id), Some(group_name), Some(owner_user_id), Some(owner)) => {
+                // A column that does not parse reads as everything, the same as
+                // NULL: the share was validated on the way in, so this only
+                // happens to a row edited by hand.
+                let include = self
+                    .include_json
+                    .as_deref()
+                    .and_then(|j| serde_json::from_str::<Vec<String>>(j).ok())
+                    .unwrap_or_default();
                 Some(SharedInfo {
                     group_id,
                     group_name,
                     owner_user_id,
                     owner_username: repair_username(&owner),
+                    include,
                 })
             }
             _ => None,
@@ -478,7 +490,8 @@ pub(crate) async fn fetch_save(
                   COALESCE(COUNT(sn.id), 0) as "snapshot_count: i64",
                   COALESCE(SUM(sn.total_size_bytes), 0) as "total_size_bytes: i64",
                   ss.group_id as "group_id?", g.name as "group_name?",
-                  g.owner_user_id as "group_owner_id?", u.username as "group_owner_name?"
+                  g.owner_user_id as "group_owner_id?", u.username as "group_owner_name?",
+                  ss.include_json as "include_json?"
            FROM saves s
            LEFT JOIN shared_saves ss ON ss.save_id = s.id
            LEFT JOIN groups g ON g.id = ss.group_id

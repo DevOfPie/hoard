@@ -123,20 +123,24 @@ pub async fn apply(
     // consulted when we know which game the folder belongs to; a bare `--to` over
     // a save that is not in the local state gets no shields and the kernel
     // decides on its own.
+    let row = CliState::load_default()
+        .ok()
+        .and_then(|(st, _)| st.saves.get(&save_id).cloned());
     let shields = {
         // A save new to this machine has no row until the restore is done, so with
         // `--remember` its game comes from the plan.
         let slug = match &home {
             Some(home) => Some(home.game_slug.clone()),
-            None => CliState::load_default()
-                .ok()
-                .and_then(|(st, _)| st.saves.get(&save_id).map(|s| s.game_slug.clone())),
+            None => row.as_ref().map(|s| s.game_slug.clone()),
         };
         slug.map(|s| hoard_agent::savefilter::shields_for_slug(&s))
             .unwrap_or_default()
     };
     let gate = hoard_core::kernel::fileclass::RestoreGate {
         shields,
+        // A shared save writes only its world's files, the same list its backup
+        // walks.
+        include: row.map(|s| s.include).unwrap_or_default(),
         allow_device_local: allow_ini,
     };
 

@@ -575,7 +575,7 @@ enum ByteSource {
 async fn build_reuse_index(
     dir: &Path,
     wanted_sizes: &HashSet<u64>,
-    shields: &[String],
+    gate: &RestoreGate,
 ) -> ReuseIndex {
     if wanted_sizes.is_empty() || !dir.exists() {
         // An empty or missing destination: no index, everything downloads, which is
@@ -583,22 +583,23 @@ async fn build_reuse_index(
         return ReuseIndex::new();
     }
     // `walk_source` is the same walk the backup side uses: sorted by relative
-    // path, symlinks and transient game locks already filtered out.
-    let candidates: Vec<crate::backup::UploadFile> = match crate::backup::walk_source(dir, shields)
-    {
-        Ok(files) => files
-            .into_iter()
-            .filter(|f| wanted_sizes.contains(&f.size_bytes))
-            .collect(),
-        Err(e) => {
-            tracing::debug!(
-                dir = %dir.display(),
-                error = %format!("{e:#}"),
-                "cloud restore: couldn't walk the local folder; downloading everything"
-            );
-            return ReuseIndex::new();
-        }
-    };
+    // path, symlinks, transient game locks and anything outside the include
+    // list already filtered out.
+    let candidates: Vec<crate::backup::UploadFile> =
+        match crate::backup::walk_source(dir, gate.scope()) {
+            Ok(files) => files
+                .into_iter()
+                .filter(|f| wanted_sizes.contains(&f.size_bytes))
+                .collect(),
+            Err(e) => {
+                tracing::debug!(
+                    dir = %dir.display(),
+                    error = %format!("{e:#}"),
+                    "cloud restore: couldn't walk the local folder; downloading everything"
+                );
+                return ReuseIndex::new();
+            }
+        };
 
     // A few files hash in flight so per-file open latency overlaps. `buffered`
     // rather than `buffer_unordered`: results stay in walk order, so when two
@@ -819,7 +820,7 @@ where
     let plan = match options.reuse_from.as_deref() {
         Some(reuse_dir) => {
             let wanted: HashSet<u64> = kept.iter().map(|f| f.size_bytes.max(0) as u64).collect();
-            let index = build_reuse_index(reuse_dir, &wanted, &options.gate.shields).await;
+            let index = build_reuse_index(reuse_dir, &wanted, &options.gate).await;
             let shas: Vec<String> = kept.iter().map(|f| f.sha256.clone()).collect();
             plan_byte_sources(&shas, &index)
         }
@@ -1420,7 +1421,8 @@ mod tests {
             seed(dir.path(), &format!("_autosave{i}.zip"), blob);
         }
 
-        let index = build_reuse_index(dir.path(), &sizes_of(&blobs), &[]).await;
+        let index =
+            build_reuse_index(dir.path(), &sizes_of(&blobs), &RestoreGate::permissive()).await;
         let plan = plan_byte_sources(&manifest_shas, &index);
 
         assert_eq!(plan.len(), N);
@@ -1468,7 +1470,7 @@ mod tests {
         assert_eq!(kept.len(), 2, "la puerta debe vetar el .ini");
 
         let sizes: HashSet<u64> = kept.iter().map(|(_, b)| b.len() as u64).collect();
-        let index = build_reuse_index(dir.path(), &sizes, &gate.shields).await;
+        let index = build_reuse_index(dir.path(), &sizes, &gate).await;
         let shas: Vec<String> = kept.iter().map(|(_, b)| sha_of(b)).collect();
         let plan = plan_byte_sources(&shas, &index);
 
@@ -1512,8 +1514,12 @@ mod tests {
 
         seed(dir.path(), "save.dat", &local);
 
-        let index =
-            build_reuse_index(dir.path(), &sizes_of(std::slice::from_ref(&remote)), &[]).await;
+        let index = build_reuse_index(
+            dir.path(),
+            &sizes_of(std::slice::from_ref(&remote)),
+            &RestoreGate::permissive(),
+        )
+        .await;
         let plan = plan_byte_sources(&[sha_of(&remote)], &index);
 
         assert_eq!(plan, vec![ByteSource::Download]);
@@ -1528,7 +1534,7 @@ mod tests {
         let wanted = sizes_of(&blobs);
 
         let empty = tempfile::tempdir().unwrap();
-        let index = build_reuse_index(empty.path(), &wanted, &[]).await;
+        let index = build_reuse_index(empty.path(), &wanted, &RestoreGate::permissive()).await;
         assert!(index.is_empty());
         assert_eq!(
             plan_byte_sources(&shas, &index),
@@ -1536,7 +1542,7 @@ mod tests {
         );
 
         let missing = empty.path().join("not-created-yet");
-        let index = build_reuse_index(&missing, &wanted, &[]).await;
+        let index = build_reuse_index(&missing, &wanted, &RestoreGate::permissive()).await;
         assert!(index.is_empty());
         assert_eq!(
             plan_byte_sources(&shas, &index),
@@ -1552,8 +1558,12 @@ mod tests {
         let blob = vec![7u8; 8192];
         seed(dir.path(), "nested/old-name.zip", &blob);
 
-        let index =
-            build_reuse_index(dir.path(), &sizes_of(std::slice::from_ref(&blob)), &[]).await;
+        let index = build_reuse_index(
+            dir.path(),
+            &sizes_of(std::slice::from_ref(&blob)),
+            &RestoreGate::permissive(),
+        )
+        .await;
         let plan = plan_byte_sources(&[sha_of(&blob)], &index);
 
         assert_eq!(

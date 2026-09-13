@@ -399,9 +399,17 @@ pub enum Request {
         group_id: String,
     },
     /// Move a save into a group's namespace. Answers [`Payload::Save`].
+    ///
+    /// `world` names the world inside the save's root (`Alpha` for Valheim's
+    /// `worlds_local/Alpha.db`); the daemon turns it into the include list the
+    /// share carries, so members pull that world and nothing else. `None`
+    /// shares the whole folder. A game with no template or a name that is not
+    /// a file stem answers [`IpcError::Invalid`].
     ShareSave {
         save_id: String,
         group_id: String,
+        #[serde(default)]
+        world: Option<String>,
     },
     /// Move a save back into the owner's namespace.
     UnshareSave {
@@ -670,6 +678,11 @@ pub enum IpcError {
     /// `message` is what the user reads.
     #[error("{message}")]
     Conflict { code: String, message: String },
+    /// The request itself is wrong (a world name that is not a file stem, a
+    /// game with no world template): retrying will not help, the user has to
+    /// change what they asked for.
+    #[error("{message}")]
+    Invalid { message: String },
     #[error("the Hoard service couldn't do it: {message}")]
     Internal { message: String },
 }
