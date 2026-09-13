@@ -1402,26 +1402,22 @@ pub async fn adopt(client: &ApiClient, args: AdoptArgs) -> Result<TrackOutcome> 
     reject_degenerate_slug(&args.game_slug)?;
     // The row already exists on the server; what is read back is whether it is
     // shared and, if so, of what it consists, so the first walk of the folder
-    // already takes the world's files and nothing else. Cloud has no groups.
-    // Best-effort: a server that cannot be reached right now still lets the
-    // folder be adopted, and `reconcile_with_server` fills the pair in at the
-    // engine's next start.
+    // already takes the world's files and nothing else. Cloud has no groups. A
+    // server that cannot answer refuses the adopt: seating the slot without the
+    // list would push this machine's whole folder into the group.
     let (shared, include) = if client.is_cloud().await {
         (None, Vec::new())
     } else {
-        match client.get_save(&args.save_id).await {
-            Ok(row) => (
-                row.shared.as_ref().map(shared_ref_from),
-                row.shared.map(|s| s.include).unwrap_or_default(),
-            ),
-            Err(e) => {
-                tracing::warn!(
-                    save_id = %args.save_id, error = %format!("{e:#}"),
-                    "adopt: couldn't read the server's row; sharing is settled at reconcile"
-                );
-                (None, Vec::new())
-            }
-        }
+        let row = client.get_save(&args.save_id).await.with_context(|| {
+            format!(
+                "couldn't read the server's row for {}; try again when the server answers",
+                args.save_id
+            )
+        })?;
+        (
+            row.shared.as_ref().map(shared_ref_from),
+            row.shared.map(|s| s.include).unwrap_or_default(),
+        )
     };
     let local_path = PathBuf::from(&args.local_path);
     // Adopting is repointing a save that already exists in the cloud: overlapping
@@ -1580,6 +1576,9 @@ pub struct HomeForRestore {
     /// uploads under both.
     pub game_slug: String,
     pub label: String,
+    /// What the save consists of when it is shared, from the same server row:
+    /// the safety copy and the gate walk it before the row exists here.
+    pub include: Vec<String>,
 }
 
 /// Checks `local_path` as the folder `save_id` will live in on this machine,
@@ -1617,10 +1616,11 @@ pub async fn plan_home_for_restore(
             adopt: None,
             game_slug: row.game_slug.clone(),
             label: row.label.clone(),
+            include: row.include.clone(),
         });
     }
 
-    let (game_slug, label) = server_name_of(client, save_id).await?;
+    let (game_slug, label, include) = server_name_of(client, save_id).await?;
     reject_degenerate_slug(&game_slug)?;
     restore_twin(&state, save_id, &game_slug, &label, local_path)?;
     Ok(HomeForRestore {
@@ -1634,6 +1634,7 @@ pub async fn plan_home_for_restore(
         }),
         game_slug,
         label,
+        include,
     })
 }
 
@@ -1651,9 +1652,13 @@ impl HomeForRestore {
     }
 }
 
-/// The `(game_slug, label)` the server files a save under. Cloud mounts no
-/// `GET /v1/saves/:id`, so there it comes out of the sync manifest.
-async fn server_name_of(client: &ApiClient, save_id: &str) -> Result<(String, String)> {
+/// The `(game_slug, label, include)` the server files a save under. Cloud
+/// mounts no `GET /v1/saves/:id` and has no groups, so there it comes out of
+/// the sync manifest with an empty list.
+async fn server_name_of(
+    client: &ApiClient,
+    save_id: &str,
+) -> Result<(String, String, Vec<String>)> {
     if client.is_cloud().await {
         let manifest = client.cloud_sync().await?;
         let entry = manifest
@@ -1661,10 +1666,11 @@ async fn server_name_of(client: &ApiClient, save_id: &str) -> Result<(String, St
             .into_iter()
             .find(|e| e.save_id == save_id)
             .with_context(|| format!("the cloud has no save {save_id}"))?;
-        return Ok((entry.game_slug, entry.label));
+        return Ok((entry.game_slug, entry.label, Vec::new()));
     }
     let save = client.get_save(save_id).await?;
-    Ok((save.game_slug.into_inner(), save.label))
+    let include = save.shared.map(|s| s.include).unwrap_or_default();
+    Ok((save.game_slug.into_inner(), save.label, include))
 }
 
 fn format_optional_time(t: Option<OffsetDateTime>) -> Option<String> {
@@ -2692,32 +2698,24 @@ pub async fn share_save(
     group_id: &str,
     world: Option<&str>,
 ) -> Result<(hoard_core::wire::Save, Option<WatchedSave>)> {
-    let (mut state, path) = CliState::load_default()?;
     let include = match world {
         None => Vec::new(),
         Some(w) => {
             // The template goes by game, and the row is the cheapest place to
             // read it; a save not tracked here still has a game on the server.
-            let slug = match state.saves.get(save_id) {
-                Some(st) => st.game_slug.clone(),
+            let local_slug = CliState::load_default()
+                .ok()
+                .and_then(|(state, _)| state.saves.get(save_id).map(|st| st.game_slug.clone()));
+            let slug = match local_slug {
+                Some(slug) => slug,
                 None => client.get_save(save_id).await?.game_slug.into_inner(),
             };
             include_for_share(&slug, Some(w))?
         }
     };
+    hoard_core::wire::validate_include(&include).map_err(|m| anyhow::anyhow!(m))?;
     let save = client.share_save(save_id, group_id, &include).await?;
-    let watched = state.saves.get_mut(save_id).map(|st| {
-        st.shared = save.shared.as_ref().map(shared_ref_from);
-        st.include = save
-            .shared
-            .as_ref()
-            .map(|s| s.include.clone())
-            .unwrap_or_default();
-        watched_from_snapshot(save_id.to_string(), st)
-    });
-    if watched.is_some() {
-        state.save(&path)?;
-    }
+    let watched = record_sharing(save_id, save.shared.as_ref());
     Ok((save, watched))
 }
 
@@ -2725,16 +2723,39 @@ pub async fn share_save(
 /// machine's row. The `WatchedSave` to reseat, when the save is tracked here.
 pub async fn unshare_save(client: &ApiClient, save_id: &str) -> Result<Option<WatchedSave>> {
     client.unshare_save(save_id).await?;
-    let (mut state, path) = CliState::load_default()?;
-    let watched = state.saves.get_mut(save_id).map(|st| {
-        st.shared = None;
-        st.include.clear();
-        watched_from_snapshot(save_id.to_string(), st)
-    });
-    if watched.is_some() {
-        state.save(&path)?;
+    Ok(record_sharing(save_id, None))
+}
+
+/// Writes the server's answer onto this machine's row, after the server has
+/// moved. State is loaded here and not before the call, so a version cursor
+/// hoardd persisted meanwhile is not written over. A local failure is logged
+/// and not returned: the server row is the truth and `reconcile_with_server`
+/// repairs the row at the next start. A paused row stays paused: nothing is
+/// reseated for it, as `set_preset` does.
+fn record_sharing(
+    save_id: &str,
+    shared: Option<&hoard_core::wire::SharedInfo>,
+) -> Option<WatchedSave> {
+    let (mut state, path) = match CliState::load_default() {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!(save_id, error = %format!("{e:#}"), "sharing: couldn't read state; the row lags until reconcile");
+            return None;
+        }
+    };
+    let st = state.saves.get_mut(save_id)?;
+    st.shared = shared.map(shared_ref_from);
+    st.include = shared.map(|s| s.include.clone()).unwrap_or_default();
+    let snapshot = st.clone();
+    if let Err(e) = state.save(&path) {
+        tracing::warn!(save_id, error = %format!("{e:#}"), "sharing: couldn't write state; the row lags until reconcile");
+        return None;
     }
-    Ok(watched)
+    if snapshot.paused {
+        None
+    } else {
+        Some(watched_from_snapshot(save_id.to_string(), &snapshot))
+    }
 }
 
 #[cfg(test)]

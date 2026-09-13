@@ -189,18 +189,36 @@ pub struct Scope<'a> {
 ///
 /// An empty list is no filter. Otherwise the path, `/`-separated as
 /// `walk_source` hands it out, matches when one pattern matches it segment by
-/// segment with [`glob_match`]: `*` and `?` stay inside a segment, there is no
-/// `**`, and a pattern with a different number of segments matches nothing. The
-/// match is exact in case: the patterns are made from names read off the disk.
+/// segment with [`glob_match`]: `*` and `?` stay inside a segment and there is
+/// no `**`. A pattern with fewer segments than the path names a directory and
+/// covers everything beneath it (`saves/Alpha` takes `saves/Alpha/region/r.mca`);
+/// a pattern with more segments than the path matches nothing. The match is
+/// exact in case: the patterns are made from names read off the disk. This is
+/// a stored format (`shared_saves.include_json`), evaluated by every member's
+/// build, so the rule does not move.
 pub fn included(include: &[String], rel_path: &str) -> bool {
-    if include.is_empty() {
-        return true;
+    include.is_empty()
+        || include
+            .iter()
+            .any(|pattern| pattern_covers(pattern, rel_path))
+}
+
+/// One pattern against one path, without collecting either: this runs once per
+/// file per pattern on the engine's tick.
+fn pattern_covers(pattern: &str, rel_path: &str) -> bool {
+    let mut pat = pattern.split('/');
+    let mut path = rel_path.split('/');
+    loop {
+        match (pat.next(), path.next()) {
+            (None, _) => return true,
+            (Some(_), None) => return false,
+            (Some(p), Some(s)) => {
+                if !glob_match(p, s) {
+                    return false;
+                }
+            }
+        }
     }
-    let path: Vec<&str> = rel_path.split('/').collect();
-    include.iter().any(|pattern| {
-        let pat: Vec<&str> = pattern.split('/').collect();
-        pat.len() == path.len() && pat.iter().zip(&path).all(|(p, s)| glob_match(p, s))
-    })
 }
 
 /// What a restore is allowed to write to disk.
@@ -589,9 +607,24 @@ mod tests {
         // Same name, wrong depth: `*` never crosses a `/`.
         assert!(!included(&list, "Alpha.db"));
         assert!(!included(&list, "worlds_local/old/Alpha.db"));
-        assert!(!included(&inc(&["*"]), "worlds_local/Alpha.db"));
+        // A pattern deeper than the path matches nothing; one at the same
+        // depth matches segment by segment.
         assert!(!included(&inc(&["*/*/*"]), "worlds_local/Alpha.db"));
         assert!(included(&inc(&["*/*"]), "worlds_local/Alpha.db"));
+    }
+
+    /// A pattern shorter than the path names a directory and covers everything
+    /// beneath it: how a game that keeps a world in a folder of its own is named.
+    #[test]
+    fn a_shorter_pattern_covers_the_directory_it_names() {
+        let list = inc(&["saves/Alpha"]);
+        assert!(included(&list, "saves/Alpha/level.dat"));
+        assert!(included(&list, "saves/Alpha/region/r.0.0.mca"));
+        assert!(!included(&list, "saves/Alpha2/level.dat"));
+        assert!(!included(&list, "saves/Beta/level.dat"));
+        assert!(!included(&list, "saves"));
+        // `*` alone therefore covers the whole root, which is what it says.
+        assert!(included(&inc(&["*"]), "worlds_local/Alpha.db"));
     }
 
     /// Exact in case: the pattern was made from the name on disk.
