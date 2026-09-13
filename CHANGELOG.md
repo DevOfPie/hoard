@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [1.1.7] - 2026-09-13
+
 ### Added
 - **This fork updates from its own releases.** The desktop app, the CLI and the
   server look for new versions at DevOfPie/hoard and accept only builds signed
