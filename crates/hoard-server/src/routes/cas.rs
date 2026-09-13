@@ -288,6 +288,17 @@ pub async fn init(
     // the superset exception below, which it must not be able to bypass.
     if let Namespace::Group(_) = ns {
         crate::routes::leases::require_host(&mut *tx, &save_id, &user_id).await?;
+        // And only the world's own files: the list every member filters with is
+        // enforced here so a row that lost it cannot push the rest of a folder.
+        let include = crate::routes::share::include_for(&mut *tx, &save_id)
+            .await
+            .map_err(|e| internal_logged("include lookup", e))?;
+        if let Some(p) = crate::routes::share::first_outside_include(
+            &include,
+            body.files.iter().map(|f| f.relative_path.as_str()),
+        ) {
+            return Err(outside_include(p));
+        }
     }
     if let Some(base) = body.base_version {
         // A base that does not match the head is rejected so a push cannot bury
@@ -432,6 +443,19 @@ async fn manifest_covers_head(
 /// that field is the canonical row the push was rejected against, which may not be
 /// the one the client thought it was writing to, and the client parses one
 /// structure instead of branching on which server answered.
+/// 400 with a code the client can name: the manifest carries a file the share
+/// does not include.
+pub(crate) fn outside_include(path: &str) -> ApiError {
+    (
+        StatusCode::BAD_REQUEST,
+        Json(serde_json::json!({
+            "error": format!("{path} is not part of what this shared save consists of"),
+            "code": "outside_include",
+            "path": path,
+        })),
+    )
+}
+
 fn non_fast_forward(save_id: &str, head: i64, base: i64) -> ApiError {
     (
         StatusCode::CONFLICT,
@@ -951,6 +975,22 @@ pub async fn commit(
             rollback(&placed);
             cleanup_staging();
             return Err(e);
+        }
+        let include = match crate::routes::share::include_for(&mut *tx, &save_id).await {
+            Ok(v) => v,
+            Err(e) => {
+                rollback(&placed);
+                cleanup_staging();
+                return Err(internal_logged("include lookup", e));
+            }
+        };
+        if let Some(p) = crate::routes::share::first_outside_include(
+            &include,
+            body.files.iter().map(|f| f.relative_path.as_str()),
+        ) {
+            rollback(&placed);
+            cleanup_staging();
+            return Err(outside_include(p));
         }
     }
     if let Some(base) = body.base_version {

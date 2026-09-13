@@ -712,6 +712,59 @@ async fn the_include_list_is_stored_with_the_share_and_listed_to_everyone() {
     assert!(save.shared.as_ref().unwrap().include.is_empty());
 }
 
+/// The list is enforced where it cannot be forgotten: a push carrying a file
+/// the share does not name is refused before a byte moves, whoever pushes.
+#[tokio::test]
+async fn a_push_outside_the_include_list_is_refused() {
+    let h = harness().await;
+    let f = Fixture::new();
+    two_versions(&h, &f).await;
+    let gid = group_with_everyone(&h).await;
+    share_with(
+        &h,
+        &h.owner,
+        &gid,
+        &["worlds_local/Alpha.db", "worlds_local/Alpha.fwl"],
+    )
+    .await
+    .expect("shared");
+    let Json(_) = leases::acquire(
+        st(&h),
+        Extension(h.owner.clone()),
+        Path(SAVE.to_string()),
+        axum::http::HeaderMap::new(),
+        Json(LeaseAcquireRequest { base_version: 2 }),
+    )
+    .await
+    .expect("lease");
+
+    let stray: &[(&str, &[u8])] = &[
+        ("worlds_local/Alpha.db", b"world"),
+        ("characters_local/Me.fch", b"me"),
+    ];
+    let err = match cas::init(
+        st(&h),
+        Extension(h.owner.clone()),
+        Path(SAVE.to_string()),
+        Json(CasInit {
+            base_version: Some(2),
+            files: manifest(stray),
+        }),
+    )
+    .await
+    {
+        Err(e) => e,
+        Ok(_) => panic!("a character file is refused"),
+    };
+    assert_eq!(err.0, StatusCode::BAD_REQUEST);
+    assert_eq!(err.1 .0["code"], "outside_include");
+    assert_eq!(err.1 .0["path"], "characters_local/Me.fch");
+
+    let inside: &[(&str, &[u8])] = &[("worlds_local/Alpha.db", b"world")];
+    let (_, snap) = backup_as(&h, &h.owner, inside, Some(2)).await;
+    assert_eq!(snap.version_num, 3);
+}
+
 /// A list the client cannot have made from a world name is refused whole,
 /// before anything moves.
 #[tokio::test]
