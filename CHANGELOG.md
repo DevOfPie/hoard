@@ -18,6 +18,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   its last heartbeat, so a machine that dies mid-session frees the world on its
   own instead of holding it until somebody notices. This is the server side; the
   desktop app and the CLI follow.
+- **A shared save names its files.** Sharing a Valheim world sends only that
+  world (`worlds_local/<name>` and its backups), never the characters, and every
+  member's backup, restore and fingerprint honour the same list. A world shared
+  with you appears in `hoard saves` with its group, ready to adopt into a folder.
 
 ## [1.1.7] - 2026-09-13
 

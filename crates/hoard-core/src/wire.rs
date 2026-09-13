@@ -371,8 +371,12 @@ pub fn validate_include(include: &[String]) -> Result<(), String> {
         if p.contains('\\') {
             return Err(format!("include pattern uses `\\`; separate with `/`: {p}"));
         }
-        if p.split('/').any(|seg| seg.is_empty() || seg == "..") {
-            return Err(format!("include pattern has an empty or `..` segment: {p}"));
+        if p.split('/')
+            .any(|seg| seg.is_empty() || seg == ".." || seg == ".")
+        {
+            return Err(format!(
+                "include pattern has an empty, `.` or `..` segment: {p}"
+            ));
         }
     }
     Ok(())

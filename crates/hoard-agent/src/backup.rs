@@ -2149,8 +2149,15 @@ pub async fn remember_save(
                 processes: prev_processes,
                 shared_processes: prev_shared,
                 allow_device_local: prev_allow_device_local,
-                shared: None,
-                include: Vec::new(),
+                // The server row says whether the save is shared and of what it
+                // consists; dropping that here would send the next push over the
+                // whole folder.
+                shared: save.shared.as_ref().map(crate::library::shared_ref_from),
+                include: save
+                    .shared
+                    .as_ref()
+                    .map(|s| s.include.clone())
+                    .unwrap_or_default(),
             },
         );
     } else if let Some(existing) = state.saves.get(save_id).cloned() {
