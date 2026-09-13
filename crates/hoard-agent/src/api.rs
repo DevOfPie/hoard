@@ -1549,6 +1549,19 @@ impl ApiClient {
         Ok(())
     }
 
+    /// `DELETE /v1/groups/{id}`: the owner dissolves the group. Its shares
+    /// go back to their owners on the server.
+    pub async fn delete_group(&self, group_id: &str) -> Result<()> {
+        let resp = self
+            .http
+            .delete(self.url(&format!("/v1/groups/{group_id}")))
+            .header("authorization", self.auth_header())
+            .send()
+            .await?;
+        Self::ok_or_err(resp).await?;
+        Ok(())
+    }
+
     /// `POST /v1/saves/{id}/share`: move the save into a group's namespace.
     /// `include` names what the save consists of (empty for everything) and
     /// comes back to every member on their listing.

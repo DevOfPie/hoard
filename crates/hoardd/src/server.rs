@@ -385,8 +385,12 @@ impl Daemon {
             // The group verbs are plain server calls on the engine's client, and
             // they answer with the server's payload.
             Request::ListGroups => {
-                self.with_client(|c| async move { c.list_groups().await.map(Payload::Groups) })
-                    .await
+                self.with_client(|c| async move {
+                    c.list_groups()
+                        .await
+                        .map(|groups| Payload::Groups { groups })
+                })
+                .await
             }
             Request::CreateGroup { name } => {
                 self.with_client(|c| async move {
@@ -421,6 +425,36 @@ impl Daemon {
                     c.leave_group(&group_id, &me).await.map(|()| Payload::Ack)
                 })
                 .await
+            }
+            Request::RemoveMember { group_id, user_id } => {
+                self.with_client(|c| async move {
+                    c.leave_group(&group_id, &user_id)
+                        .await
+                        .map(|()| Payload::Ack)
+                })
+                .await
+            }
+            Request::DeleteGroup { group_id } => {
+                self.with_client(|c| async move {
+                    c.delete_group(&group_id).await.map(|()| Payload::Ack)
+                })
+                .await
+            }
+            // The list comes off this machine's disk, but it is gated on the
+            // engine like a share is: with no engine there is no session, and
+            // a test fixture must never read the tester's own `state.json`.
+            Request::ListWorlds { save_id } => {
+                if self.engine.client().is_none() {
+                    return Reply::Error(IpcError::EngineDown {
+                        reason: self.engine.down_reason(),
+                    });
+                }
+                match hoard_agent::library::list_worlds(&save_id) {
+                    Ok(worlds) => Reply::Ok(Payload::Worlds { worlds }),
+                    Err(err) => Reply::Error(IpcError::Invalid {
+                        message: format!("{err:#}"),
+                    }),
+                }
             }
             // Sharing changes what the owner's slot walks (the world's files and
             // nothing else), so the row is rewritten and the slot re-seated here,

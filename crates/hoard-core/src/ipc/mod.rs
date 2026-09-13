@@ -404,6 +404,23 @@ pub enum Request {
     LeaveGroup {
         group_id: String,
     },
+    /// The owner takes a member out of the group. Same server route as
+    /// leaving, another user's id.
+    RemoveMember {
+        group_id: String,
+        user_id: String,
+    },
+    /// The owner deletes the group: its shares go back to their owners.
+    DeleteGroup {
+        group_id: String,
+    },
+    /// The worlds a tracked save holds, each with the include list a share of
+    /// it would carry. Answers [`Payload::Worlds`]; empty for a game with no
+    /// world template (it shares whole). Needs the save tracked on this
+    /// machine: the list comes from its folder.
+    ListWorlds {
+        save_id: String,
+    },
     /// Move a save into a group's namespace. Answers [`Payload::Save`].
     ///
     /// `world` names the world inside the save's root (`Alpha` for Valheim's
@@ -464,7 +481,12 @@ pub enum Payload {
     /// How the update is going (answer to [`Request::UpdateStatus`] and to
     /// [`Request::ApplyUpdate`]).
     Update(UpdateState),
-    Groups(Vec<crate::wire::Group>),
+    /// A struct variant, not a newtype: an internally tagged enum cannot
+    /// serialize a variant that wraps a bare sequence (serde refuses at run
+    /// time), so the list travels under a field.
+    Groups {
+        groups: Vec<crate::wire::Group>,
+    },
     /// Boxed, like the two below: a reply is mostly `Ack`, and the enum must
     /// not grow to the size of a `Save` for it.
     Group(Box<crate::wire::Group>),
@@ -472,6 +494,21 @@ pub enum Payload {
     /// `None` when nobody is hosting.
     Lease(Option<Box<crate::wire::Lease>>),
     Save(Box<crate::wire::Save>),
+    /// The worlds of a save (answer to [`Request::ListWorlds`]). A struct
+    /// variant for the same reason as `Groups`.
+    Worlds {
+        worlds: Vec<WorldFiles>,
+    },
+}
+
+/// One world a save holds and what a share of it carries: the patterns the
+/// game's template resolves for that name, `/`-separated and relative to the
+/// save root. Computed by the service so no frontend re-implements the
+/// template.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorldFiles {
+    pub name: String,
+    pub include: Vec<String>,
 }
 
 /// Everything the service knows about the update, which is all of it: what is
@@ -1086,12 +1123,56 @@ mod tests {
                 },
                 "dismiss_world",
             ),
+            (
+                Request::ListWorlds {
+                    save_id: "w1".into(),
+                },
+                "list_worlds",
+            ),
+            (
+                Request::RemoveMember {
+                    group_id: "g1".into(),
+                    user_id: "u2".into(),
+                },
+                "remove_member",
+            ),
+            (
+                Request::DeleteGroup {
+                    group_id: "g1".into(),
+                },
+                "delete_group",
+            ),
             (Request::Shutdown, "shutdown"),
         ];
         for (request, op) in cases {
             let json = serde_json::to_value(&request).unwrap();
             assert_eq!(json["op"], op, "wire name changed for {request:?}");
         }
+    }
+
+    /// The world list travels as `{name, include}` rows under the `worlds`
+    /// payload tag: the share dialog lists the names and shows the include
+    /// list as "what travels", so both halves are contract.
+    #[test]
+    fn a_world_list_carries_each_worlds_include_list() {
+        let payload = Payload::Worlds {
+            worlds: vec![WorldFiles {
+                name: "Alpha".into(),
+                include: vec!["worlds_local/Alpha.db".into()],
+            }],
+        };
+        let json = serde_json::to_value(&payload).unwrap();
+        assert_eq!(json["payload"], "worlds");
+        // The sibling list payload has to survive the same trip: an internally
+        // tagged enum cannot carry a bare sequence, which is why both are
+        // struct variants.
+        serde_json::to_value(Payload::Groups { groups: Vec::new() }).unwrap();
+        assert_eq!(json["worlds"][0]["name"], "Alpha");
+        assert_eq!(json["worlds"][0]["include"][0], "worlds_local/Alpha.db");
+        let back: Payload = serde_json::from_value(json).unwrap();
+        assert!(
+            matches!(back, Payload::Worlds { worlds } if worlds.len() == 1 && worlds[0].name == "Alpha")
+        );
     }
 
     /// Older desktops send `force_restore` without `version_num`. New daemon

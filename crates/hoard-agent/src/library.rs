@@ -2654,6 +2654,33 @@ pub fn include_for_share(game_slug: &str, world: Option<&str>) -> Result<Vec<Str
     }
 }
 
+/// The worlds a save tracked here holds, each with the include list a share
+/// of it carries (see [`crate::worldfiles`]). Empty for a game with no world
+/// template: it shares whole, and a picker has nothing to offer. A save not
+/// tracked on this machine has no folder to look in.
+pub fn list_worlds(save_id: &str) -> Result<Vec<hoard_core::ipc::WorldFiles>> {
+    let (state, _) = CliState::load_default()?;
+    let st = state.saves.get(save_id).context(
+        "This save isn't tracked on this machine; link a local folder before sharing a world of it.",
+    )?;
+    world_files(&st.game_slug, &st.local_path)
+}
+
+/// [`list_worlds`] for a known game and folder: the worlds under `root`, each
+/// with its include list.
+pub fn world_files(game_slug: &str, root: &Path) -> Result<Vec<hoard_core::ipc::WorldFiles>> {
+    if !crate::worldfiles::has_template(game_slug) {
+        return Ok(Vec::new());
+    }
+    crate::worldfiles::worlds(game_slug, root)
+        .into_iter()
+        .map(|name| {
+            let include = include_for_share(game_slug, Some(&name))?;
+            Ok(hoard_core::ipc::WorldFiles { name, include })
+        })
+        .collect()
+}
+
 /// Shares `save_id` into `group_id`, naming `world` when the game shares by
 /// world (see [`crate::worldfiles`]). On success this machine's row takes the
 /// server's `shared` and `include`, and the `WatchedSave` to reseat comes back
@@ -3957,7 +3984,10 @@ mod slug_gate_tests {
 
 #[cfg(test)]
 mod sharing_tests {
-    use super::{include_for_share, sync_shared_from_server, tracked_from_server_row, ShareError};
+    use super::{
+        include_for_share, sync_shared_from_server, tracked_from_server_row, world_files,
+        ShareError,
+    };
     use crate::state::{CliState, SaveState, SharedRef};
     use hoard_core::wire::{Save, SharedInfo};
     use std::path::PathBuf;
@@ -4108,5 +4138,39 @@ mod sharing_tests {
         assert!(include_for_share("stardew-valley", None)
             .unwrap()
             .is_empty());
+    }
+
+    #[test]
+    fn a_game_without_a_template_lists_no_worlds() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(world_files("stardew-valley", dir.path())
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn a_template_game_lists_each_world_with_its_include_list() {
+        let dir = tempfile::tempdir().unwrap();
+        let worlds = dir.path().join("worlds_local");
+        std::fs::create_dir_all(&worlds).unwrap();
+        for f in [
+            "Beta.fwl",
+            "Beta.db",
+            "Alpha.fwl",
+            "Alpha_backup_auto-1.fwl",
+        ] {
+            std::fs::write(worlds.join(f), b"").unwrap();
+        }
+        let out = world_files("valheim", dir.path()).unwrap();
+        let names: Vec<&str> = out.iter().map(|w| w.name.as_str()).collect();
+        assert_eq!(names, ["Alpha", "Beta"]);
+        assert_eq!(
+            out[0].include,
+            include_for_share("valheim", Some("Alpha")).unwrap()
+        );
+        assert!(out[0]
+            .include
+            .iter()
+            .all(|p| p.starts_with("worlds_local/Alpha")));
     }
 }

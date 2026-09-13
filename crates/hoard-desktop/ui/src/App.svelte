@@ -24,6 +24,7 @@
     Bell,
     Eye,
     EyeOff,
+    Users,
   } from "@lucide/svelte";
   import { _ } from "svelte-i18n";
 
@@ -43,6 +44,7 @@
   const loadOnboardingDone = () => import("./routes/OnboardingDone.svelte");
   const loadDashboard = () => import("./routes/Dashboard.svelte");
   const loadLibrary = () => import("./routes/Library.svelte");
+  const loadGroups = () => import("./routes/Groups.svelte");
   const loadSettings = () => import("./routes/Settings.svelte");
   const loadHistory = () => import("./routes/History.svelte");
   const loadLogs = () => import("./routes/Logs.svelte");
@@ -172,6 +174,7 @@
     "/onboarding/done": lazy(loadOnboardingDone),
     "/dashboard": lazy(loadDashboard),
     "/library": lazy(loadLibrary),
+    "/groups": lazy(loadGroups),
     "/settings": lazy(loadSettings),
     // The old `/history` index was a duplicate of the Dashboard, so it was
     // dropped from the nav. The per-save timeline still lives here and is
@@ -807,6 +810,7 @@
       children: [
         { kind: "link", labelKey: "nav.library", icon: Library, route: "/library" },
         { kind: "link", labelKey: "nav.dashboard", icon: Triforce, route: "/dashboard" },
+        { kind: "link", labelKey: "nav.groups", icon: Users, route: "/groups" },
       ],
     },
     // Hoard-Screen (overlay) is a Cloud-only paid feature: shown (and server
@@ -827,6 +831,7 @@
   const APP_ROUTE_PREFIXES = [
     "/dashboard",
     "/library",
+    "/groups",
     "/settings",
     "/history",
     "/logs",

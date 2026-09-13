@@ -281,6 +281,39 @@ async fn the_world_and_group_verbs_round_trip_and_want_an_engine() {
     let text = err.to_string();
     assert!(text.contains("no engine"), "{text}");
 
+    // The world list is read off this machine's disk, and still wants an engine:
+    // without one the fixture would be reading the tester's own `state.json`.
+    let err = client
+        .request(Request::ListWorlds {
+            save_id: "w1".into(),
+        })
+        .await
+        .expect_err("no engine, no world list");
+    let text = err.to_string();
+    assert!(text.contains("no engine"), "{text}");
+    assert!(
+        !text.contains("EngineDown"),
+        "leaked the Debug shape: {text}"
+    );
+
+    // The owner's verbs are server calls like the listing: same answer.
+    for request in [
+        Request::RemoveMember {
+            group_id: "g1".into(),
+            user_id: "u2".into(),
+        },
+        Request::DeleteGroup {
+            group_id: "g1".into(),
+        },
+    ] {
+        let err = client
+            .request(request)
+            .await
+            .expect_err("no engine, no client to call with");
+        let text = err.to_string();
+        assert!(text.contains("no engine"), "{text}");
+    }
+
     // Still connected: a refused request is an answer, not a farewell.
     let (_, pid) = client.ping().await.unwrap();
     assert_eq!(pid, std::process::id());

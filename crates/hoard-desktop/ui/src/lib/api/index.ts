@@ -761,6 +761,42 @@ export type AgentEvent =
       type: "backup_attention_cleared";
       save_id: string;
       game_slug: string;
+    }
+  | {
+      /** This machine took a role on a shared world. `auto` is the engine
+       *  deciding on its own (the unanswered prompt). */
+      type: "world_claimed";
+      save_id: string;
+      game_slug: string;
+      role: WorldRole;
+      auto: boolean;
+    }
+  | { type: "world_released"; save_id: string; game_slug: string }
+  | {
+      /** Local changes on a world another member hosts: they stay local. */
+      type: "world_hosted_elsewhere";
+      save_id: string;
+      game_slug: string;
+      holder: string;
+    }
+  | {
+      /** The lease this machine held is gone: forced, or expired offline. */
+      type: "world_lease_lost";
+      save_id: string;
+      game_slug: string;
+    }
+  | {
+      /** A game with shared worlds started and nothing says which world this
+       *  machine plays, or how. Answered with `claimWorld` or `dismissWorld`. */
+      type: "world_claim_wanted";
+      game_slug: string;
+      worlds: WorldChoice[];
+    }
+  | {
+      /** A second write landed on a world this machine only views. */
+      type: "view_session_writing";
+      save_id: string;
+      game_slug: string;
     };
 
 /** Ensure the sync service is up and report its engine status. */
@@ -1492,4 +1528,156 @@ export function catalogStatus(): Promise<CatalogStatus> {
 
 export function updateCatalog(): Promise<CatalogUpdateResult> {
   return invoke<CatalogUpdateResult>("update_catalog");
+}
+
+// ---- Groups, shares and world leases (commands/groups.rs) -----------------
+//
+// Field names mirror `hoard_core::wire` and `hoard_core::ipc::events` exactly:
+// these rows come off the service unchanged.
+
+/** One member of a group. `role` is `owner` or `member`. */
+export type GroupMember = {
+  user_id: string;
+  username: string;
+  role: string;
+  joined_at: string;
+};
+
+/** A group as the caller sees it, members included. */
+export type Group = {
+  id: string;
+  name: string;
+  owner_user_id: string;
+  created_at: string;
+  members: GroupMember[];
+};
+
+/** A freshly minted invite. `token` is shown once: the server keeps only
+ *  its hash. */
+export type InviteOut = {
+  invite_id: string;
+  token: string;
+  expires_at: string;
+};
+
+/** Who is hosting a shared save. `live` is computed on read: unreleased and
+ *  renewed within the server's TTL. */
+export type Lease = {
+  save_id: string;
+  holder_user_id: string;
+  holder_username: string;
+  holder_device_fp?: string | null;
+  acquired_at: string;
+  renewed_at: string;
+  base_version: number;
+  /** The holder has pushed under this lease: it cannot be forced any more. */
+  pushed_since: boolean;
+  live: boolean;
+};
+
+/** The lease as the card draws it: the row, and whether this machine holds
+ *  it (by device fingerprint, decided on the Rust side). */
+export type LeaseView = {
+  lease: Lease | null;
+  here: boolean;
+};
+
+/** What a machine does with a shared world during a session. */
+export type WorldRole = "host" | "view";
+
+/** The lease as the engine last heard it, for the prompt. */
+export type WorldLease = "unknown" | "free" | "mine" | "other";
+
+/** One shared world the claim prompt offers. */
+export type WorldChoice = {
+  save_id: string;
+  label: string;
+  group_name: string;
+  holder?: string | null;
+  lease: WorldLease;
+};
+
+/** One world a save holds and what a share of it carries: `/`-separated
+ *  patterns relative to the save root, resolved by the service. */
+export type WorldFiles = {
+  name: string;
+  include: string[];
+};
+
+export function listGroups(): Promise<Group[]> {
+  return invoke<Group[]>("list_groups");
+}
+
+export function createGroup(name: string): Promise<Group> {
+  return invoke<Group>("create_group", { name });
+}
+
+/** Mint an invite token. `expiresInSecs` defaults to seven days on the server. */
+export function inviteToGroup(
+  groupId: string,
+  expiresInSecs?: number,
+): Promise<InviteOut> {
+  return invoke<InviteOut>("invite_to_group", {
+    groupId,
+    expiresInSecs: expiresInSecs ?? null,
+  });
+}
+
+export function joinGroup(token: string): Promise<Group> {
+  return invoke<Group>("join_group", { token });
+}
+
+export function leaveGroup(groupId: string): Promise<void> {
+  return invoke<void>("leave_group", { groupId });
+}
+
+export function removeMember(groupId: string, userId: string): Promise<void> {
+  return invoke<void>("remove_member", { groupId, userId });
+}
+
+export function deleteGroup(groupId: string): Promise<void> {
+  return invoke<void>("delete_group", { groupId });
+}
+
+/** Move a save into a group. `world` names the world for a game that shares
+ *  by world; `null` shares the whole folder. Answers the server's row. */
+export function shareSave(
+  saveId: string,
+  groupId: string,
+  world: string | null,
+): Promise<unknown> {
+  return invoke<unknown>("share_save", { saveId, groupId, world });
+}
+
+export function unshareSave(saveId: string): Promise<void> {
+  return invoke<void>("unshare_save", { saveId });
+}
+
+/** Accepted at once; the outcome arrives as `agent://world-claimed` or
+ *  `agent://world-hosted-elsewhere`. */
+export function claimWorld(saveId: string, role: WorldRole): Promise<void> {
+  return invoke<void>("claim_world", { saveId, role });
+}
+
+export function releaseWorld(saveId: string): Promise<void> {
+  return invoke<void>("release_world", { saveId });
+}
+
+/** Take the lease off its holder. Refused once they have pushed under it. */
+export function forceWorld(saveId: string): Promise<void> {
+  return invoke<void>("force_world", { saveId });
+}
+
+/** "Not playing": answers the claim prompt without taking a role. */
+export function dismissWorld(saveId: string): Promise<void> {
+  return invoke<void>("dismiss_world", { saveId });
+}
+
+export function getLease(saveId: string): Promise<LeaseView> {
+  return invoke<LeaseView>("get_lease", { saveId });
+}
+
+/** The worlds a tracked save holds. Empty for a game that shares whole. */
+export function listWorlds(saveId: string): Promise<WorldFiles[]> {
+  return invoke<WorldFiles[]>("list_worlds", { saveId });
 }

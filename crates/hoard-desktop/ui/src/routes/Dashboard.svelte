@@ -33,6 +33,7 @@
   import Input from "../lib/components/Input.svelte";
   import Modal from "../lib/components/Modal.svelte";
   import SaveGameCard from "../lib/components/SaveGameCard.svelte";
+  import ShareWorldModal from "../lib/components/ShareWorldModal.svelte";
   import MirrorWarningBanner from "../lib/components/MirrorWarningBanner.svelte";
   import * as api from "../lib/api";
   import type {
@@ -56,6 +57,8 @@
     hydrateCoverAspect,
   } from "../lib/stores/coverAspect.svelte";
   import { toastError, toastSuccess } from "../lib/stores/toasts";
+  import { showError } from "../lib/stores/error_dialog";
+  import { refreshLease } from "../lib/stores/groups";
   import {
     formatBytes,
     formatDateTime,
@@ -384,6 +387,7 @@
     void hydrateCoverAspect();
     try {
       saves = await api.listTrackedSaves();
+      seedLeases(saves);
     } catch (e) {
       toastError(typeof e === "string" ? e : (e as Error).message);
     } finally {
@@ -461,6 +465,71 @@
       toastError(typeof e === "string" ? e : (e as Error).message);
     } finally {
       signingOut = false;
+    }
+  }
+
+  // ---- Sharing and leases. The verbs go to the service; the outcome of a
+  // claim or a release arrives as an event the groups store folds in, the
+  // lease is read back once so the chip does not wait on the journal.
+  let shareTarget = $state<TrackedSave | null>(null);
+  let unshareTarget = $state<TrackedSave | null>(null);
+  let takeOverTarget = $state<TrackedSave | null>(null);
+  let leaseBusy = $state(false);
+
+  /** Every shared row's lease, once: the chips draw from the store. */
+  function seedLeases(rows: TrackedSave[]) {
+    for (const s of rows) {
+      if (s.shared) void refreshLease(s.save_id).catch(() => {});
+    }
+  }
+
+  async function onShared() {
+    try {
+      saves = await api.listTrackedSaves();
+      seedLeases(saves);
+    } catch (e) {
+      toastError(typeof e === "string" ? e : (e as Error).message);
+    }
+    toastSuccess($_("share.shared_toast"));
+  }
+
+  async function confirmUnshare() {
+    if (!unshareTarget || leaseBusy) return;
+    const target = unshareTarget;
+    leaseBusy = true;
+    try {
+      await api.unshareSave(target.save_id);
+      saves = await api.listTrackedSaves();
+      toastSuccess($_("share.unshared_toast"));
+      unshareTarget = null;
+    } catch (e) {
+      showError(e);
+    } finally {
+      leaseBusy = false;
+    }
+  }
+
+  async function releaseWorld(save: TrackedSave) {
+    try {
+      await api.releaseWorld(save.save_id);
+      toastSuccess($_("lease.released_toast"));
+    } catch (e) {
+      showError(e);
+    }
+  }
+
+  async function confirmTakeOver() {
+    if (!takeOverTarget || leaseBusy) return;
+    const target = takeOverTarget;
+    leaseBusy = true;
+    try {
+      await api.forceWorld(target.save_id);
+      toastSuccess($_("lease.take_over_toast"));
+      takeOverTarget = null;
+    } catch (e) {
+      showError(e);
+    } finally {
+      leaseBusy = false;
     }
   }
 
@@ -786,6 +855,10 @@
           onBackup={backupNow}
           onTogglePause={togglePause}
           onHistory={(s) => push(`/history/${s.save_id}`)}
+          onShare={(s) => (shareTarget = s)}
+          onUnshare={(s) => (unshareTarget = s)}
+          onRelease={releaseWorld}
+          onTakeOver={(s) => (takeOverTarget = s)}
         />
       {/each}
     </div>
@@ -868,6 +941,59 @@
     </Button>
     <Button onclick={confirmRename} loading={renaming}>
       {$_("common.save")}
+    </Button>
+  {/snippet}
+</Modal>
+
+<ShareWorldModal
+  save={shareTarget}
+  onClose={() => (shareTarget = null)}
+  onShared={onShared}
+/>
+
+<!-- Unshare: the save goes back to its owner's namespace; members lose it. -->
+<Modal
+  open={unshareTarget !== null}
+  title={$_("share.unshare_title")}
+  dismissible={!leaseBusy}
+  onClose={() => {
+    if (!leaseBusy) unshareTarget = null;
+  }}
+>
+  <p class="text-sm text-zinc-300">
+    {$_("share.unshare_body", {
+      values: { label: unshareTarget?.label ?? "", group: unshareTarget?.shared?.group_name ?? "" },
+    })}
+  </p>
+  {#snippet footer()}
+    <Button variant="ghost" onclick={() => (unshareTarget = null)} disabled={leaseBusy}>
+      {$_("common.cancel")}
+    </Button>
+    <Button variant="danger" onclick={confirmUnshare} loading={leaseBusy}>
+      {$_("share.menu_unshare")}
+    </Button>
+  {/snippet}
+</Modal>
+
+<!-- Take over: the service refuses once the holder has pushed under the
+     lease; the dialog only says what is about to be asked. -->
+<Modal
+  open={takeOverTarget !== null}
+  title={$_("lease.take_over_title")}
+  dismissible={!leaseBusy}
+  onClose={() => {
+    if (!leaseBusy) takeOverTarget = null;
+  }}
+>
+  <p class="text-sm text-zinc-300">
+    {$_("lease.take_over_body", { values: { label: takeOverTarget?.label ?? "" } })}
+  </p>
+  {#snippet footer()}
+    <Button variant="ghost" onclick={() => (takeOverTarget = null)} disabled={leaseBusy}>
+      {$_("common.cancel")}
+    </Button>
+    <Button onclick={confirmTakeOver} loading={leaseBusy}>
+      {$_("lease.menu_take_over")}
     </Button>
   {/snippet}
 </Modal>
