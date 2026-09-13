@@ -1,0 +1,26 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT s.user_id, ss.group_id AS \"group_id?\"\n           FROM saves s LEFT JOIN shared_saves ss ON ss.save_id = s.id\n           WHERE s.id = ?",
+  "describe": {
+    "columns": [
+      {
+        "name": "user_id",
+        "ordinal": 0,
+        "type_info": "Text"
+      },
+      {
+        "name": "group_id?",
+        "ordinal": 1,
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": [
+      false,
+      false
+    ]
+  },
+  "hash": "249af7325bf86a64e3e17eebffa80d2468092616a37e6a0b20b0eb0a6965c0e6"
+}

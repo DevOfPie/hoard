@@ -79,7 +79,7 @@ use crate::routes::access::save_access;
 use crate::routes::health::ServerState;
 use crate::routes::snapshots::{
     blob_in_db, chunk_in_db, err, internal, internal_logged, is_safe_relative_path,
-    prune_over_version_cap, snapshot_too_large, snapshot_too_large_declared,
+    namespace_changed, prune_over_version_cap, snapshot_too_large, snapshot_too_large_declared,
 };
 
 type ApiError = (StatusCode, Json<serde_json::Value>);
@@ -116,11 +116,11 @@ impl Stored {
 /// quota until the purge frees them, so its content is available and referencing
 /// it is correct.
 async fn stored_representation(
-    pool: &sqlx::SqlitePool,
+    conn: &mut sqlx::SqliteConnection,
     ns: &Namespace,
     sha: &str,
 ) -> Result<Option<Stored>, sqlx::Error> {
-    if let Some(size) = namespace::blob_size(pool, ns, sha).await? {
+    if let Some(size) = namespace::blob_size(&mut *conn, ns, sha).await? {
         return Ok(Some(Stored::Blob { size_bytes: size }));
     }
 
@@ -149,7 +149,7 @@ async fn stored_representation(
     let row = sqlx::query(sql)
         .bind(scope)
         .bind(sha)
-        .fetch_optional(pool)
+        .fetch_optional(conn)
         .await?;
 
     Ok(row.map(|r| Stored::Chunks {
@@ -260,18 +260,34 @@ pub async fn init(
         return Err(snapshot_too_large_declared(max_per_snapshot, logical));
     }
 
+    // Everything below depends on the namespace: the lease, what is missing,
+    // who pays. One write-locked transaction reads it all against the
+    // namespace as it stands now, and a share since the access lookup is a
+    // 409 rather than a missing list computed against the wrong tables.
+    let mut tx = state
+        .pool
+        .begin_with("BEGIN IMMEDIATE")
+        .await
+        .map_err(|e| internal_logged("opening the init transaction", e))?;
+    let now = Namespace::for_save(&mut *tx, &save_id)
+        .await
+        .map_err(|e| internal_logged("namespace lookup", e))?;
+    if now.as_ref() != Some(&ns) {
+        return Err(namespace_changed());
+    }
+
     // Reject the non-fast-forward *before* a byte moves. In the multipart this
     // check arrives after the whole save has been uploaded; here it is the first
     // thing, which is half the reason for having an `init` at all.
     let head: i64 = sqlx::query_scalar("SELECT latest_version_num FROM saves WHERE id=?")
         .bind(&save_id)
-        .fetch_one(&state.pool)
+        .fetch_one(&mut *tx)
         .await
         .map_err(|e| internal_logged("reading the save's latest version", e))?;
     // A shared save is pushed by its host alone, the owner included. Before
     // the superset exception below, which it must not be able to bypass.
     if let Namespace::Group(_) = ns {
-        crate::routes::leases::require_host(&state.pool, &save_id, &user_id).await?;
+        crate::routes::leases::require_host(&mut *tx, &save_id, &user_id).await?;
     }
     if let Some(base) = body.base_version {
         // A base that does not match the head is rejected so a push cannot bury
@@ -283,7 +299,7 @@ pub async fn init(
         // do it themselves. Reading the head out of a 409 body is from aug-2026,
         // and before that a rejection left them knowing they had diverged but not
         // from what.
-        if base != head && !manifest_covers_head(&state.pool, &save_id, head, &body.files).await? {
+        if base != head && !manifest_covers_head(&mut tx, &save_id, head, &body.files).await? {
             return Err(non_fast_forward(&save_id, head, base));
         }
         if base != head {
@@ -305,7 +321,7 @@ pub async fn init(
         if !valid_sha256(&sha) {
             return Err(err(StatusCode::BAD_REQUEST, "invalid sha256 in manifest"));
         }
-        if stored_representation(&state.pool, &ns, &sha)
+        if stored_representation(&mut tx, &ns, &sha)
             .await
             .map_err(|e| internal_logged("blob dedup lookup", e))?
             .is_none()
@@ -329,12 +345,16 @@ pub async fn init(
     let (quota, used): (i64, i64) =
         sqlx::query_as("SELECT storage_quota_bytes, storage_used_bytes FROM users WHERE id=?")
             .bind(&billing)
-            .fetch_one(&state.pool)
+            .fetch_one(&mut *tx)
             .await
             .map_err(|e| internal_logged("quota lookup", e))?;
     if used + missing_bytes > quota {
         return Err(err(StatusCode::PAYLOAD_TOO_LARGE, "storage quota exceeded"));
     }
+    // Nothing was written; the commit only gives the lock back.
+    tx.commit()
+        .await
+        .map_err(|e| internal_logged("closing the init transaction", e))?;
 
     let upload_id = Uuid::new_v4().to_string();
     let dir = staging_dir(&state.config.storage.data_dir, &upload_id);
@@ -374,7 +394,7 @@ pub async fn init(
 /// half-built version, or one from before content-addressing) concedes nothing
 /// either: there is nothing to compare against.
 async fn manifest_covers_head(
-    pool: &sqlx::SqlitePool,
+    conn: &mut sqlx::SqliteConnection,
     save_id: &str,
     head: i64,
     files: &[CasFile],
@@ -390,7 +410,7 @@ async fn manifest_covers_head(
     )
     .bind(save_id)
     .bind(head)
-    .fetch_all(pool)
+    .fetch_all(conn)
     .await
     .map_err(|e| internal_logged("reading the head's manifest", e))?;
     if head_files.is_empty() {
@@ -688,6 +708,10 @@ pub async fn commit(
     // was uploaded, and gets rejected before the store is touched.
     let mut staged: HashMap<String, (PathBuf, i64)> = HashMap::new();
     let mut reused: HashMap<String, Stored> = HashMap::new();
+    let mut conn = state.pool.acquire().await.map_err(|e| {
+        cleanup_staging();
+        internal_logged("blob dedup lookup", e)
+    })?;
     for (sha, _declared) in unique_shas(&body.files) {
         if !valid_sha256(&sha) {
             cleanup_staging();
@@ -702,12 +726,13 @@ pub async fn commit(
                 staged.insert(sha, (path, meta.len() as i64));
             }
             Err(_) => {
-                let Some(stored) = stored_representation(&state.pool, &ns, &sha)
-                    .await
-                    .map_err(|e| {
-                        cleanup_staging();
-                        internal_logged("blob dedup lookup", e)
-                    })?
+                let Some(stored) =
+                    stored_representation(&mut conn, &ns, &sha)
+                        .await
+                        .map_err(|e| {
+                            cleanup_staging();
+                            internal_logged("blob dedup lookup", e)
+                        })?
                 else {
                     cleanup_staging();
                     warn!(sha = %sha, save_id = %save_id, "cas commit: manifest references a blob that was never uploaded");
@@ -720,6 +745,7 @@ pub async fn commit(
             }
         }
     }
+    drop(conn);
 
     // ---- chunk whatever deserves it (ADR 0019)
     // Planning only (hashing), no writing: if the quota refuses further down there
@@ -884,11 +910,29 @@ pub async fn commit(
 
     // ---- transaction: rows only
     let snapshot_id = Uuid::new_v4().to_string();
-    let mut tx = state.pool.begin().await.map_err(|e| {
+    let mut tx = state
+        .pool
+        .begin_with("BEGIN IMMEDIATE")
+        .await
+        .map_err(|e| {
+            rollback(&placed);
+            cleanup_staging();
+            internal_logged("opening the commit transaction", e)
+        })?;
+
+    // The namespace was read before the bytes were placed; a share or unshare
+    // since then means they sit under the wrong keys. Checked under the write
+    // lock, so nothing can move the save between here and the rows.
+    let now = Namespace::for_save(&mut *tx, &save_id).await.map_err(|e| {
         rollback(&placed);
         cleanup_staging();
-        internal_logged("opening the commit transaction", e)
+        internal_logged("namespace lookup", e)
     })?;
+    if now.as_ref() != Some(&ns) {
+        rollback(&placed);
+        cleanup_staging();
+        return Err(namespace_changed());
+    }
 
     let head: i64 = sqlx::query_scalar("SELECT latest_version_num FROM saves WHERE id=?")
         .bind(&save_id)
@@ -1275,10 +1319,13 @@ mod tests {
         .unwrap();
 
         let u1 = Namespace::User("u1".into());
-        let got = stored_representation(&pool, &u1, &whole).await.unwrap();
+        let mut conn = pool.acquire().await.unwrap();
+        let got = stored_representation(&mut conn, &u1, &whole).await.unwrap();
         assert!(matches!(got, Some(Stored::Blob { size_bytes: 100 })));
 
-        let got = stored_representation(&pool, &u1, &chunked).await.unwrap();
+        let got = stored_representation(&mut conn, &u1, &chunked)
+            .await
+            .unwrap();
         match got {
             Some(Stored::Chunks {
                 size_bytes,
@@ -1290,13 +1337,13 @@ mod tests {
             other => panic!("expected chunked, got {other:?}"),
         }
 
-        assert!(stored_representation(&pool, &u1, &absent)
+        assert!(stored_representation(&mut conn, &u1, &absent)
             .await
             .unwrap()
             .is_none());
         // Dedup does not cross accounts: another user does not see this content.
         assert!(
-            stored_representation(&pool, &Namespace::User("u2".into()), &whole)
+            stored_representation(&mut conn, &Namespace::User("u2".into()), &whole)
                 .await
                 .unwrap()
                 .is_none()

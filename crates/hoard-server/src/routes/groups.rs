@@ -32,6 +32,8 @@ type ApiError = (StatusCode, Json<serde_json::Value>);
 
 const MAX_NAME_CHARS: usize = 64;
 const DEFAULT_INVITE_TTL_SECS: u64 = 7 * 24 * 60 * 60;
+/// A year. Past it `OffsetDateTime` arithmetic panics before the stamp exists.
+const MAX_INVITE_TTL_SECS: u64 = 365 * 24 * 60 * 60;
 
 /// One (group, member) row; `fold_groups` turns a run of them into `Group`s.
 struct GroupRow {
@@ -225,11 +227,20 @@ pub async fn delete(
     if st.owner_user_id != user_id {
         return Err(owner_only());
     }
+    // The guard, the object purge and the row go under one write lock: a
+    // share landing between them would cascade its rows away and orphan its
+    // objects. With no save shared the namespace should hold nothing; what it
+    // does hold is stray, and would otherwise outlive its `group_blobs` rows.
+    let mut tx = state
+        .pool
+        .begin_with("BEGIN IMMEDIATE")
+        .await
+        .map_err(|e| internal_logged("opening a transaction", e))?;
     let shared: i64 = sqlx::query_scalar!(
         r#"SELECT COUNT(*) AS "n: i64" FROM shared_saves WHERE group_id = ?"#,
         group_id
     )
-    .fetch_one(&state.pool)
+    .fetch_one(&mut *tx)
     .await
     .map_err(|e| internal_logged("counting shared saves", e))?;
     if shared > 0 {
@@ -238,10 +249,24 @@ pub async fn delete(
             "unshare every save before deleting the group",
         ));
     }
+    let (objects, bytes) = crate::store::purge_group_objects(&mut tx, &state.store, &group_id)
+        .await
+        .map_err(|e| internal_logged("purging a group's objects", e))?;
+    if objects > 0 {
+        tracing::warn!(
+            group_id,
+            objects,
+            bytes,
+            "group delete: stray objects purged"
+        );
+    }
     sqlx::query!("DELETE FROM groups WHERE id = ?", group_id)
-        .execute(&state.pool)
+        .execute(&mut *tx)
         .await
         .map_err(|e| internal_logged("deleting a group", e))?;
+    tx.commit()
+        .await
+        .map_err(|e| internal_logged("committing a group delete", e))?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -268,7 +293,13 @@ pub async fn create_invite(
             "expires_in_secs must be positive",
         ));
     }
-    let ttl = i64::try_from(ttl).unwrap_or(i64::MAX / 2);
+    if ttl > MAX_INVITE_TTL_SECS {
+        return Err(err(
+            StatusCode::BAD_REQUEST,
+            "expires_in_secs must be at most one year",
+        ));
+    }
+    let ttl = i64::try_from(ttl).expect("capped at a year");
 
     let mut raw = [0u8; 32];
     rand::thread_rng().fill_bytes(&mut raw);
@@ -341,11 +372,27 @@ pub async fn join(
         return Err(invalid());
     }
 
+    // The UPDATE carries the checks: two redemptions of one token serialise on
+    // the write lock, and the second finds `used_at` set and changes nothing.
     let mut tx = state
         .pool
-        .begin()
+        .begin_with("BEGIN IMMEDIATE")
         .await
         .map_err(|e| internal_logged("opening a transaction", e))?;
+    let used = sqlx::query!(
+        "UPDATE group_invites SET used_by = ?, used_at = ?
+         WHERE id = ? AND used_at IS NULL AND expires_at > ?",
+        user_id,
+        now,
+        invite.id,
+        now
+    )
+    .execute(&mut *tx)
+    .await
+    .map_err(|e| internal_logged("marking an invite used", e))?;
+    if used.rows_affected() == 0 {
+        return Err(invalid());
+    }
     sqlx::query!(
         "INSERT INTO group_members (group_id, user_id, role) VALUES (?, ?, 'member')",
         invite.group_id,
@@ -354,15 +401,6 @@ pub async fn join(
     .execute(&mut *tx)
     .await
     .map_err(|e| internal_logged("inserting a membership", e))?;
-    sqlx::query!(
-        "UPDATE group_invites SET used_by = ?, used_at = ? WHERE id = ?",
-        user_id,
-        now,
-        invite.id
-    )
-    .execute(&mut *tx)
-    .await
-    .map_err(|e| internal_logged("marking an invite used", e))?;
     tx.commit()
         .await
         .map_err(|e| internal_logged("committing a join", e))?;
@@ -400,6 +438,29 @@ pub async fn remove_member(
             StatusCode::CONFLICT,
             "the owner cannot leave their own group",
         ));
+    }
+    // What the departing member holds in the group goes first: the leases
+    // they hold (they can no longer read the saves they host), then the saves
+    // they shared, back into their own namespace (the owner would go on
+    // paying for a save nobody in the group can unshare). Each ended lease is
+    // announced once its transaction is behind it.
+    let ended = crate::routes::leases::end_leases_held_in_group(&state.pool, &group_id, &target)
+        .await
+        .map_err(|e| internal_logged("ending the member's leases", e))?;
+    for lease in &ended {
+        crate::routes::leases::announce_end(&state, lease).await;
+    }
+    let ended = crate::routes::share::take_back_group(
+        &state.pool,
+        &state.store,
+        &user_id,
+        &group_id,
+        Some(&target),
+    )
+    .await
+    .map_err(|e| internal_logged("taking back the member's shared saves", e))?;
+    for lease in &ended {
+        crate::routes::leases::announce_end(&state, lease).await;
     }
     let done = sqlx::query!(
         "DELETE FROM group_members WHERE group_id = ? AND user_id = ?",

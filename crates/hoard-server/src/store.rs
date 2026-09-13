@@ -452,9 +452,10 @@ pub async fn purge_user_objects(
 /// [`purge_user_objects`] for a group: every object in its namespace, driven
 /// off `group_blobs`/`group_chunks`, which the cascade from `users` through
 /// `groups` takes away just as it takes `blobs`. Runs before deleting the user
-/// who owns the group, for the same reason.
+/// who owns the group, for the same reason. Takes a connection so a group
+/// delete can read the rows under the same lock that removes them.
 pub async fn purge_group_objects(
-    pool: &sqlx::SqlitePool,
+    conn: &mut sqlx::SqliteConnection,
     store: &Arc<dyn BlobStore>,
     group_id: &str,
 ) -> Result<(u64, i64)> {
@@ -468,7 +469,7 @@ pub async fn purge_group_objects(
             "SELECT sha256, size_bytes FROM {table} WHERE group_id = ?"
         ))
         .bind(group_id)
-        .fetch_all(pool)
+        .fetch_all(&mut *conn)
         .await?;
         keys.extend(rows.iter().map(|r| {
             let sha: String = r.get("sha256");
@@ -518,8 +519,9 @@ pub async fn purge_owned_groups(
         .fetch_all(pool)
         .await?;
     let (mut removed, mut bytes) = (0u64, 0i64);
+    let mut conn = pool.acquire().await?;
     for gid in &groups {
-        let (r, b) = purge_group_objects(pool, store, gid).await?;
+        let (r, b) = purge_group_objects(&mut conn, store, gid).await?;
         removed += r;
         bytes += b;
     }

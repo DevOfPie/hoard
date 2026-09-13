@@ -23,7 +23,7 @@ use axum::{
     response::Json,
 };
 use hoard_core::wire::{Lease, LeaseAcquireRequest, LeaseEvent, LeaseOut};
-use sqlx::{Sqlite, SqlitePool};
+use sqlx::{Sqlite, SqliteConnection, SqlitePool};
 use std::sync::Arc;
 use tracing::info;
 
@@ -253,9 +253,12 @@ pub async fn acquire(
     require_shared_access(&state.pool, &save_id, &user_id).await?;
     let fp = device_fp(&headers);
 
+    // IMMEDIATE: two members acquiring at once must serialise on the write
+    // lock, so the second reads the first's row and gets `409 held`, not a
+    // failed upgrade from a deferred read.
     let mut tx = state
         .pool
-        .begin()
+        .begin_with("BEGIN IMMEDIATE")
         .await
         .map_err(|e| internal_logged("opening the lease transaction", e))?;
     let current = live_lease(&mut *tx, &save_id)
@@ -336,6 +339,11 @@ pub async fn renew(
     let user_id = user.user_id.to_string();
     require_shared_access(&state.pool, &save_id, &user_id).await?;
     let ttl = -LEASE_TTL_SECS;
+    let mut tx = state
+        .pool
+        .begin_with("BEGIN IMMEDIATE")
+        .await
+        .map_err(|e| internal_logged("opening the lease transaction", e))?;
     let done = sqlx::query!(
         "UPDATE save_leases SET renewed_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
          WHERE save_id = ? AND holder_user_id = ? AND released_at IS NULL
@@ -344,17 +352,20 @@ pub async fn renew(
         user_id,
         ttl
     )
-    .execute(&state.pool)
+    .execute(&mut *tx)
     .await
     .map_err(|e| internal_logged("renewing the lease", e))?;
     if done.rows_affected() == 0 {
         return Err(not_holder());
     }
-    live_lease(&state.pool, &save_id)
+    let lease = live_lease(&mut *tx, &save_id)
         .await
         .map_err(|e| internal_logged("lease lookup", e))?
-        .map(|l| Json(l.to_wire()))
-        .ok_or_else(not_holder)
+        .ok_or_else(not_holder)?;
+    tx.commit()
+        .await
+        .map_err(|e| internal_logged("committing the lease", e))?;
+    Ok(Json(lease.to_wire()))
 }
 
 // ---- POST /v1/saves/:save_id/lease/release
@@ -366,12 +377,23 @@ pub async fn release(
 ) -> Result<StatusCode, ApiError> {
     let user_id = user.user_id.to_string();
     require_shared_access(&state.pool, &save_id, &user_id).await?;
-    let lease = live_lease(&state.pool, &save_id)
+    let mut tx = state
+        .pool
+        .begin_with("BEGIN IMMEDIATE")
+        .await
+        .map_err(|e| internal_logged("opening the lease transaction", e))?;
+    let lease = live_lease(&mut *tx, &save_id)
         .await
         .map_err(|e| internal_logged("lease lookup", e))?
         .filter(|l| l.holder_user_id == user_id)
         .ok_or_else(not_holder)?;
-    end_lease(&state, &lease).await?;
+    end_lease_row(&mut tx, &lease)
+        .await
+        .map_err(|e| internal_logged("releasing the lease", e))?;
+    tx.commit()
+        .await
+        .map_err(|e| internal_logged("committing the lease", e))?;
+    announce_end(&state, &lease).await;
     info!(user = %user.username, save_id = %save_id, "lease released");
     Ok(StatusCode::NO_CONTENT)
 }
@@ -388,7 +410,12 @@ pub async fn force(
 ) -> Result<StatusCode, ApiError> {
     let user_id = user.user_id.to_string();
     require_shared_access(&state.pool, &save_id, &user_id).await?;
-    let lease = live_lease(&state.pool, &save_id)
+    let mut tx = state
+        .pool
+        .begin_with("BEGIN IMMEDIATE")
+        .await
+        .map_err(|e| internal_logged("opening the lease transaction", e))?;
+    let lease = live_lease(&mut *tx, &save_id)
         .await
         .map_err(|e| internal_logged("lease lookup", e))?
         .ok_or_else(|| conflict("not_held", "nobody is hosting this save"))?;
@@ -399,22 +426,35 @@ pub async fn force(
             serde_json::json!({ "lease": lease.to_wire() }),
         ));
     }
-    end_lease(&state, &lease).await?;
+    end_lease_row(&mut tx, &lease)
+        .await
+        .map_err(|e| internal_logged("releasing the lease", e))?;
+    tx.commit()
+        .await
+        .map_err(|e| internal_logged("committing the lease", e))?;
+    announce_end(&state, &lease).await;
     info!(user = %user.username, save_id = %save_id, holder = %lease.holder_user_id, "lease forced");
     Ok(StatusCode::NO_CONTENT)
 }
 
-/// Set `released_at` on the live row and tell everyone the save has no host.
-async fn end_lease(state: &ServerState, lease: &LeaseRow) -> Result<(), ApiError> {
+/// Set `released_at` on the live row, inside the caller's transaction.
+pub async fn end_lease_row(
+    conn: &mut SqliteConnection,
+    lease: &LeaseRow,
+) -> Result<(), sqlx::Error> {
     sqlx::query!(
         "UPDATE save_leases SET released_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
          WHERE save_id = ? AND holder_user_id = ? AND released_at IS NULL",
         lease.save_id,
         lease.holder_user_id
     )
-    .execute(&state.pool)
-    .await
-    .map_err(|e| internal_logged("releasing the lease", e))?;
+    .execute(conn)
+    .await?;
+    Ok(())
+}
+
+/// Tell everyone the save has no host. After the commit that ended the lease.
+pub async fn announce_end(state: &ServerState, lease: &LeaseRow) {
     publish(
         state,
         &lease.save_id,
@@ -426,5 +466,33 @@ async fn end_lease(state: &ServerState, lease: &LeaseRow) -> Result<(), ApiError
         },
     )
     .await;
-    Ok(())
+}
+
+/// End every live lease `holder` holds on a save shared into `group_id`: a
+/// member leaving or removed cannot go on hosting what they can no longer
+/// read. The ended leases come back for the caller to announce.
+pub async fn end_leases_held_in_group(
+    pool: &SqlitePool,
+    group_id: &str,
+    holder: &str,
+) -> Result<Vec<LeaseRow>, sqlx::Error> {
+    let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
+    let save_ids = sqlx::query_scalar!(
+        r#"SELECT l.save_id AS "save_id!: String"
+           FROM save_leases l JOIN shared_saves ss ON ss.save_id = l.save_id
+           WHERE ss.group_id = ? AND l.holder_user_id = ? AND l.released_at IS NULL"#,
+        group_id,
+        holder
+    )
+    .fetch_all(&mut *tx)
+    .await?;
+    let mut ended = Vec::new();
+    for save_id in &save_ids {
+        if let Some(lease) = live_lease(&mut *tx, save_id).await? {
+            end_lease_row(&mut tx, &lease).await?;
+            ended.push(lease);
+        }
+    }
+    tx.commit().await?;
+    Ok(ended)
 }

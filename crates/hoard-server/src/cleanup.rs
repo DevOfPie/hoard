@@ -301,26 +301,33 @@ async fn purge_trash(
     .await?;
 
     let mut removed = 0u64;
-    for row in &rows {
+    'snapshots: for row in &rows {
         let snap_id: String = row.get("id");
         let save_id: String = row.get("save_id");
-        let Some(ns) = Namespace::for_save(pool, &save_id).await? else {
+
+        // Under the write lock from the first read: a share moves the rows to
+        // the other namespace, and a decrement against the old one would miss.
+        let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
+        let Some(ns) = Namespace::for_save(&mut *tx, &save_id).await? else {
             continue;
         };
-        let billing = ns.billing_user(pool).await?;
+        let billing = ns.billing_user(&mut *tx).await?;
 
         // The whole-file shas this snapshot referenced (one row per file, dups
         // included so the refcount decrement matches the increment from
-        // `create`). Chunked files have no blob row, so their decrement below
-        // is a harmless no-op, since their bytes are freed via the chunk pass.
-        let shas: Vec<String> =
-            sqlx::query("SELECT sha256 FROM snapshot_files WHERE snapshot_id = ?")
-                .bind(&snap_id)
-                .fetch_all(pool)
-                .await?
-                .iter()
-                .map(|r| r.get::<String, _>("sha256"))
-                .collect();
+        // `create`). Chunked files have no blob row and are left to the chunk
+        // pass, so every sha here must have one.
+        let shas: Vec<String> = sqlx::query(
+            "SELECT sf.sha256 FROM snapshot_files sf
+             WHERE sf.snapshot_id = ?
+               AND NOT EXISTS (SELECT 1 FROM snapshot_file_chunks c WHERE c.snapshot_file_id = sf.id)",
+        )
+        .bind(&snap_id)
+        .fetch_all(&mut *tx)
+        .await?
+        .iter()
+        .map(|r| r.get::<String, _>("sha256"))
+        .collect();
 
         // The chunk shas this snapshot referenced (ADR 0019, Fase 4): one row
         // per chunk reference, dups included, matching the per-chunk increment.
@@ -331,27 +338,31 @@ async fn purge_trash(
              WHERE sf.snapshot_id = ?",
         )
         .bind(&snap_id)
-        .fetch_all(pool)
+        .fetch_all(&mut *tx)
         .await?
         .iter()
         .map(|r| r.get::<String, _>("sha"))
         .collect();
 
-        let mut tx = pool.begin().await?;
         let mut freed_bytes: i64 = 0;
         let mut gc_paths: Vec<GcTarget> = Vec::new();
 
+        // A reference with no row is a broken invariant: deleting the snapshot
+        // would bury it. The transaction is dropped, the row stays for the next
+        // sweep, and the operator has the log.
         for sha in &shas {
-            if let Some((rc, size)) = namespace::blob_decref(&mut tx, &ns, sha, 1).await? {
-                if rc <= 0 {
-                    namespace::blob_delete_row(&mut tx, &ns, sha).await?;
-                    freed_bytes += size;
-                    gc_paths.push(GcTarget {
-                        is_chunk: false,
-                        sha: sha.clone(),
-                        key: ns.blob_key(sha),
-                    });
-                }
+            let Some((rc, size)) = namespace::blob_decref(&mut tx, &ns, sha, 1).await? else {
+                warn!(save_id, snapshot_id = %snap_id, sha, "trash purge: a referenced blob has no row; snapshot kept");
+                continue 'snapshots;
+            };
+            if rc <= 0 {
+                namespace::blob_delete_row(&mut tx, &ns, sha).await?;
+                freed_bytes += size;
+                gc_paths.push(GcTarget {
+                    is_chunk: false,
+                    sha: sha.clone(),
+                    key: ns.blob_key(sha),
+                });
             }
         }
 
@@ -359,16 +370,18 @@ async fn purge_trash(
         // refund the freed bytes. Done in the same tx as the blob pass so a
         // crash can't leave a chunk refcounted but unreferenced.
         for sha in &chunk_shas {
-            if let Some((rc, size)) = namespace::chunk_decref(&mut tx, &ns, sha, 1).await? {
-                if rc <= 0 {
-                    namespace::chunk_delete_row(&mut tx, &ns, sha).await?;
-                    freed_bytes += size;
-                    gc_paths.push(GcTarget {
-                        is_chunk: true,
-                        sha: sha.clone(),
-                        key: ns.chunk_key(sha),
-                    });
-                }
+            let Some((rc, size)) = namespace::chunk_decref(&mut tx, &ns, sha, 1).await? else {
+                warn!(save_id, snapshot_id = %snap_id, sha, "trash purge: a referenced chunk has no row; snapshot kept");
+                continue 'snapshots;
+            };
+            if rc <= 0 {
+                namespace::chunk_delete_row(&mut tx, &ns, sha).await?;
+                freed_bytes += size;
+                gc_paths.push(GcTarget {
+                    is_chunk: true,
+                    sha: sha.clone(),
+                    key: ns.chunk_key(sha),
+                });
             }
         }
 

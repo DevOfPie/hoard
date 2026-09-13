@@ -731,3 +731,95 @@ async fn a_member_cannot_rename_or_delete_the_save() {
     let still = get_save(&h, &owner, sid).await.unwrap();
     assert_eq!(still.label, "farm");
 }
+
+// ---- invites: bounds, the guard, and the redeemer's deletion
+
+/// A year is the most an invite lives; more used to overflow the stamp.
+#[tokio::test]
+async fn an_invite_ttl_past_a_year_is_400() {
+    let h = harness().await;
+    let owner = user(&h, "owner").await;
+    let g = create_group(&h, &owner, "valheim-crew").await.unwrap();
+    assert_eq!(
+        invite(&h, &owner, &g.id, Some(u64::MAX)).await,
+        Err(StatusCode::BAD_REQUEST)
+    );
+    assert_eq!(
+        invite(&h, &owner, &g.id, Some(366 * 24 * 60 * 60)).await,
+        Err(StatusCode::BAD_REQUEST)
+    );
+    assert!(invite(&h, &owner, &g.id, Some(365 * 24 * 60 * 60))
+        .await
+        .is_ok());
+}
+
+/// The UPDATE that spends a token is guarded on `used_at`: a row already
+/// marked used, by whatever path, admits nobody and is not rewritten.
+#[tokio::test]
+async fn a_spent_invite_is_not_spent_again() {
+    let h = harness().await;
+    let owner = user(&h, "owner").await;
+    let member = user(&h, "member").await;
+    let g = create_group(&h, &owner, "valheim-crew").await.unwrap();
+    let inv = invite(&h, &owner, &g.id, None).await.unwrap();
+    sqlx::query("UPDATE group_invites SET used_at = '2000-01-01T00:00:00Z' WHERE id = ?")
+        .bind(&inv.invite_id)
+        .execute(&h.state.pool)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        join(&h, &member, &inv.token).await,
+        Err(StatusCode::NOT_FOUND)
+    );
+    let used_by: Option<String> = sqlx::query("SELECT used_by FROM group_invites WHERE id = ?")
+        .bind(&inv.invite_id)
+        .fetch_one(&h.state.pool)
+        .await
+        .unwrap()
+        .get("used_by");
+    assert_eq!(used_by, None, "the guarded UPDATE changed nothing");
+    assert!(list_groups(&h, &member).await.is_empty());
+}
+
+/// Deleting the account that redeemed an invite used to fail on the foreign
+/// key (0022 had no ON DELETE); 0026 clears `used_by` and lets it through.
+#[tokio::test]
+async fn deleting_a_user_who_redeemed_an_invite_clears_used_by() {
+    let h = harness().await;
+    let owner = user(&h, "owner").await;
+    let member = user(&h, "member").await;
+    let g = create_group(&h, &owner, "valheim-crew").await.unwrap();
+    let inv = invite(&h, &owner, &g.id, None).await.unwrap();
+    join(&h, &member, &inv.token).await.unwrap();
+
+    let Json(_) = admin::delete_user(
+        Extension(h.admin.clone()),
+        State(h.state.clone()),
+        Path(uid(&member)),
+    )
+    .await
+    .expect("the redeemer can be deleted");
+    let used_by: Option<String> = sqlx::query("SELECT used_by FROM group_invites WHERE id = ?")
+        .bind(&inv.invite_id)
+        .fetch_one(&h.state.pool)
+        .await
+        .unwrap()
+        .get("used_by");
+    assert_eq!(used_by, None);
+    assert_eq!(list_groups(&h, &owner).await[0].members.len(), 1);
+
+    // The minter goes with their invites.
+    let Json(_) = admin::delete_user(
+        Extension(h.admin.clone()),
+        State(h.state.clone()),
+        Path(uid(&owner)),
+    )
+    .await
+    .expect("the minter can be deleted");
+    let left: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM group_invites")
+        .fetch_one(&h.state.pool)
+        .await
+        .unwrap();
+    assert_eq!(left, 0);
+}

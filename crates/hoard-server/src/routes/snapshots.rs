@@ -51,6 +51,19 @@ pub(crate) fn internal() -> (StatusCode, Json<serde_json::Value>) {
     err(StatusCode::INTERNAL_SERVER_ERROR, "internal server error")
 }
 
+/// 409 for a push that found its save shared or unshared since it began: the
+/// bytes were placed under the old namespace's keys. The client retries from
+/// `init`, which reads the new one.
+pub(crate) fn namespace_changed() -> (StatusCode, Json<serde_json::Value>) {
+    (
+        StatusCode::CONFLICT,
+        Json(serde_json::json!({
+            "error": "the save was shared or unshared during this push: retry",
+            "code": "namespace_changed",
+        })),
+    )
+}
+
 /// A 500 that says, **in the log**, what actually went wrong.
 ///
 /// The client still gets the same opaque `{"error":"internal server error"}`,
@@ -642,11 +655,29 @@ pub async fn create(
     }
 
     let snapshot_id = Uuid::new_v4().to_string();
-    let mut tx = state.pool.begin().await.map_err(|e| {
+    let mut tx = state
+        .pool
+        .begin_with("BEGIN IMMEDIATE")
+        .await
+        .map_err(|e| {
+            rollback_blobs(&created_blobs);
+            cleanup_tmp();
+            internal_logged("opening the commit transaction", e)
+        })?;
+
+    // The namespace was read before the bytes were placed; a share or unshare
+    // since then means they sit under the wrong keys. Checked under the write
+    // lock, so nothing can move the save between here and the rows.
+    let now = Namespace::for_save(&mut *tx, &save_id).await.map_err(|e| {
         rollback_blobs(&created_blobs);
         cleanup_tmp();
-        internal_logged("opening the commit transaction", e)
+        internal_logged("namespace lookup", e)
     })?;
+    if now.as_ref() != Some(&ns) {
+        rollback_blobs(&created_blobs);
+        cleanup_tmp();
+        return Err(namespace_changed());
+    }
 
     let head: i64 = sqlx::query!("SELECT latest_version_num FROM saves WHERE id=?", save_id)
         .fetch_one(&mut *tx)

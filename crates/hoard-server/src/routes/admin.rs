@@ -619,9 +619,39 @@ pub async fn delete_user(
         return Err(err(StatusCode::NOT_FOUND, "no_such_user"));
     };
 
-    // The groups this user owns go with them, shared saves included: the
-    // members lose access to the owner's data, and the cascade through `groups`
-    // would otherwise take the `group_blobs` rows and orphan the objects.
+    // Shares end before anything is purged. The user's own shared saves come
+    // back to them, so the purge below finds them and the group's owner stops
+    // paying; the saves other members shared into the user's groups go back
+    // to those members, whose `blobs` rows and bytes would otherwise vanish
+    // with the group. Every lease that ends along the way is announced.
+    let actor = user.user_id.to_string();
+    let purge_failed = |e: anyhow::Error| {
+        tracing::error!(error = %e, "admin: taking back shared saves failed");
+        err(StatusCode::INTERNAL_SERVER_ERROR, "internal")
+    };
+    let mut ended =
+        crate::routes::share::take_back_owned(&state.pool, &state.store, &actor, &target_id)
+            .await
+            .map_err(purge_failed)?;
+    let owned: Vec<String> = sqlx::query_scalar("SELECT id FROM groups WHERE owner_user_id = ?")
+        .bind(&target_id)
+        .fetch_all(&state.pool)
+        .await
+        .map_err(|e| db_error(e, "admin delete groups lookup"))?;
+    for gid in &owned {
+        ended.extend(
+            crate::routes::share::take_back_group(&state.pool, &state.store, &actor, gid, None)
+                .await
+                .map_err(purge_failed)?,
+        );
+    }
+    for lease in &ended {
+        crate::routes::leases::announce_end(&state, lease).await;
+    }
+
+    // The groups this user owns go with them; by now they hold nothing, and
+    // the cascade through `groups` would otherwise take the `group_blobs`
+    // rows and orphan whatever objects are left.
     let (mut objects_removed, mut bytes_removed) =
         crate::store::purge_owned_groups(&state.pool, &state.store, &target_id)
             .await

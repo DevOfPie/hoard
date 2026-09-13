@@ -357,10 +357,41 @@ pub async fn delete(
     .map_err(|e| internal_logged_status("reading a row", e))?
     .ok_or(StatusCode::NOT_FOUND)?;
 
-    sqlx::query!("DELETE FROM saves WHERE id=?", save_id)
-        .execute(&state.pool)
+    // A shared save comes back to its owner first: the cascade would take the
+    // `shared_saves` row without releasing the group's refcounts or refunding
+    // its owner. A share landing between the take-back and the delete is
+    // caught under the write lock and taken back again.
+    for round in 0.. {
+        crate::routes::share::take_back(&state.pool, &state.store, &user_id, &save_id)
+            .await
+            .map_err(|e| internal_logged_status("taking back a shared save", e))?;
+        let mut tx = state
+            .pool
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .map_err(|e| internal_logged_status("opening a transaction", e))?;
+        let shared = sqlx::query_scalar!(
+            r#"SELECT COUNT(*) AS "n: i64" FROM shared_saves WHERE save_id = ?"#,
+            save_id
+        )
+        .fetch_one(&mut *tx)
         .await
-        .map_err(|e| internal_logged_status("writing to the database", e))?;
+        .map_err(|e| internal_logged_status("reading a row", e))?;
+        if shared > 0 {
+            if round >= 2 {
+                return Err(StatusCode::CONFLICT);
+            }
+            continue;
+        }
+        sqlx::query!("DELETE FROM saves WHERE id=?", save_id)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| internal_logged_status("writing to the database", e))?;
+        tx.commit()
+            .await
+            .map_err(|e| internal_logged_status("writing to the database", e))?;
+        break;
+    }
 
     // Remove physical directory
     let dir = state

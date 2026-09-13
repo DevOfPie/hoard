@@ -12,7 +12,7 @@
 //! charge lands on [`Namespace::billing_user`] and is mirrored into
 //! `groups.storage_used_bytes` in the same statement.
 
-use sqlx::{Sqlite, SqliteConnection, SqlitePool};
+use sqlx::{Sqlite, SqliteConnection};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Namespace {
@@ -38,18 +38,20 @@ impl Namespace {
         }
     }
 
-    /// `None` when the save does not exist.
-    pub async fn for_save(
-        pool: &SqlitePool,
-        save_id: &str,
-    ) -> Result<Option<Namespace>, sqlx::Error> {
+    /// `None` when the save does not exist. A writer resolves it again inside
+    /// its `BEGIN IMMEDIATE` transaction: a share can land between a lookup on
+    /// the pool and the write, and the rows must go where the save is now.
+    pub async fn for_save<'e, E>(ex: E, save_id: &str) -> Result<Option<Namespace>, sqlx::Error>
+    where
+        E: sqlx::Executor<'e, Database = Sqlite>,
+    {
         let row = sqlx::query!(
             r#"SELECT s.user_id, ss.group_id AS "group_id?"
                FROM saves s LEFT JOIN shared_saves ss ON ss.save_id = s.id
                WHERE s.id = ?"#,
             save_id
         )
-        .fetch_optional(pool)
+        .fetch_optional(ex)
         .await?;
         Ok(row.map(|r| Namespace::of(&r.user_id, r.group_id.as_deref())))
     }
@@ -77,12 +79,15 @@ impl Namespace {
     }
 
     /// Who is charged for this namespace: the user, or the group's owner.
-    pub async fn billing_user(&self, pool: &SqlitePool) -> Result<String, sqlx::Error> {
+    pub async fn billing_user<'e, E>(&self, ex: E) -> Result<String, sqlx::Error>
+    where
+        E: sqlx::Executor<'e, Database = Sqlite>,
+    {
         match self {
             Namespace::User(id) => Ok(id.clone()),
             Namespace::Group(id) => {
                 sqlx::query_scalar!("SELECT owner_user_id FROM groups WHERE id = ?", id)
-                    .fetch_one(pool)
+                    .fetch_one(ex)
                     .await
             }
         }

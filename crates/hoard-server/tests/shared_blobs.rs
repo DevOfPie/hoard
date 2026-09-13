@@ -16,7 +16,7 @@ use hoard_core::wire::{
 };
 use hoard_server::auth::AuthUser;
 use hoard_server::routes::health::ServerState;
-use hoard_server::routes::{admin, cas, groups, leases, share, snapshots};
+use hoard_server::routes::{admin, cas, groups, leases, saves, share, snapshots};
 use sha2::{Digest, Sha256};
 use sqlx::SqlitePool;
 use std::sync::Arc;
@@ -693,8 +693,8 @@ async fn purging_trash_on_a_shared_save_refunds_the_group_owner() {
     assert_eq!(used(pool, OWNER).await, 0);
 }
 
-/// Deleting the group's owner takes the group's objects off the disk, not just
-/// its rows.
+/// Deleting the group's owner hands every save shared into the group back to
+/// its owner and takes the group's objects off the disk, not just its rows.
 #[tokio::test]
 async fn deleting_the_group_owner_purges_the_groups_objects() {
     let h = harness().await;
@@ -716,10 +716,17 @@ async fn deleting_the_group_owner_purges_the_groups_objects() {
     let Json(out) = admin::delete_user(Extension(h.admin.clone()), st(&h), Path(PAYER.to_string()))
         .await
         .expect("deleted");
-    assert_eq!(out.objects_removed, 3);
-    assert_eq!(out.bytes_removed, f.total());
+    // Was 3 and `f.total()`: the members' saves used to be purged with the
+    // group (review finding 1). They go back to their owners first, so the
+    // group holds nothing by the time it is purged.
+    assert_eq!(out.objects_removed, 0);
+    assert_eq!(out.bytes_removed, 0);
 
     assert!(!group_dir.exists());
+    assert_back_with_owner(&h, &f, &gid).await;
+    let got = download_as(&h, &h.owner, 1).await;
+    assert_eq!(got[0].1, f.a);
+    assert_eq!(got[1].1, f.b);
     for bytes in [&f.a, &f.b, &f.c] {
         assert!(!stored(&h, &group_key(&gid, &sha_of(bytes))).await);
     }
@@ -735,4 +742,465 @@ async fn deleting_the_group_owner_purges_the_groups_objects() {
         .await
         .unwrap();
     assert_eq!(shared, 0);
+}
+
+// ---- shares ending without the owner asking
+
+async fn delete_save_as(h: &Harness, who: &AuthUser) -> Result<StatusCode, StatusCode> {
+    saves::delete(st(h), Extension(who.clone()), Path(SAVE.to_string())).await
+}
+
+async fn remove_member_as(
+    h: &Harness,
+    who: &AuthUser,
+    group_id: &str,
+    target: &str,
+) -> Result<StatusCode, (StatusCode, serde_json::Value)> {
+    groups::remove_member(
+        st(h),
+        Extension(who.clone()),
+        Path((group_id.to_string(), target.to_string())),
+    )
+    .await
+    .map_err(|(code, Json(body))| (code, body))
+}
+
+async fn acquire_as(
+    h: &Harness,
+    who: &AuthUser,
+    base: i64,
+) -> Result<hoard_core::wire::Lease, (StatusCode, serde_json::Value)> {
+    leases::acquire(
+        st(h),
+        Extension(who.clone()),
+        Path(SAVE.to_string()),
+        axum::http::HeaderMap::new(),
+        Json(LeaseAcquireRequest { base_version: base }),
+    )
+    .await
+    .map(|Json(l)| l)
+    .map_err(|(code, Json(body))| (code, body))
+}
+
+async fn lease_as(h: &Harness, who: &AuthUser) -> Option<hoard_core::wire::Lease> {
+    leases::get(st(h), Extension(who.clone()), Path(SAVE.to_string()))
+        .await
+        .expect("lease read")
+        .0
+        .lease
+}
+
+async fn count(pool: &SqlitePool, sql: &str, arg: &str) -> i64 {
+    sqlx::query_scalar::<_, i64>(sql)
+        .bind(arg)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+}
+
+/// The save is back where it started: the owner's rows, files and bill, no
+/// `shared_saves` row, nothing left under the group.
+async fn assert_back_with_owner(h: &Harness, f: &Fixture, gid: &str) {
+    let pool = &h.state.pool;
+    for (bytes, refs) in [(&f.a, 2), (&f.b, 1), (&f.c, 1)] {
+        let sha = sha_of(bytes);
+        assert_eq!(
+            user_blob(pool, &sha).await,
+            Some((refs, bytes.len() as i64)),
+            "the owner's row is back"
+        );
+        assert_eq!(group_blob(pool, gid, &sha).await, None);
+        assert!(stored(h, &user_key(&sha)).await);
+        assert!(!stored(h, &group_key(gid, &sha)).await);
+    }
+    assert_eq!(used(pool, OWNER).await, f.total());
+    assert_eq!(
+        count(
+            pool,
+            "SELECT COUNT(*) FROM shared_saves WHERE save_id=?",
+            SAVE
+        )
+        .await,
+        0
+    );
+}
+
+/// Deleting a member whose save is shared into somebody else's group takes
+/// the save back first: the group's owner stops paying and the group holds
+/// nothing of the deleted account.
+#[tokio::test]
+async fn deleting_a_member_hands_their_shared_save_back_before_the_purge() {
+    let h = harness().await;
+    let f = Fixture::new();
+    two_versions(&h, &f).await;
+    let gid = group_with_everyone(&h).await;
+    share(&h, &h.owner, &gid).await.expect("shared");
+    let pool = &h.state.pool;
+    assert_eq!(used(pool, PAYER).await, f.total());
+
+    let Json(out) = admin::delete_user(Extension(h.admin.clone()), st(&h), Path(OWNER.to_string()))
+        .await
+        .expect("deleted");
+    assert_eq!(
+        out.objects_removed, 3,
+        "the owner's objects, back under their key"
+    );
+    assert_eq!(out.bytes_removed, f.total());
+
+    assert_eq!(used(pool, PAYER).await, 0);
+    assert_eq!(group_used(pool, &gid).await, 0);
+    assert_eq!(
+        count(
+            pool,
+            "SELECT COUNT(*) FROM group_blobs WHERE group_id=?",
+            &gid
+        )
+        .await,
+        0
+    );
+    for bytes in [&f.a, &f.b, &f.c] {
+        assert!(!stored(&h, &group_key(&gid, &sha_of(bytes))).await);
+        assert!(!stored(&h, &user_key(&sha_of(bytes))).await);
+    }
+    assert_eq!(
+        count(pool, "SELECT COUNT(*) FROM saves WHERE id=?", SAVE).await,
+        0
+    );
+}
+
+/// A share landing between `init` and `commit` moves the save's bytes. The
+/// commit reads the namespace afresh: without the lease the owner is now
+/// refused like any member and nothing is recorded; with it the version lands
+/// under the group's keys on the group owner's bill, though `init` negotiated
+/// against the owner's. (The re-check inside the commit transaction guards
+/// the window after that read; it needs two writers and has no test here.)
+#[tokio::test]
+async fn a_share_between_init_and_commit_is_read_by_the_commit() {
+    let h = harness().await;
+    let f = Fixture::new();
+    two_versions(&h, &f).await;
+    let gid = group_with_everyone(&h).await;
+    let pool = &h.state.pool;
+
+    let d = vec![4u8; 5_000];
+    let m = manifest(&[("world.db", &f.a), ("world.fwl", &d)]);
+    let init = cas::init(
+        st(&h),
+        Extension(h.owner.clone()),
+        Path(SAVE.to_string()),
+        Json(CasInit {
+            base_version: Some(2),
+            files: m.clone(),
+        }),
+    )
+    .await
+    .expect("init")
+    .0;
+    assert_eq!(init.missing.len(), 1);
+    cas::upload_blob(
+        st(&h),
+        Extension(h.owner.clone()),
+        Path((init.upload_id.clone(), sha_of(&d))),
+        axum::http::HeaderMap::new(),
+        Body::from(d.clone()),
+    )
+    .await
+    .expect("upload");
+
+    share(&h, &h.owner, &gid).await.expect("shared meanwhile");
+
+    let commit = |h: &Harness| {
+        cas::commit(
+            st(h),
+            Extension(h.owner.clone()),
+            Path(SAVE.to_string()),
+            Json(CasCommit {
+                upload_id: init.upload_id.clone(),
+                base_version: Some(2),
+                device_name: Some("desk".into()),
+                notes: None,
+                files: m.clone(),
+            }),
+        )
+    };
+    let (code, Json(body)) = commit(&h).await.expect_err("the save is shared now");
+    assert_eq!(code, StatusCode::CONFLICT);
+    assert_eq!(body["code"], "lease_required");
+    assert_eq!(
+        count(pool, "SELECT COUNT(*) FROM snapshots WHERE save_id=?", SAVE).await,
+        2
+    );
+    assert_eq!(user_blob(pool, &sha_of(&d)).await, None);
+    assert_eq!(group_blob(pool, &gid, &sha_of(&d)).await, None);
+    assert_eq!(used(pool, PAYER).await, f.total());
+    assert_eq!(used(pool, OWNER).await, 0);
+
+    // The staging dir is gone with the refusal; a fresh init sees the group.
+    acquire_as(&h, &h.owner, 2).await.expect("hosting");
+    let (asked, snap) = backup_as(
+        &h,
+        &h.owner,
+        &[("world.db", &f.a), ("world.fwl", &d)],
+        Some(2),
+    )
+    .await;
+    assert_eq!(asked, vec![sha_of(&d)]);
+    assert_eq!(snap.version_num, 3);
+    assert!(stored(&h, &group_key(&gid, &sha_of(&d))).await);
+    assert!(!stored(&h, &user_key(&sha_of(&d))).await);
+    assert_eq!(user_blob(pool, &sha_of(&d)).await, None);
+    assert_eq!(group_blob(pool, &gid, &sha_of(&d)).await, Some((1, 5_000)));
+    assert_eq!(used(pool, PAYER).await, f.total() + 5_000);
+    assert_eq!(used(pool, OWNER).await, 0);
+}
+
+/// After an unshare the trash purge finds the rows back in the owner's tables
+/// and refunds the owner, not the group's owner.
+#[tokio::test]
+async fn purging_trash_after_an_unshare_refunds_the_owner() {
+    let h = harness().await;
+    let f = Fixture::new();
+    two_versions(&h, &f).await;
+    let gid = group_with_everyone(&h).await;
+    share(&h, &h.owner, &gid).await.expect("shared");
+    assert_eq!(unshare(&h, &h.owner).await.unwrap(), StatusCode::NO_CONTENT);
+    let pool = &h.state.pool;
+
+    sqlx::query(
+        "UPDATE snapshots SET deleted_at='2000-01-01T00:00:00Z' WHERE save_id=? AND version_num=1",
+    )
+    .bind(SAVE)
+    .execute(pool)
+    .await
+    .unwrap();
+    hoard_server::cleanup::run_once(
+        pool,
+        &h.state.config.storage.data_dir,
+        &h.state.store,
+        24,
+        0,
+        None,
+    )
+    .await
+    .expect("cleanup");
+
+    assert_eq!(user_blob(pool, &sha_of(&f.b)).await, None);
+    assert!(!stored(&h, &user_key(&sha_of(&f.b))).await);
+    assert_eq!(user_blob(pool, &sha_of(&f.a)).await, Some((1, 30_000)));
+    assert!(stored(&h, &user_key(&sha_of(&f.a))).await);
+    let left = (f.a.len() + f.c.len()) as i64;
+    assert_eq!(used(pool, OWNER).await, left);
+    assert_eq!(used(pool, PAYER).await, 0);
+    assert_eq!(group_used(pool, &gid).await, 0);
+}
+
+/// Deleting a shared save takes it back first, so the group's rows go with
+/// the refcounts they carried and the group's owner is refunded.
+#[tokio::test]
+async fn deleting_a_shared_save_refunds_the_group_owner() {
+    let h = harness().await;
+    let f = Fixture::new();
+    two_versions(&h, &f).await;
+    let gid = group_with_everyone(&h).await;
+    share(&h, &h.owner, &gid).await.expect("shared");
+    let pool = &h.state.pool;
+
+    assert_eq!(
+        delete_save_as(&h, &h.member).await,
+        Err(StatusCode::NOT_FOUND),
+        "a member cannot delete it"
+    );
+    assert_eq!(
+        delete_save_as(&h, &h.owner).await,
+        Ok(StatusCode::NO_CONTENT)
+    );
+
+    assert_eq!(
+        count(pool, "SELECT COUNT(*) FROM saves WHERE id=?", SAVE).await,
+        0
+    );
+    assert_eq!(
+        count(
+            pool,
+            "SELECT COUNT(*) FROM group_blobs WHERE group_id=?",
+            &gid
+        )
+        .await,
+        0
+    );
+    assert_eq!(used(pool, PAYER).await, 0);
+    assert_eq!(group_used(pool, &gid).await, 0);
+    for bytes in [&f.a, &f.b, &f.c] {
+        assert!(!stored(&h, &group_key(&gid, &sha_of(bytes))).await);
+    }
+}
+
+/// A group with no shared saves may still hold an object nothing points at;
+/// deleting the group takes it off the disk with the rows.
+#[tokio::test]
+async fn deleting_a_group_purges_stray_objects() {
+    let h = harness().await;
+    let f = Fixture::new();
+    two_versions(&h, &f).await;
+    let gid = group_with_everyone(&h).await;
+    let pool = &h.state.pool;
+
+    let sha = sha_of(&f.a);
+    let key = group_key(&gid, &sha);
+    let path = h.state.config.storage.data_dir.join(&key);
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(&path, &f.a).unwrap();
+    assert!(stored(&h, &key).await);
+    sqlx::query(
+        "INSERT INTO group_blobs (group_id, sha256, size_bytes, refcount) VALUES (?,?,?,1)",
+    )
+    .bind(&gid)
+    .bind(&sha)
+    .bind(f.a.len() as i64)
+    .execute(pool)
+    .await
+    .unwrap();
+
+    let code = groups::delete(st(&h), Extension(h.payer.clone()), Path(gid.clone()))
+        .await
+        .expect("deleted");
+    assert_eq!(code, StatusCode::NO_CONTENT);
+    assert!(!stored(&h, &key).await);
+    assert_eq!(
+        count(
+            pool,
+            "SELECT COUNT(*) FROM group_blobs WHERE group_id=?",
+            &gid
+        )
+        .await,
+        0
+    );
+}
+
+/// The group's owner removes the member who shared a save: it goes back to
+/// that member, the owner stops paying, and the save is private again.
+#[tokio::test]
+async fn removing_a_member_takes_their_shared_save_back() {
+    let h = harness().await;
+    let f = Fixture::new();
+    two_versions(&h, &f).await;
+    let gid = group_with_everyone(&h).await;
+    share(&h, &h.owner, &gid).await.expect("shared");
+
+    assert_eq!(
+        remove_member_as(&h, &h.payer, &gid, OWNER).await.unwrap(),
+        StatusCode::NO_CONTENT
+    );
+    assert_back_with_owner(&h, &f, &gid).await;
+    assert_eq!(used(&h.state.pool, PAYER).await, 0);
+    assert_eq!(group_used(&h.state.pool, &gid).await, 0);
+
+    let (code, _) = acquire_as(&h, &h.member, 2)
+        .await
+        .expect_err("no longer shared with the member");
+    assert_eq!(code, StatusCode::NOT_FOUND);
+    let (code, body) = acquire_as(&h, &h.owner, 2)
+        .await
+        .expect_err("nothing to host");
+    assert_eq!(code, StatusCode::CONFLICT);
+    assert_eq!(body["code"], "not_shared");
+    let got = download_as(&h, &h.owner, 2).await;
+    assert_eq!(got[1].1, f.c);
+}
+
+/// A member leaves while hosting a save they shared themselves: the lease
+/// ends, announced to the group, and the save follows them out.
+#[tokio::test]
+async fn a_hosting_member_leaving_ends_the_lease_and_takes_the_save() {
+    let h = harness().await;
+    let f = Fixture::new();
+    two_versions(&h, &f).await;
+    let gid = group_with_everyone(&h).await;
+    share(&h, &h.owner, &gid).await.expect("shared");
+    let mut payer_rx = h.state.events.subscribe(h.payer.user_id);
+    let d = vec![4u8; 5_000];
+    host(
+        &h,
+        &h.owner,
+        &[("world.db", &f.a), ("world.fwl", &d)],
+        Some(2),
+    )
+    .await;
+    assert!(lease_as(&h, &h.member)
+        .await
+        .is_some_and(|l| l.pushed_since));
+    let _ = payer_rx.try_recv();
+    while payer_rx.try_recv().is_ok() {}
+
+    assert_eq!(
+        remove_member_as(&h, &h.owner, &gid, OWNER).await.unwrap(),
+        StatusCode::NO_CONTENT
+    );
+    let pool = &h.state.pool;
+    assert_eq!(
+        count(
+            pool,
+            "SELECT COUNT(*) FROM shared_saves WHERE save_id=?",
+            SAVE
+        )
+        .await,
+        0
+    );
+    assert_eq!(
+        count(
+            pool,
+            "SELECT COUNT(*) FROM save_leases WHERE save_id=? AND released_at IS NULL",
+            SAVE
+        )
+        .await,
+        0
+    );
+    assert_eq!(used(pool, PAYER).await, 0);
+    assert_eq!(used(pool, OWNER).await, f.total() + 5_000);
+    let ended = std::iter::from_fn(|| payer_rx.try_recv().ok())
+        .filter_map(|fr| match fr {
+            hoard_server::routes::events::Frame::Lease(e) => Some(e),
+            _ => None,
+        })
+        .find(|e| !e.live)
+        .expect("the group heard the lease end");
+    assert!(ended.holder_user_id.is_none());
+}
+
+/// The owner removes the member hosting somebody else's save: the lease ends
+/// and another member can host, even though the departing member had pushed.
+#[tokio::test]
+async fn removing_the_host_frees_the_lease_for_the_next_member() {
+    let h = harness().await;
+    let f = Fixture::new();
+    two_versions(&h, &f).await;
+    let gid = group_with_everyone(&h).await;
+    share(&h, &h.owner, &gid).await.expect("shared");
+    let d = vec![4u8; 5_000];
+    host(
+        &h,
+        &h.member,
+        &[("world.db", &f.a), ("world.fwl", &d)],
+        Some(2),
+    )
+    .await;
+    assert!(lease_as(&h, &h.owner).await.is_some_and(|l| l.pushed_since));
+
+    assert_eq!(
+        remove_member_as(&h, &h.payer, &gid, MEMBER).await.unwrap(),
+        StatusCode::NO_CONTENT
+    );
+    assert!(lease_as(&h, &h.owner).await.is_none());
+    let lease = acquire_as(&h, &h.owner, 3).await.expect("free to host");
+    assert_eq!(lease.holder_user_id, OWNER);
+    // Still shared: the departing member owned nothing in the group.
+    assert_eq!(
+        count(
+            &h.state.pool,
+            "SELECT COUNT(*) FROM shared_saves WHERE save_id=?",
+            SAVE
+        )
+        .await,
+        1
+    );
 }

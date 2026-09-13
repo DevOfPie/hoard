@@ -1,0 +1,20 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT l.save_id AS \"save_id!: String\"\n           FROM save_leases l JOIN shared_saves ss ON ss.save_id = l.save_id\n           WHERE ss.group_id = ? AND l.holder_user_id = ? AND l.released_at IS NULL",
+  "describe": {
+    "columns": [
+      {
+        "name": "save_id!: String",
+        "ordinal": 0,
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Right": 2
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "4de3a4a00b8689fffe90d2cfa922fa49c3b625cb1e6b71ab5ca1b8eb8c52fa08"
+}

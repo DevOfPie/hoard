@@ -655,6 +655,35 @@ async fn status(cfg: &Config) -> Result<()> {
             println!("{:<24} {:>10} {:>12}", username, objs, human_bytes(bytes));
         }
     }
+
+    // Group namespaces: what members shared, billed to the group's owner but
+    // stored under the group's keys, so it is in nobody's row above.
+    let groups = sqlx::query(
+        "SELECT g.name AS name, u.username AS owner,
+            (SELECT COUNT(*) FROM group_blobs b WHERE b.group_id = g.id AND b.refcount > 0)
+          + (SELECT COUNT(*) FROM group_chunks c WHERE c.group_id = g.id AND c.refcount > 0) AS objs,
+            (SELECT COALESCE(SUM(size_bytes),0) FROM group_blobs b WHERE b.group_id = g.id AND b.refcount > 0)
+          + (SELECT COALESCE(SUM(size_bytes),0) FROM group_chunks c WHERE c.group_id = g.id AND c.refcount > 0) AS bytes
+         FROM groups g JOIN users u ON u.id = g.owner_user_id ORDER BY g.name",
+    )
+    .fetch_all(&pool)
+    .await?;
+    for r in &groups {
+        let name: String = r.get("name");
+        let owner: String = r.get("owner");
+        let objs: i64 = r.get("objs");
+        let bytes: i64 = r.get("bytes");
+        total_objs += objs;
+        total_bytes += bytes;
+        if objs > 0 {
+            println!(
+                "{:<24} {:>10} {:>12}",
+                format!("group:{name} ({owner})"),
+                objs,
+                human_bytes(bytes)
+            );
+        }
+    }
     println!(
         "{:<24} {:>10} {:>12}",
         "TOTAL",
