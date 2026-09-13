@@ -55,6 +55,8 @@ pub(crate) struct WorldSession {
     pub view_writing_told: bool,
     /// Wrote under somebody else's lease: the session's changes stay local.
     pub side_copy: bool,
+    /// Wrote while the lease was still unknown; claims when it reads free.
+    pub wrote_unclaimed: bool,
     /// The side copy is on its way; the session ends when it lands.
     pub side_copy_started: bool,
     /// The lease task was asked who holds it, once, when the prompt found
@@ -76,6 +78,7 @@ impl WorldSession {
             writes: 0,
             view_writing_told: false,
             side_copy: false,
+            wrote_unclaimed: false,
             side_copy_started: false,
             refresh_asked: false,
             auto_host_deadline: None,
@@ -145,11 +148,25 @@ pub(crate) fn on_game_started(
         let Some(slot) = slots.get_mut(id) else {
             continue;
         };
+        // A side copy still on its way belongs to the last session: it keeps
+        // its session until the copy lands, and this prompt goes out without
+        // it. Otherwise the answer would land on a session that is not the one
+        // that wrote, and the move could take files from under the game.
+        if slot
+            .session
+            .as_ref()
+            .is_some_and(|w| !w.live() && w.side_copy_started)
+        {
+            tracing::info!(save_id = %id, "agent: side copy still landing; not asking about this world yet");
+            continue;
+        }
         let mut session = WorldSession::new(now);
         session.prompted = true;
         // A lease this machine still holds (an earlier session that never
         // released, a restart) is a role already taken, not one to ask about.
         session.claimed = slot.lease == LeaseObs::Mine;
+        // A role is for one session: last time's View does not decide this one.
+        slot.role = WorldRole::Host;
         slot.session = Some(session);
         worlds.push(WorldChoice {
             save_id: id.clone(),
@@ -159,8 +176,8 @@ pub(crate) fn on_game_started(
             lease: lease_for_prompt(slot.lease),
         });
     }
-    if ids.len() == 1 {
-        if let Some(slot) = slots.get_mut(&ids[0]) {
+    if worlds.len() == 1 {
+        if let Some(slot) = slots.get_mut(&worlds[0].save_id) {
             // `Unknown` arms too: the reconcile pass asks the server first
             // thing, and the clock only fires on a lease that reads free.
             let free = matches!(slot.lease, LeaseObs::Free | LeaseObs::Unknown);
@@ -171,6 +188,9 @@ pub(crate) fn on_game_started(
                 }
             }
         }
+    }
+    if worlds.is_empty() {
+        return;
     }
     tracing::info!(game_slug = %game_slug, worlds = worlds.len(), "agent: asking which shared world");
     let _ = events_tx.try_send(AgentEvent::WorldClaimWanted { game_slug, worlds });
@@ -302,6 +322,9 @@ pub(crate) fn on_write(
                 session.auto_host_deadline = None;
                 acquire_auto(slot, events_tx, lease, "a write with nobody hosting");
             }
+            // Nobody knows who holds it yet: the write is kept as evidence and
+            // claims once the refresh reads free (`on_reconciled`).
+            LeaseObs::Unknown if !session.claimed => session.wrote_unclaimed = true,
             _ => {}
         },
     }
@@ -359,6 +382,24 @@ pub(crate) fn on_reconciled(
                 lease.refresh(slot.save.save_id.clone());
             }
         }
+        // A write seen while the lease was unknown claims as soon as it reads
+        // free; if somebody else holds it, the write was theirs to refuse.
+        if session.wrote_unclaimed && !session.claimed && !session.dismissed {
+            match slot.lease {
+                LeaseObs::Free if slot.role == WorldRole::Host => {
+                    session.wrote_unclaimed = false;
+                    session.claimed = true;
+                    session.auto_host_deadline = None;
+                    acquire_auto(slot, events_tx, lease, "a write with nobody hosting");
+                    return Followup::Nothing;
+                }
+                LeaseObs::Other => {
+                    session.wrote_unclaimed = false;
+                    session.side_copy = true;
+                }
+                _ => {}
+            }
+        }
         maybe_auto_host(slot, now, events_tx, lease);
         return Followup::Nothing;
     }
@@ -380,8 +421,14 @@ pub(crate) fn on_reconciled(
         session.side_copy_started = true;
         return Followup::SideCopy;
     }
-    slot.session = None;
+    end_session(slot);
     Followup::Nothing
+}
+
+/// A session is over: the role it chose goes with it.
+fn end_session(slot: &mut SaveSlot) {
+    slot.session = None;
+    slot.role = WorldRole::Host;
 }
 
 /// The minute is up with nobody hosting: host. `true` when it did.
@@ -443,7 +490,7 @@ pub(crate) fn maybe_release_after_stop(
         save_id: id,
         game_slug: slot.save.game_slug.clone(),
     });
-    slot.session = None;
+    end_session(slot);
     true
 }
 
@@ -489,6 +536,15 @@ pub(crate) async fn move_world_aside(save: &WatchedSave, dir: &Path) -> anyhow::
 /// may be pulled over. `has_pending` is cleared for that reason alone; the
 /// reducer then owes the head a pull, which it runs once the folder is quiet.
 pub(crate) fn on_side_copied(slot: &mut SaveSlot, moved: u64) {
+    // Only the session that asked for the copy is ended by it: a game
+    // relaunched meanwhile keeps its own session, and its pending writes.
+    if !slot
+        .session
+        .as_ref()
+        .is_some_and(|w| !w.live() && w.side_copy_started)
+    {
+        return;
+    }
     if moved > 0 {
         // The files are in the side copy, not in the folder: nothing local is
         // unversioned any more, and the head has to come back.
@@ -496,13 +552,19 @@ pub(crate) fn on_side_copied(slot: &mut SaveSlot, moved: u64) {
         slot.known_version = None;
         slot.pull_pending = true;
     }
-    slot.session = None;
+    end_session(slot);
 }
 
 /// The side copy could not be made: the bytes stay where they are, pending,
 /// and the session is over.
 pub(crate) fn on_side_copy_failed(slot: &mut SaveSlot) {
-    slot.session = None;
+    if slot
+        .session
+        .as_ref()
+        .is_some_and(|w| !w.live() && w.side_copy_started)
+    {
+        end_session(slot);
+    }
 }
 
 #[cfg(test)]
@@ -895,6 +957,94 @@ mod tests {
         // And the next launch asks again.
         on_game_started(&mut s, "w1", now, &tx);
         assert_eq!(drain(&mut rx).len(), 1);
+    }
+
+    /// Viewing is for one session: the next launch of the same world starts
+    /// as a host again, clock and all.
+    #[tokio::test(start_paused = true)]
+    async fn a_view_choice_ends_with_its_session() {
+        let (tx, mut rx) = mpsc::channel(8);
+        let mut s = slots(vec![world("w1", "valheim")]);
+        s.get_mut("w1").unwrap().lease = LeaseObs::Free;
+        let now = Instant::now();
+        on_game_started(&mut s, "w1", now, &tx);
+        drain(&mut rx);
+        let slot = s.get_mut("w1").unwrap();
+        slot.role = WorldRole::View;
+        on_claim(slot);
+        on_game_stopped(slot);
+        assert_eq!(on_reconciled(slot, now, &tx, None), Followup::Nothing);
+        assert!(slot.session.is_none());
+        assert_eq!(slot.role, WorldRole::Host);
+        on_game_started(&mut s, "w1", now, &tx);
+        assert_eq!(drain(&mut rx).len(), 1);
+        assert!(s["w1"]
+            .session
+            .as_ref()
+            .unwrap()
+            .auto_host_deadline
+            .is_some());
+    }
+
+    /// The game relaunched while the side copy was on its way: the old
+    /// session keeps the copy, the new launch asks nothing about that world,
+    /// and the landing touches only the session that asked for it.
+    #[tokio::test(start_paused = true)]
+    async fn a_relaunch_waits_for_the_side_copy_to_land() {
+        let (tx, mut rx) = mpsc::channel(8);
+        let mut s = slots(vec![world("w1", "valheim")]);
+        s.get_mut("w1").unwrap().lease = LeaseObs::Other;
+        let now = Instant::now();
+        on_game_started(&mut s, "w1", now, &tx);
+        drain(&mut rx);
+        {
+            let slot = s.get_mut("w1").unwrap();
+            slot.role = WorldRole::View;
+            slot.has_pending = true;
+            on_game_stopped(slot);
+            assert_eq!(on_reconciled(slot, now, &tx, None), Followup::SideCopy);
+        }
+        on_game_started(&mut s, "w1", now, &tx);
+        assert!(
+            drain(&mut rx).is_empty(),
+            "no prompt while the copy is landing"
+        );
+        let slot = s.get_mut("w1").unwrap();
+        assert!(slot.session.as_ref().unwrap().side_copy_started);
+        assert!(!slot.session.as_ref().unwrap().live());
+        on_side_copied(slot, 2);
+        assert!(slot.session.is_none());
+        assert!(!slot.has_pending);
+        assert_eq!(slot.role, WorldRole::Host);
+        on_game_started(&mut s, "w1", now, &tx);
+        assert_eq!(drain(&mut rx).len(), 1, "the next launch asks again");
+    }
+
+    /// A write while nobody knows who holds the lease is not lost: it claims
+    /// the moment the refresh reads free.
+    #[tokio::test(start_paused = true)]
+    async fn a_write_under_an_unknown_lease_claims_once_it_reads_free() {
+        let (tx, mut rx) = mpsc::channel(8);
+        let mut s = slots(vec![world("w1", "valheim")]);
+        let now = Instant::now();
+        on_game_started(&mut s, "w1", now, &tx);
+        drain(&mut rx);
+        let slot = s.get_mut("w1").unwrap();
+        assert_eq!(slot.lease, LeaseObs::Unknown);
+        on_write(slot, &tx, None);
+        assert!(drain(&mut rx).is_empty());
+        assert!(slot.session.as_ref().unwrap().wrote_unclaimed);
+        slot.lease = LeaseObs::Free;
+        assert_eq!(on_reconciled(slot, now, &tx, None), Followup::Nothing);
+        let events = drain(&mut rx);
+        assert!(
+            matches!(
+                events.as_slice(),
+                [AgentEvent::WorldClaimed { auto: true, .. }]
+            ),
+            "{events:?}"
+        );
+        assert!(slot.session.as_ref().unwrap().claimed);
     }
 
     #[tokio::test]
