@@ -378,6 +378,10 @@ impl Daemon {
                 self.with_engine(|h| async move { h.force_world(save_id).await })
                     .await
             }
+            Request::DismissWorld { save_id } => {
+                self.with_engine(|h| async move { h.dismiss_world(save_id).await })
+                    .await
+            }
             // The group verbs are plain server calls on the engine's client, and
             // they answer with the server's payload.
             Request::ListGroups => {

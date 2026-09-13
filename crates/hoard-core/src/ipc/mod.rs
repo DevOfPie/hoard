@@ -47,7 +47,7 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 
-pub use events::{AgentEvent, AgentSlotStatus, BackupReason, WorldRole};
+pub use events::{AgentEvent, AgentSlotStatus, BackupReason, WorldChoice, WorldLease, WorldRole};
 pub use journal::{Backlog, JournalEntry};
 
 /// Protocol version. Goes up only on an incompatible change; adding a field with
@@ -376,6 +376,12 @@ pub enum Request {
     /// Take the lease off its holder (only while they have pushed nothing under
     /// it) and acquire it.
     ForceWorld {
+        save_id: String,
+    },
+    /// "Not playing": the answer to [`events::AgentEvent::WorldClaimWanted`]
+    /// that takes no role. No auto-host and no second prompt this session;
+    /// a write to the world still claims it by evidence.
+    DismissWorld {
         save_id: String,
     },
     /// The groups this account belongs to. Answers [`Payload::Groups`].
@@ -966,6 +972,34 @@ mod tests {
         )
         .unwrap();
         assert!(matches!(lost, AgentEvent::WorldLeaseLost { .. }));
+        let wanted = serde_json::to_value(AgentEvent::WorldClaimWanted {
+            game_slug: "valheim".into(),
+            worlds: vec![WorldChoice {
+                save_id: "s1".into(),
+                label: "Midgard".into(),
+                group_name: "friends".into(),
+                holder: Some("bob".into()),
+                lease: WorldLease::Other,
+            }],
+        })
+        .unwrap();
+        assert_eq!(wanted["type"], "world_claim_wanted");
+        assert_eq!(wanted["worlds"][0]["lease"], "other");
+        assert_eq!(wanted["worlds"][0]["holder"], "bob");
+        // `holder` is optional on the way in: a free world names nobody.
+        let wanted: AgentEvent = serde_json::from_str(
+            r#"{"type":"world_claim_wanted","game_slug":"valheim","worlds":[{"save_id":"s1","label":"Midgard","group_name":"friends","lease":"free"}]}"#,
+        )
+        .unwrap();
+        assert!(
+            matches!(wanted, AgentEvent::WorldClaimWanted { worlds, .. } if worlds[0].holder.is_none())
+        );
+        let writing = serde_json::to_value(AgentEvent::ViewSessionWriting {
+            save_id: "s1".into(),
+            game_slug: "valheim".into(),
+        })
+        .unwrap();
+        assert_eq!(writing["type"], "view_session_writing");
     }
 
     /// The goodbye carries its reason, so the client can show it ("`hoard sync
@@ -1046,6 +1080,12 @@ mod tests {
             ),
             (Request::ForgetServerSession, "forget_server_session"),
             (Request::ServerToken, "server_token"),
+            (
+                Request::DismissWorld {
+                    save_id: "w1".into(),
+                },
+                "dismiss_world",
+            ),
             (Request::Shutdown, "shutdown"),
         ];
         for (request, op) in cases {

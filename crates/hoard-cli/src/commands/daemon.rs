@@ -416,6 +416,22 @@ fn render(ev: &AgentEvent) -> Option<String> {
         WorldLeaseLost { game_slug, .. } => {
             format!("⚠  {game_slug}: hosting lease lost — nothing more is pushed this session")
         }
+        WorldClaimWanted { game_slug, worlds } => {
+            let names: Vec<String> = worlds
+                .iter()
+                .map(|w| match &w.holder {
+                    Some(h) => format!("{} (hosted by {h})", w.label),
+                    None => w.label.clone(),
+                })
+                .collect();
+            format!(
+                "?  {game_slug}: which shared world, and host or view? {}",
+                names.join(", ")
+            )
+        }
+        ViewSessionWriting { game_slug, .. } => {
+            format!("⚠  {game_slug}: the game is saving into a world you only view — nothing is uploaded")
+        }
         _ => return None,
     })
 }

@@ -11,6 +11,7 @@ pub mod agent;
 pub mod api;
 pub mod atomic_write;
 pub mod backup;
+pub mod claim;
 pub mod cloud_account;
 pub mod cloud_auth;
 pub mod cloud_live;

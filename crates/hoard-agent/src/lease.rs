@@ -41,6 +41,7 @@ enum Cmd {
     Acquire { save_id: String, base_version: i64 },
     Release { save_id: String },
     Force { save_id: String },
+    Refresh { save_id: String },
     Closing { done: oneshot::Sender<()> },
 }
 
@@ -72,6 +73,39 @@ impl LeaseHandle {
         let _ = self.tx.try_send(Cmd::Force {
             save_id: save_id.into(),
         });
+    }
+
+    /// Ask the server who holds the lease now. The answer arrives as
+    /// `set_lease`, like every other; a slot still reading `Unknown` at
+    /// launch asks this before the minute of grace runs.
+    pub fn refresh(&self, save_id: impl Into<String>) {
+        let _ = self.tx.try_send(Cmd::Refresh {
+            save_id: save_id.into(),
+        });
+    }
+
+    /// A handle whose commands land in a channel instead of a server, as
+    /// `"<verb> <save_id>"` lines, for the engine tests.
+    #[cfg(test)]
+    pub(crate) fn probe() -> (Self, mpsc::UnboundedReceiver<String>) {
+        let (tx, mut rx) = mpsc::channel(64);
+        let (seen_tx, seen_rx) = mpsc::unbounded_channel();
+        tokio::spawn(async move {
+            while let Some(cmd) = rx.recv().await {
+                let line = match cmd {
+                    Cmd::Acquire { save_id, .. } => format!("acquire {save_id}"),
+                    Cmd::Release { save_id } => format!("release {save_id}"),
+                    Cmd::Force { save_id } => format!("force {save_id}"),
+                    Cmd::Refresh { save_id } => format!("refresh {save_id}"),
+                    Cmd::Closing { done } => {
+                        let _ = done.send(());
+                        break;
+                    }
+                };
+                let _ = seen_tx.send(line);
+            }
+        });
+        (Self { tx }, seen_rx)
     }
 
     /// Release every held lease on an orderly shutdown. Bounded
@@ -202,6 +236,24 @@ async fn run<A: LeaseApi, S: LeaseSink>(api: A, sink: S, mut rx: mpsc::Receiver<
                         }
                         Err(e) => {
                             tracing::info!(save_id = %save_id, error = %e, "lease: force refused");
+                        }
+                    }
+                }
+                Some(Cmd::Refresh { save_id }) => {
+                    // Only a verdict changes the slot: a transport error keeps
+                    // the last state, like everywhere else in this task.
+                    match api.current(save_id.clone()).await {
+                        Ok(Some(l)) if held.contains_key(&save_id) => {
+                            let me = l.holder_username.as_str().to_string();
+                            sink.set_lease(save_id, LeaseObs::Mine, Some(me)).await;
+                        }
+                        Ok(Some(l)) => {
+                            let holder = l.holder_username.as_str().to_string();
+                            sink.set_lease(save_id, LeaseObs::Other, Some(holder)).await;
+                        }
+                        Ok(None) => sink.set_lease(save_id, LeaseObs::Free, None).await,
+                        Err(e) => {
+                            tracing::debug!(save_id = %save_id, error = %e, "lease: refresh failed (state kept)");
                         }
                     }
                 }
@@ -552,6 +604,39 @@ mod tests {
         let seen = sink.0.lock().unwrap().clone();
         assert_eq!(seen[1], ("w1".to_string(), LeaseObs::Free, None));
         assert_eq!(seen[2], ("w2".to_string(), LeaseObs::Free, None));
+    }
+
+    /// A refresh reports what the server says and touches nothing else:
+    /// somebody's lease reads as theirs, no lease reads free, and a held one
+    /// stays ours.
+    #[tokio::test(start_paused = true)]
+    async fn a_refresh_reads_the_servers_answer() {
+        let fake = Fake::default();
+        *fake.0.current.lock().unwrap() = Some(lease("bob"));
+        let (handle, seen, task) = start(fake.clone());
+        handle.refresh("w1");
+        settle().await;
+        assert_eq!(
+            seen.0.lock().unwrap().as_slice(),
+            &[("w1".to_string(), LeaseObs::Other, Some("bob".to_string()))]
+        );
+
+        *fake.0.current.lock().unwrap() = None;
+        handle.refresh("w1");
+        settle().await;
+        assert_eq!(
+            seen.0.lock().unwrap().last().unwrap(),
+            &("w1".to_string(), LeaseObs::Free, None)
+        );
+
+        fake.0.acquire.lock().unwrap().push(Ok(lease("me")));
+        *fake.0.current.lock().unwrap() = Some(lease("me"));
+        handle.acquire("w1", 1);
+        handle.refresh("w1");
+        settle().await;
+        assert_eq!(seen.0.lock().unwrap().last().unwrap().1, LeaseObs::Mine);
+        drop(handle);
+        let _ = task.await;
     }
 
     #[tokio::test(start_paused = true)]

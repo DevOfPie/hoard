@@ -271,6 +271,16 @@ async fn the_world_and_group_verbs_round_trip_and_want_an_engine() {
     let text = err.to_string();
     assert!(text.contains("no engine"), "{text}");
 
+    // "Not playing" is an engine command like the claim: same answer without one.
+    let err = client
+        .request(Request::DismissWorld {
+            save_id: "w1".into(),
+        })
+        .await
+        .expect_err("no engine, nothing to dismiss");
+    let text = err.to_string();
+    assert!(text.contains("no engine"), "{text}");
+
     // Still connected: a refused request is an answer, not a farewell.
     let (_, pid) = client.ping().await.unwrap();
     assert_eq!(pid, std::process::id());

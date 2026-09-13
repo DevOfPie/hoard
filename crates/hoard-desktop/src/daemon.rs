@@ -858,6 +858,8 @@ fn emit_event(app: &AppHandle, ev: &AgentEvent) {
         AgentEvent::WorldReleased { .. } => "agent://world-released",
         AgentEvent::WorldHostedElsewhere { .. } => "agent://world-hosted-elsewhere",
         AgentEvent::WorldLeaseLost { .. } => "agent://world-lease-lost",
+        AgentEvent::WorldClaimWanted { .. } => "agent://world-claim-wanted",
+        AgentEvent::ViewSessionWriting { .. } => "agent://view-session-writing",
     };
     let _ = app.emit(topic, ev);
 

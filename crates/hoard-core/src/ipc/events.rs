@@ -343,6 +343,9 @@ pub enum AgentEvent {
     /// was newer than the local copy (ADR 0014). Before overwriting, the
     /// agent moved each local version into `conflict_dir`. The UI surfaces
     /// a toast so the user can recover manually if mtime decided wrong.
+    /// Also what a shared-world session that never pushes (a viewer's, or
+    /// under somebody else's lease) leaves behind on close: its writes, set
+    /// aside in `conflict_dir` before the head comes back.
     SaveConflictsBackedUp {
         save_id: String,
         game_slug: String,
@@ -408,6 +411,42 @@ pub enum AgentEvent {
         save_id: String,
         game_slug: String,
     },
+    /// A game with shared worlds started and nothing says which world this
+    /// machine plays, or how. One per session per game: a re-prompt replaces
+    /// the last. The answer is `ClaimWorld` or `DismissWorld`; with exactly one
+    /// world whose lease is free, no answer within a minute hosts it.
+    WorldClaimWanted {
+        game_slug: String,
+        worlds: Vec<WorldChoice>,
+    },
+    /// A second write landed on a shared world this machine only views: the
+    /// game is saving into a copy that will never be pushed. Once per session.
+    ViewSessionWriting {
+        save_id: String,
+        game_slug: String,
+    },
+}
+
+/// One shared world the prompt offers.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorldChoice {
+    pub save_id: String,
+    pub label: String,
+    pub group_name: String,
+    /// Who hosts it now, when the lease is somebody's.
+    #[serde(default)]
+    pub holder: Option<String>,
+    pub lease: WorldLease,
+}
+
+/// The lease as the engine last heard it, for the prompt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorldLease {
+    Unknown,
+    Free,
+    Mine,
+    Other,
 }
 
 /// What a machine does with a shared world during a session. `Host` holds the

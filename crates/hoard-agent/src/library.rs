@@ -579,6 +579,7 @@ fn playtime_watched_save(slug: &str, install_dir: Option<PathBuf>) -> WatchedSav
         set_hash: None,
         track_only: true,
         shared: false,
+        group_name: None,
         include: Vec::new(),
     }
 }
@@ -735,6 +736,7 @@ pub fn watched_saves_from_state(
             set_hash: s.set_hash.clone(),
             track_only: false,
             shared: s.shared.is_some(),
+            group_name: s.shared.as_ref().map(|r| r.group_name.clone()),
             include: s.include.clone(),
         });
     }
@@ -755,7 +757,7 @@ pub fn watched_save_from(
     processes_override: Vec<String>,
     shared_processes: bool,
     allow_device_local: Option<bool>,
-    shared: bool,
+    shared: Option<&SharedRef>,
     include: Vec<String>,
 ) -> WatchedSave {
     let steam_apps = steam::list_installed_steam_games(Os::current()).unwrap_or_default();
@@ -783,7 +785,8 @@ pub fn watched_save_from(
         known_version: None,
         set_hash: None,
         track_only: false,
-        shared,
+        shared: shared.is_some(),
+        group_name: shared.map(|r| r.group_name.clone()),
         include,
     }
 }
@@ -1255,7 +1258,7 @@ pub async fn add_to_tracking(client: &ApiClient, args: AddGameArgs) -> Result<Tr
             pinned_processes.clone(),
             args.shared_processes,
             None,
-            false,
+            None,
             Vec::new(),
         );
         return Ok(TrackOutcome {
@@ -1359,7 +1362,7 @@ pub async fn add_to_tracking(client: &ApiClient, args: AddGameArgs) -> Result<Tr
         pinned_processes.clone(),
         args.shared_processes,
         None,
-        false,
+        None,
         Vec::new(),
     );
 
@@ -1489,7 +1492,7 @@ pub async fn adopt(client: &ApiClient, args: AdoptArgs) -> Result<TrackOutcome> 
         Vec::new(),
         false,
         None,
-        shared.is_some(),
+        shared.as_ref(),
         include,
     );
 
@@ -2451,7 +2454,7 @@ fn watched_from_snapshot(save_id: String, s: &SaveState) -> WatchedSave {
         s.processes.clone(),
         s.shared_processes,
         s.allow_device_local,
-        s.shared.is_some(),
+        s.shared.as_ref(),
         s.include.clone(),
     )
 }

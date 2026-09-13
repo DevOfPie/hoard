@@ -136,6 +136,12 @@ struct Strings {
     lease_lost_title: &'static str,
     /// `{name}`
     lease_lost_body: &'static str,
+    /// The app is waiting for a world and a role. `{name}`
+    claim_wanted_title: &'static str,
+    claim_wanted_body: &'static str,
+    /// The game keeps writing into a world this machine only views. `{name}`
+    view_writing_title: &'static str,
+    view_writing_body: &'static str,
 }
 
 const EN: Strings = Strings {
@@ -160,6 +166,10 @@ const EN: Strings = Strings {
     hosted_elsewhere_body: "{name}: {holder} is hosting this world. Your changes stay on this machine until the lease is free.",
     lease_lost_title: "Hosting lease lost",
     lease_lost_body: "{name}: another member took over the world. Nothing more is uploaded this session.",
+    claim_wanted_title: "Which world?",
+    claim_wanted_body: "{name} started. Open Hoard to pick the shared world and whether you host or only view it.",
+    view_writing_title: "Playing a copy",
+    view_writing_body: "{name} is saving into a world you only view. Nothing is uploaded; take over hosting in Hoard to keep it.",
 };
 
 const ES: Strings = Strings {
@@ -185,6 +195,10 @@ const ES: Strings = Strings {
     hosted_elsewhere_body: "{name}: {holder} está alojando este mundo. Tus cambios se quedan en este equipo hasta que se libere.",
     lease_lost_title: "Alojamiento perdido",
     lease_lost_body: "{name}: otro miembro se ha hecho con el mundo. No se sube nada más en esta sesión.",
+    claim_wanted_title: "¿Qué mundo?",
+    claim_wanted_body: "{name} ha arrancado. Abre Hoard para elegir el mundo compartido y si lo alojas o solo lo ves.",
+    view_writing_title: "Jugando una copia",
+    view_writing_body: "{name} está guardando en un mundo que solo ves. No se sube nada; pasa a alojarlo en Hoard para conservarlo.",
 };
 
 const DE: Strings = Strings {
@@ -209,6 +223,10 @@ const DE: Strings = Strings {
     hosted_elsewhere_body: "{name}: {holder} hostet diese Welt. Deine Änderungen bleiben auf diesem Rechner, bis sie frei ist.",
     lease_lost_title: "Hosting verloren",
     lease_lost_body: "{name}: ein anderes Mitglied hat die Welt übernommen. In dieser Sitzung wird nichts mehr hochgeladen.",
+    claim_wanted_title: "Welche Welt?",
+    claim_wanted_body: "{name} wurde gestartet. Öffne Hoard, um die geteilte Welt zu wählen und ob du sie hostest oder nur ansiehst.",
+    view_writing_title: "Du spielst eine Kopie",
+    view_writing_body: "{name} speichert in eine Welt, die du nur ansiehst. Nichts wird hochgeladen; übernimm das Hosting in Hoard, um sie zu behalten.",
 };
 
 const FR: Strings = Strings {
@@ -233,6 +251,10 @@ const FR: Strings = Strings {
     hosted_elsewhere_body: "{name} : {holder} héberge ce monde. Tes changements restent sur cette machine tant qu'il n'est pas libre.",
     lease_lost_title: "Hébergement perdu",
     lease_lost_body: "{name} : un autre membre a repris le monde. Plus rien n'est envoyé pendant cette session.",
+    claim_wanted_title: "Quel monde ?",
+    claim_wanted_body: "{name} a démarré. Ouvre Hoard pour choisir le monde partagé et si tu l'héberges ou le regardes seulement.",
+    view_writing_title: "Tu joues sur une copie",
+    view_writing_body: "{name} sauvegarde dans un monde que tu ne fais que regarder. Rien n'est envoyé ; reprends l'hébergement dans Hoard pour le garder.",
 };
 
 const IT: Strings = Strings {
@@ -257,6 +279,10 @@ const IT: Strings = Strings {
     hosted_elsewhere_body: "{name}: {holder} sta ospitando questo mondo. Le tue modifiche restano su questa macchina finché non è libero.",
     lease_lost_title: "Hosting perso",
     lease_lost_body: "{name}: un altro membro ha preso il mondo. In questa sessione non viene più caricato nulla.",
+    claim_wanted_title: "Quale mondo?",
+    claim_wanted_body: "{name} è partito. Apri Hoard per scegliere il mondo condiviso e se lo ospiti o lo guardi soltanto.",
+    view_writing_title: "Stai giocando una copia",
+    view_writing_body: "{name} sta salvando in un mondo che guardi soltanto. Non viene caricato nulla; prendi l'hosting in Hoard per conservarlo.",
 };
 
 const JA: Strings = Strings {
@@ -281,6 +307,10 @@ const JA: Strings = Strings {
     hosted_elsewhere_body: "{name}：{holder} がこのワールドをホストしています。解放されるまで変更はこの端末に留まります。",
     lease_lost_title: "ホスト権を失いました",
     lease_lost_body: "{name}：別のメンバーがワールドを引き継ぎました。このセッションではこれ以上アップロードされません。",
+    claim_wanted_title: "どのワールド？",
+    claim_wanted_body: "{name} が起動しました。Hoard を開いて共有ワールドと、ホストするか閲覧のみかを選んでください。",
+    view_writing_title: "コピーをプレイ中",
+    view_writing_body: "{name} は閲覧のみのワールドに保存しています。何もアップロードされません。残すには Hoard でホストを引き継いでください。",
 };
 
 const PT: Strings = Strings {
@@ -306,6 +336,10 @@ const PT: Strings = Strings {
     hosted_elsewhere_body: "{name}: {holder} está a alojar este mundo. As tuas alterações ficam nesta máquina até ficar livre.",
     lease_lost_title: "Alojamento perdido",
     lease_lost_body: "{name}: outro membro ficou com o mundo. Nada mais é enviado nesta sessão.",
+    claim_wanted_title: "Que mundo?",
+    claim_wanted_body: "{name} arrancou. Abre o Hoard para escolher o mundo partilhado e se o alojas ou só o vês.",
+    view_writing_title: "A jogar numa cópia",
+    view_writing_body: "{name} está a guardar num mundo que só vês. Nada é enviado; assume o alojamento no Hoard para o manter.",
 };
 
 const ZH: Strings = Strings {
@@ -331,6 +365,11 @@ const ZH: Strings = Strings {
         "{name}：{holder} 正在托管这个世界。在其释放之前，你的更改只保留在本机。",
     lease_lost_title: "托管已丢失",
     lease_lost_body: "{name}：另一位成员接管了这个世界。本次会话不再上传任何内容。",
+    claim_wanted_title: "哪个世界？",
+    claim_wanted_body: "{name} 已启动。打开 Hoard 选择共享世界，以及是托管还是仅查看。",
+    view_writing_title: "正在游玩副本",
+    view_writing_body:
+        "{name} 正在保存到一个你仅查看的世界。不会上传任何内容；在 Hoard 中接管托管以保留它。",
 };
 
 /// Escribe el aviso.
@@ -434,6 +473,14 @@ pub fn render(kind: &Kind, name: &str, lang: Lang) -> Note {
             title: s.lease_lost_title.to_string(),
             body: fill(s.lease_lost_body, &[("name", name)]),
         },
+        Kind::WorldClaimWanted { .. } => Note {
+            title: s.claim_wanted_title.to_string(),
+            body: fill(s.claim_wanted_body, &[("name", name)]),
+        },
+        Kind::ViewSessionWriting => Note {
+            title: s.view_writing_title.to_string(),
+            body: fill(s.view_writing_body, &[("name", name)]),
+        },
     }
 }
 
@@ -523,6 +570,8 @@ mod tests {
                 );
             }
             assert!(s.lease_lost_body.contains("{name}"));
+            assert!(s.claim_wanted_body.contains("{name}"));
+            assert!(s.view_writing_body.contains("{name}"));
         }
     }
 
@@ -572,6 +621,8 @@ mod tests {
                 holder: "bob".into(),
             },
             Kind::WorldLeaseLost,
+            Kind::WorldClaimWanted { worlds: 1 },
+            Kind::ViewSessionWriting,
         ];
         for lang in ALL {
             for kind in &kinds {
