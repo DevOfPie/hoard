@@ -422,11 +422,15 @@ pub async fn restore_snapshot(
             .unwrap_or_default(),
     };
     // The safety copy walks what the save consists of, like every other backup.
-    let include = cli_state
-        .saves
-        .get(&save_id)
-        .map(|s| s.include.clone())
-        .unwrap_or_default();
+    // A save new to this machine has no row: the plan carries the server's list.
+    let include = match &home {
+        Some(home) => home.include.clone(),
+        None => cli_state
+            .saves
+            .get(&save_id)
+            .map(|s| s.include.clone())
+            .unwrap_or_default(),
+    };
 
     // 1) Optional pre-restore backup. Done synchronously so the user can be
     //    sure the safety net exists before we start overwriting files.
@@ -500,11 +504,11 @@ pub async fn restore_snapshot(
             // The shields go by game, and `restore_gate` reads the game from the
             // row, which a save new to this machine does not have yet.
             gate: match &home {
-                // New to this machine, so not shared here yet either: the
-                // include list arrives with the row at adopt.
+                // New to this machine: the server's list came with the plan, so
+                // the gate and the safety copy above walk the same files.
                 Some(home) => hoard_core::kernel::fileclass::RestoreGate {
                     shields: hoard_agent::savefilter::shields_for_slug(&home.game_slug),
-                    include: Vec::new(),
+                    include: home.include.clone(),
                     allow_device_local: allow_config,
                 },
                 None => restore_gate(&save_id, allow_config),

@@ -226,6 +226,15 @@ pub async fn create(
     // A shared save's bytes live in its group and the group's owner pays,
     // whoever pushes.
     let ns = Namespace::of(&access.owner_user_id, access.group_id.as_deref());
+    // What a shared save consists of, enforced per file below: a client whose
+    // row lost the list must not push the rest of its folder into the group.
+    let include = if let Namespace::Group(_) = ns {
+        crate::routes::share::include_for(&state.pool, &save_id)
+            .await
+            .map_err(|e| internal_logged("include lookup", e))?
+    } else {
+        Vec::new()
+    };
     let billing = ns
         .billing_user(&state.pool)
         .await
@@ -344,6 +353,10 @@ pub async fn create(
                 if !is_safe_relative_path(&rel) {
                     cleanup_tmp();
                     return Err(err(StatusCode::BAD_REQUEST, "unsafe file path"));
+                }
+                if crate::routes::share::first_outside_include(&include, [rel.as_str()]).is_some() {
+                    cleanup_tmp();
+                    return Err(crate::routes::cas::outside_include(&rel));
                 }
                 if files.len() >= max_files {
                     cleanup_tmp();
