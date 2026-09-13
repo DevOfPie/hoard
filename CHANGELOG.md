@@ -18,6 +18,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   its last heartbeat, so a machine that dies mid-session frees the world on its
   own instead of holding it until somebody notices. This is the server side; the
   desktop app and the CLI follow.
+
+## [1.1.7] - 2026-09-13
+
+### Added
+- **This fork updates from its own releases.** The desktop app, the CLI and the
+  server look for new versions at DevOfPie/hoard and accept only builds signed
+  with this fork's key, so a machine running a fork build keeps getting fork
+  builds. Switching back to upstream means installing an upstream build by hand.
 - **The size limit per save is yours to set.** Free stays at 1 GB by default and
   Pro at 10 GB, but the number is no longer fixed: there is a pencil next to
   "Per-save size" on the account screen, and it opens a slider that goes from
