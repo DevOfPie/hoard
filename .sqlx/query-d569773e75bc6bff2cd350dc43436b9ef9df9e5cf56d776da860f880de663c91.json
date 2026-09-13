@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "INSERT INTO group_invites (id, group_id, token_hash, created_by, expires_at)\n         VALUES (?, ?, ?, ?, ?)",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 5
+    },
+    "nullable": []
+  },
+  "hash": "d569773e75bc6bff2cd350dc43436b9ef9df9e5cf56d776da860f880de663c91"
+}

@@ -1,0 +1,98 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT s.id, s.game_slug, s.label, s.local_path_hint, s.client_os,\n                      s.latest_version_num, s.created_at, s.updated_at,\n                      COALESCE(COUNT(sn.id), 0) as \"snapshot_count: i64\",\n                      COALESCE(SUM(sn.total_size_bytes), 0) as \"total_size_bytes: i64\",\n                      ss.group_id as \"group_id?\", g.name as \"group_name?\",\n                      g.owner_user_id as \"group_owner_id?\", u.username as \"group_owner_name?\"\n               FROM saves s\n               LEFT JOIN shared_saves ss ON ss.save_id = s.id\n               LEFT JOIN groups g ON g.id = ss.group_id\n               LEFT JOIN users u ON u.id = g.owner_user_id\n               LEFT JOIN group_members gm ON gm.group_id = ss.group_id AND gm.user_id = ?\n               LEFT JOIN snapshots sn ON sn.save_id = s.id AND sn.deleted_at IS NULL\n               WHERE (s.user_id = ? OR gm.user_id IS NOT NULL) AND s.game_slug = ?\n               GROUP BY s.id ORDER BY s.created_at",
+  "describe": {
+    "columns": [
+      {
+        "name": "id",
+        "ordinal": 0,
+        "type_info": "Text"
+      },
+      {
+        "name": "game_slug",
+        "ordinal": 1,
+        "type_info": "Text"
+      },
+      {
+        "name": "label",
+        "ordinal": 2,
+        "type_info": "Text"
+      },
+      {
+        "name": "local_path_hint",
+        "ordinal": 3,
+        "type_info": "Text"
+      },
+      {
+        "name": "client_os",
+        "ordinal": 4,
+        "type_info": "Text"
+      },
+      {
+        "name": "latest_version_num",
+        "ordinal": 5,
+        "type_info": "Integer"
+      },
+      {
+        "name": "created_at",
+        "ordinal": 6,
+        "type_info": "Text"
+      },
+      {
+        "name": "updated_at",
+        "ordinal": 7,
+        "type_info": "Text"
+      },
+      {
+        "name": "snapshot_count: i64",
+        "ordinal": 8,
+        "type_info": "Integer"
+      },
+      {
+        "name": "total_size_bytes: i64",
+        "ordinal": 9,
+        "type_info": "Integer"
+      },
+      {
+        "name": "group_id?",
+        "ordinal": 10,
+        "type_info": "Text"
+      },
+      {
+        "name": "group_name?",
+        "ordinal": 11,
+        "type_info": "Text"
+      },
+      {
+        "name": "group_owner_id?",
+        "ordinal": 12,
+        "type_info": "Text"
+      },
+      {
+        "name": "group_owner_name?",
+        "ordinal": 13,
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Right": 3
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      true,
+      true,
+      false,
+      false,
+      false,
+      false,
+      false,
+      true,
+      true,
+      true,
+      true
+    ]
+  },
+  "hash": "f216945d610013c456676d4bf14c55b0952aeedb2c95c31c53bdf8869fce8ef0"
+}

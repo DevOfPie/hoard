@@ -17,6 +17,7 @@ use tracing::{info, warn};
 use uuid::Uuid;
 
 use crate::auth::AuthUser;
+use crate::routes::access::{save_access, Role};
 use crate::routes::health::ServerState;
 use crate::routes::repair_ts;
 
@@ -191,19 +192,18 @@ pub(crate) fn is_safe_relative_path(p: &str) -> bool {
     true
 }
 
+/// `(game_slug, label)` when the caller owns the save, `None` otherwise. The
+/// write paths gate on this; the read paths take [`save_access`] and let a
+/// group member through.
 pub(crate) async fn ownership_check(
     pool: &sqlx::SqlitePool,
     save_id: &str,
     user_id: &str,
 ) -> Result<Option<(String, String)>, sqlx::Error> {
-    let row = sqlx::query!(
-        "SELECT game_slug, label FROM saves WHERE id=? AND user_id=?",
-        save_id,
-        user_id
-    )
-    .fetch_optional(pool)
-    .await?;
-    Ok(row.map(|r| (r.game_slug, r.label)))
+    Ok(save_access(pool, save_id, user_id)
+        .await?
+        .filter(|a| a.role == Role::Owner)
+        .map(|a| (a.game_slug, a.label)))
 }
 
 // ─── POST /v1/saves/:save_id/snapshots ──────────────────────────────────────
@@ -935,9 +935,9 @@ pub async fn list(
 ) -> Result<Json<Vec<Snapshot>>, (StatusCode, Json<serde_json::Value>)> {
     let user_id = user.user_id.to_string();
 
-    if ownership_check(&state.pool, &save_id, &user_id)
+    if save_access(&state.pool, &save_id, &user_id)
         .await
-        .map_err(|e| internal_logged("ownership lookup", e))?
+        .map_err(|e| internal_logged("access lookup", e))?
         .is_none()
     {
         return Err(err(StatusCode::NOT_FOUND, "save not found"));
@@ -1018,9 +1018,9 @@ pub async fn detail(
     Path((save_id, version)): Path<(String, i64)>,
 ) -> Result<Json<SnapshotDetail>, (StatusCode, Json<serde_json::Value>)> {
     let user_id = user.user_id.to_string();
-    if ownership_check(&state.pool, &save_id, &user_id)
+    if save_access(&state.pool, &save_id, &user_id)
         .await
-        .map_err(|e| internal_logged("ownership lookup", e))?
+        .map_err(|e| internal_logged("access lookup", e))?
         .is_none()
     {
         return Err(err(StatusCode::NOT_FOUND, "save not found"));
@@ -1098,10 +1098,11 @@ pub async fn download(
     Path((save_id, version)): Path<(String, i64)>,
 ) -> Result<Response, (StatusCode, Json<serde_json::Value>)> {
     let user_id = user.user_id.to_string();
-    let (game_slug, label) = ownership_check(&state.pool, &save_id, &user_id)
+    let access = save_access(&state.pool, &save_id, &user_id)
         .await
-        .map_err(|e| internal_logged("ownership lookup", e))?
+        .map_err(|e| internal_logged("access lookup", e))?
         .ok_or_else(|| err(StatusCode::NOT_FOUND, "save not found"))?;
+    let (game_slug, label) = (access.game_slug, access.label);
 
     let snap_id: Option<String> = sqlx::query_scalar(
         "SELECT id FROM snapshots WHERE save_id=? AND version_num=? AND deleted_at IS NULL",
@@ -1127,7 +1128,8 @@ pub async fn download(
     .await
     .map_err(|e| internal_logged("listing snapshot rows", e))?;
 
-    let uid = user_id.clone();
+    // The bytes live in the owner's namespace, whoever is asking.
+    let uid = access.owner_user_id.clone();
 
     // How to source one entry's bytes when building the tar, as storage-backend
     // keys (resolved to readable local paths inside the tar-builder task).

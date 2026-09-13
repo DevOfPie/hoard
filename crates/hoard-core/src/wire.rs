@@ -253,6 +253,77 @@ pub struct Save {
     pub created_at: OffsetDateTime,
     #[serde(with = "ts")]
     pub updated_at: OffsetDateTime,
+    /// The group this save is shared into, on the owner's copy and on every
+    /// member's. Skipped when absent so an unshared save keeps emitting exactly
+    /// the release's JSON.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shared: Option<SharedInfo>,
+}
+
+/// Where a shared save lives: the group, and the group's owner, who pays for
+/// its storage.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SharedInfo {
+    pub group_id: String,
+    pub group_name: String,
+    pub owner_user_id: String,
+    pub owner_username: Username,
+}
+
+// ---- /v1/groups
+
+/// One member of a group. `role` is `owner` or `member`; anything else came
+/// from a newer server and reads as a plain member.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GroupMember {
+    pub user_id: String,
+    pub username: Username,
+    pub role: String,
+    #[serde(with = "ts")]
+    pub joined_at: OffsetDateTime,
+}
+
+/// A group as the caller sees it (`GET /v1/groups`, `POST /v1/groups`,
+/// `POST /v1/groups/join`), members included.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Group {
+    pub id: String,
+    pub name: String,
+    pub owner_user_id: String,
+    #[serde(with = "ts")]
+    pub created_at: OffsetDateTime,
+    #[serde(default)]
+    pub members: Vec<GroupMember>,
+}
+
+/// Body of `POST /v1/groups`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CreateGroupRequest {
+    pub name: String,
+}
+
+/// Body of `POST /v1/groups/{id}/invites`. `expires_in_secs` defaults to seven
+/// days on the server.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct CreateInviteRequest {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_in_secs: Option<u64>,
+}
+
+/// A freshly minted invite. `token` is shown once: the server keeps only its
+/// hash.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InviteOut {
+    pub invite_id: String,
+    pub token: String,
+    #[serde(with = "ts")]
+    pub expires_at: OffsetDateTime,
+}
+
+/// Body of `POST /v1/groups/join`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct JoinGroupRequest {
+    pub token: String,
 }
 
 // ---- /v1/saves/{id}/snapshots

@@ -1,0 +1,44 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT s.game_slug, s.label, s.user_id AS owner_user_id,\n                  ss.group_id AS \"group_id?\", gm.user_id AS \"member_id?\"\n           FROM saves s\n           LEFT JOIN shared_saves ss ON ss.save_id = s.id\n           LEFT JOIN group_members gm ON gm.group_id = ss.group_id AND gm.user_id = ?\n           WHERE s.id = ? AND (s.user_id = ? OR gm.user_id IS NOT NULL)",
+  "describe": {
+    "columns": [
+      {
+        "name": "game_slug",
+        "ordinal": 0,
+        "type_info": "Text"
+      },
+      {
+        "name": "label",
+        "ordinal": 1,
+        "type_info": "Text"
+      },
+      {
+        "name": "owner_user_id",
+        "ordinal": 2,
+        "type_info": "Text"
+      },
+      {
+        "name": "group_id?",
+        "ordinal": 3,
+        "type_info": "Text"
+      },
+      {
+        "name": "member_id?",
+        "ordinal": 4,
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Right": 3
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "528b5d8cd80b1fc0c5486fca47672808ce5e64c84862c4e0ba3300b993b329c0"
+}

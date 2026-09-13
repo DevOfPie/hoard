@@ -16,9 +16,10 @@ use hoard_server::auth::require_auth;
 use hoard_server::cleanup;
 use hoard_server::routes::{
     admin as admin_routes, auth as auth_routes, cas as cas_routes, devices as device_routes,
-    events as event_routes, games as game_routes, health, logs as log_routes,
-    overview as overview_routes, panel as panel_routes, playtime as playtime_routes,
-    saves as save_routes, session as session_routes, snapshots as snap_routes,
+    events as event_routes, games as game_routes, groups as group_routes, health,
+    logs as log_routes, overview as overview_routes, panel as panel_routes,
+    playtime as playtime_routes, saves as save_routes, session as session_routes,
+    snapshots as snap_routes,
 };
 
 #[derive(Parser)]
@@ -311,6 +312,22 @@ async fn run_self_hosted(cfg: Config) -> Result<()> {
         .route(
             "/v1/saves/:save_id/snapshots/:version/restore",
             post(snap_routes::restore),
+        )
+        // Groups and their membership (see `routes::groups`). Sharing a save
+        // into one and the lease on a shared save mount here too, later.
+        .route(
+            "/v1/groups",
+            get(group_routes::list).post(group_routes::create),
+        )
+        .route("/v1/groups/join", post(group_routes::join))
+        .route(
+            "/v1/groups/:id",
+            axum::routing::delete(group_routes::delete),
+        )
+        .route("/v1/groups/:id/invites", post(group_routes::create_invite))
+        .route(
+            "/v1/groups/:id/members/:user",
+            axum::routing::delete(group_routes::remove_member),
         )
         // Content-addressed upload: declare the manifest, upload only the
         // missing blobs, commit (see `routes::cas`). The multipart above stays

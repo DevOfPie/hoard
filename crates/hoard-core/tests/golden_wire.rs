@@ -19,8 +19,8 @@
 use std::path::PathBuf;
 
 use hoard_core::wire::{
-    CreateSaveRequest, Game, Health, LogBatch, LogIngestResponse, MaxVersionsBody,
-    MaxVersionsResponse, Save, Snapshot, SnapshotDetail, Whoami,
+    CreateSaveRequest, Game, Group, Health, InviteOut, LogBatch, LogIngestResponse,
+    MaxVersionsBody, MaxVersionsResponse, Save, Snapshot, SnapshotDetail, Whoami,
 };
 use serde::{de::DeserializeOwned, Serialize};
 
@@ -113,6 +113,25 @@ fn game_round_trips() {
 fn save_round_trips() {
     round_trip::<Save>("save");
     round_trip::<CreateSaveRequest>("create_save_request");
+}
+
+/// The group shapes as first emitted. `save.json` predates `shared` and has to
+/// keep round-tripping untouched: an unshared save must not grow the field.
+#[test]
+fn group_round_trips() {
+    round_trip::<Group>("group");
+    let g: Group = parses("group");
+    assert_eq!(g.members.len(), 2);
+    assert_eq!(g.members[0].role, "owner");
+    assert_eq!(g.members[1].username.as_str(), "player-two");
+
+    let save: Save = parses("save");
+    assert!(save.shared.is_none(), "absent means not shared");
+}
+
+#[test]
+fn invite_round_trips() {
+    round_trip::<InviteOut>("invite");
 }
 
 #[test]
