@@ -74,6 +74,38 @@ fn move_err(e: MoveError) -> ApiError {
     }
 }
 
+/// The include list stored with a share, as the client sent it; empty when the
+/// save is unshared or shares whole.
+pub async fn include_for<'e, E>(ex: E, save_id: &str) -> Result<Vec<String>, sqlx::Error>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Sqlite>,
+{
+    let json: Option<Option<String>> =
+        sqlx::query_scalar("SELECT include_json FROM shared_saves WHERE save_id = ?")
+            .bind(save_id)
+            .fetch_optional(ex)
+            .await?;
+    Ok(json
+        .flatten()
+        .and_then(|j| serde_json::from_str::<Vec<String>>(&j).ok())
+        .unwrap_or_default())
+}
+
+/// The first path a push carries that the share's include list does not name.
+/// The list is what every member's walk filters with, so a client whose row
+/// lost it must not be able to push the rest of its folder into the group.
+pub fn first_outside_include<'a>(
+    include: &[String],
+    paths: impl IntoIterator<Item = &'a str>,
+) -> Option<&'a str> {
+    if include.is_empty() {
+        return None;
+    }
+    paths
+        .into_iter()
+        .find(|p| !hoard_core::kernel::fileclass::included(include, p))
+}
+
 // ---- POST /v1/saves/:save_id/share
 
 /// The caller must own the save and belong to the group (as its owner or a

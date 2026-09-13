@@ -592,6 +592,7 @@ async fn start(events_tx: mpsc::Sender<AgentEvent>) -> anyhow::Result<Started> {
         Ok(r) if r.changed() => tracing::info!(
             relinked = r.relinked,
             dropped = r.dropped,
+            reshared = r.reshared,
             "hoardd: reconciled tracked saves with the server"
         ),
         Ok(_) => {}
