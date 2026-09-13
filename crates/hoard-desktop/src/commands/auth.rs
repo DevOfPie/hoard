@@ -410,6 +410,9 @@ pub(crate) fn pretty_error(err: anyhow::Error) -> String {
                  a firewall, or the network's route to it."
             ),
             ApiError::NonFastForward(d) => d.human(),
+            ApiError::LeaseHeld(d) | ApiError::LeaseRequired(d) => d.human(),
+            ApiError::LeaseStale(d) => d.human(),
+            ApiError::NotShared => "This save isn't shared with a group.".into(),
             ApiError::Conflict(msg) | ApiError::BadRequest(msg) => msg.clone(),
         };
     }

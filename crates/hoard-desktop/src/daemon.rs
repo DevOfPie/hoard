@@ -854,6 +854,10 @@ fn emit_event(app: &AppHandle, ev: &AgentEvent) {
         AgentEvent::RestoreDeferred { .. } => "agent://restore-deferred",
         AgentEvent::SaveAutoRestoreStuck { .. } => "agent://save-auto-restore-stuck",
         AgentEvent::SaveAutoRestoreRecovered { .. } => "agent://save-auto-restore-recovered",
+        AgentEvent::WorldClaimed { .. } => "agent://world-claimed",
+        AgentEvent::WorldReleased { .. } => "agent://world-released",
+        AgentEvent::WorldHostedElsewhere { .. } => "agent://world-hosted-elsewhere",
+        AgentEvent::WorldLeaseLost { .. } => "agent://world-lease-lost",
     };
     let _ = app.emit(topic, ev);
 

@@ -36,11 +36,12 @@ use std::time::{Duration, Instant};
 use hoard_agent::agent::{self, AgentConfig, AgentEvent, AgentHandle};
 use hoard_agent::api::ApiClient;
 use hoard_agent::config::CliConfig;
+use hoard_agent::lease::LeaseHandle;
 use hoard_agent::prefs::Prefs;
 use hoard_agent::presence::PresenceHandle;
 use hoard_agent::state::CliState;
 use hoard_agent::supervisor::Finished;
-use hoard_agent::{cloud_live, library, presence};
+use hoard_agent::{cloud_live, lease, library, presence, selfhosted_live};
 use hoard_core::ipc::{EngineDownReason, EngineStatus, KeyringFault};
 use time::OffsetDateTime;
 use tokio::sync::mpsc;
@@ -88,6 +89,9 @@ struct Running {
     handle: AgentHandle,
     task: JoinHandle<()>,
     presence: PresenceHandle,
+    /// The hosting leases this machine holds. Released on the way down, like
+    /// the presence beat: a lease left behind blocks the world for 300 s.
+    lease: LeaseHandle,
     /// The live engine's client. `Reload` rebuilds the watched set and for that it
     /// has to ask again which saves are archived: without this, archiving a save
     /// would have no effect until the next start. It shares its token cell with the
@@ -413,6 +417,7 @@ impl Engine {
         // this machine greyed out on the other machines' panel instead of going dark
         // without a word.
         running.presence.closing().await;
+        running.lease.closing().await;
         if let Err(err) = running.handle.shutdown().await {
             tracing::warn!(error = %err, "hoardd: the engine didn't acknowledge the restart");
         }
@@ -439,6 +444,7 @@ impl Engine {
         // One last presence beat while the token is good: it greys this machine out
         // on the other machines' panel straight away.
         running.presence.closing().await;
+        running.lease.closing().await;
         if let Err(err) = running.handle.shutdown().await {
             tracing::warn!(error = %err, "hoardd: the engine didn't acknowledge shutdown");
         }
@@ -606,10 +612,20 @@ async fn start(events_tx: mpsc::Sender<AgentEvent>) -> anyhow::Result<Started> {
     let live_client = active.client.clone();
     let refresh_client = active.client.clone();
     let reload_client = active.client.clone();
+    let lease_client = active.client.clone();
     let global_sync = config.global_sync;
     let (handle, task) = agent::spawn(active.client, config, saves, events_tx);
 
     let mut aux = vec![presence_task];
+    // The lease task needs the engine's handle to answer through, so it comes
+    // after `spawn` and is attached; the live stream feeds the same command.
+    // Both are gated inside on the server advertising groups.
+    let (lease_handle, lease_task) = lease::spawn(lease_client, handle.clone());
+    handle.attach_lease(lease_handle.clone()).await?;
+    aux.push(lease_task);
+    if !active.is_cloud {
+        aux.push(selfhosted_live::spawn(live_client.clone(), handle.clone()));
+    }
     // The low-latency Cloud push (Realtime plus a backup poll). Cloud only, and only
     // with global sync: `backup_only` never writes.
     if active.is_cloud && global_sync {
@@ -630,6 +646,7 @@ async fn start(events_tx: mpsc::Sender<AgentEvent>) -> anyhow::Result<Started> {
             handle,
             task,
             presence: presence_handle,
+            lease: lease_handle,
             client: reload_client,
             aux,
         },

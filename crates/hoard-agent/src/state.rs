@@ -129,6 +129,21 @@ pub struct SaveState {
     /// setting worth having; `Some(false)` is an explicit no.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub allow_device_local: Option<bool>,
+    /// The group this save is shared into, when it is. Only the fact travels
+    /// to the engine (`WatchedSave::shared`); the names are for the UI.
+    /// `default` keeps older `state.json` files loading.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shared: Option<SharedRef>,
+}
+
+/// Where a shared save lives: the group and its owner, as `state.json` keeps
+/// them. The on-disk twin of [`hoard_core::wire::SharedInfo`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SharedRef {
+    pub group_id: String,
+    pub group_name: String,
+    pub owner_user_id: String,
+    pub owner_username: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -629,6 +644,7 @@ mod tests {
             paused: false,
             preset: None,
             allow_device_local: None,
+            shared: None,
             set_hash: None,
             processes: vec![],
             shared_processes: false,

@@ -2130,6 +2130,7 @@ pub async fn remember_save(
                 processes: prev_processes,
                 shared_processes: prev_shared,
                 allow_device_local: prev_allow_device_local,
+                shared: None,
             },
         );
     } else if let Some(existing) = state.saves.get(save_id).cloned() {

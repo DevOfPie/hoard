@@ -365,6 +365,81 @@ impl Daemon {
                 self.with_engine(|h| async move { h.set_global_sync(enabled).await })
                     .await
             }
+            // The world verbs are engine commands: the outcome arrives as events.
+            Request::ClaimWorld { save_id, role } => {
+                self.with_engine(|h| async move { h.claim_world(save_id, role).await })
+                    .await
+            }
+            Request::ReleaseWorld { save_id } => {
+                self.with_engine(|h| async move { h.release_world(save_id).await })
+                    .await
+            }
+            Request::ForceWorld { save_id } => {
+                self.with_engine(|h| async move { h.force_world(save_id).await })
+                    .await
+            }
+            // The group verbs are plain server calls on the engine's client, and
+            // they answer with the server's payload.
+            Request::ListGroups => {
+                self.with_client(|c| async move { c.list_groups().await.map(Payload::Groups) })
+                    .await
+            }
+            Request::CreateGroup { name } => {
+                self.with_client(|c| async move {
+                    c.create_group(&name)
+                        .await
+                        .map(|g| Payload::Group(Box::new(g)))
+                })
+                .await
+            }
+            Request::InviteToGroup {
+                group_id,
+                expires_in_secs,
+            } => {
+                self.with_client(|c| async move {
+                    c.create_invite(&group_id, expires_in_secs)
+                        .await
+                        .map(Payload::Invite)
+                })
+                .await
+            }
+            Request::JoinGroup { token } => {
+                self.with_client(|c| async move {
+                    c.join_group(&token)
+                        .await
+                        .map(|g| Payload::Group(Box::new(g)))
+                })
+                .await
+            }
+            Request::LeaveGroup { group_id } => {
+                self.with_client(|c| async move {
+                    let me = c.whoami().await?.user_id;
+                    c.leave_group(&group_id, &me).await.map(|()| Payload::Ack)
+                })
+                .await
+            }
+            Request::ShareSave { save_id, group_id } => {
+                self.with_client(|c| async move {
+                    c.share_save(&save_id, &group_id)
+                        .await
+                        .map(|s| Payload::Save(Box::new(s)))
+                })
+                .await
+            }
+            Request::UnshareSave { save_id } => {
+                self.with_client(|c| async move {
+                    c.unshare_save(&save_id).await.map(|()| Payload::Ack)
+                })
+                .await
+            }
+            Request::GetLease { save_id } => {
+                self.with_client(|c| async move {
+                    c.get_lease(&save_id)
+                        .await
+                        .map(|l| Payload::Lease(l.map(Box::new)))
+                })
+                .await
+            }
             // How the update is going. Not through the engine: the updater belongs
             // to the daemon, and a downed engine (usually the very case where updating
             // fixes something) must not leave anybody unable to find out.
@@ -413,6 +488,48 @@ impl Daemon {
             Ok(()) => Reply::Ok(Payload::Ack),
             Err(err) => self.engine_error(err),
         }
+    }
+
+    /// A server call on the live engine's client. No engine means no session to
+    /// call with, which is the same `EngineDown` the engine commands answer.
+    async fn with_client<F, Fut>(&self, f: F) -> Reply
+    where
+        F: FnOnce(hoard_agent::api::ApiClient) -> Fut,
+        Fut: std::future::Future<Output = anyhow::Result<Payload>>,
+    {
+        let Some(client) = self.engine.client() else {
+            return Reply::Error(IpcError::EngineDown {
+                reason: self.engine.down_reason(),
+            });
+        };
+        match f(client).await {
+            Ok(payload) => Reply::Ok(payload),
+            Err(err) => self.api_error(err),
+        }
+    }
+
+    /// A 409 keeps its code: the client branches on `held`, `stale`, `pushed`
+    /// and the rest rather than on the sentence. Everything else is `Internal`.
+    fn api_error(&self, err: anyhow::Error) -> Reply {
+        use hoard_agent::api::ApiError;
+        let code = match err.downcast_ref::<ApiError>() {
+            Some(ApiError::LeaseHeld(_)) => Some("held"),
+            Some(ApiError::LeaseStale(_)) => Some("stale"),
+            Some(ApiError::LeaseRequired(_)) => Some("lease_required"),
+            Some(ApiError::NotShared) => Some("not_shared"),
+            Some(ApiError::Conflict(_)) => Some("conflict"),
+            _ => None,
+        };
+        if let Some(code) = code {
+            return Reply::Error(IpcError::Conflict {
+                code: code.to_string(),
+                message: format!("{err:#}"),
+            });
+        }
+        tracing::warn!(error = %format!("{err:#}"), "hoardd: a server call failed");
+        Reply::Error(IpcError::Internal {
+            message: format!("{err:#}"),
+        })
     }
 
     /// A command that does not reach the engine almost always means the engine is

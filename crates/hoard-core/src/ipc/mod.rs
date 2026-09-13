@@ -47,7 +47,7 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 
-pub use events::{AgentEvent, AgentSlotStatus, BackupReason};
+pub use events::{AgentEvent, AgentSlotStatus, BackupReason, WorldRole};
 pub use journal::{Backlog, JournalEntry};
 
 /// Protocol version. Goes up only on an incompatible change; adding a field with
@@ -362,6 +362,55 @@ pub enum Request {
     SnoozeUpdate {
         hours: u32,
     },
+    /// Take a role on a shared world. `Host` acquires the lease; `View` only
+    /// records the role. Answers `Ack`; the outcome arrives as
+    /// [`events::AgentEvent::WorldClaimed`] or `WorldHostedElsewhere`.
+    ClaimWorld {
+        save_id: String,
+        role: WorldRole,
+    },
+    /// Give the hosting lease back.
+    ReleaseWorld {
+        save_id: String,
+    },
+    /// Take the lease off its holder (only while they have pushed nothing under
+    /// it) and acquire it.
+    ForceWorld {
+        save_id: String,
+    },
+    /// The groups this account belongs to. Answers [`Payload::Groups`].
+    ListGroups,
+    /// Answers [`Payload::Group`].
+    CreateGroup {
+        name: String,
+    },
+    /// Mint an invite token. Answers [`Payload::Invite`].
+    InviteToGroup {
+        group_id: String,
+        #[serde(default)]
+        expires_in_secs: Option<u64>,
+    },
+    /// Redeem an invite token. Answers [`Payload::Group`].
+    JoinGroup {
+        token: String,
+    },
+    /// Leave a group one is a member of (not its owner).
+    LeaveGroup {
+        group_id: String,
+    },
+    /// Move a save into a group's namespace. Answers [`Payload::Save`].
+    ShareSave {
+        save_id: String,
+        group_id: String,
+    },
+    /// Move a save back into the owner's namespace.
+    UnshareSave {
+        save_id: String,
+    },
+    /// Who is hosting a shared save. Answers [`Payload::Lease`].
+    GetLease {
+        save_id: String,
+    },
     /// A request this daemon does not know, sent by a newer client.
     ///
     /// Without this variant the first unknown request would be a *framing* error,
@@ -401,6 +450,14 @@ pub enum Payload {
     /// How the update is going (answer to [`Request::UpdateStatus`] and to
     /// [`Request::ApplyUpdate`]).
     Update(UpdateState),
+    Groups(Vec<crate::wire::Group>),
+    /// Boxed, like the two below: a reply is mostly `Ack`, and the enum must
+    /// not grow to the size of a `Save` for it.
+    Group(Box<crate::wire::Group>),
+    Invite(crate::wire::InviteOut),
+    /// `None` when nobody is hosting.
+    Lease(Option<Box<crate::wire::Lease>>),
+    Save(Box<crate::wire::Save>),
 }
 
 /// Everything the service knows about the update, which is all of it: what is
@@ -608,6 +665,11 @@ pub enum IpcError {
     /// That request does not exist in this version of the protocol.
     #[error("this Hoard service doesn't support `{op}`")]
     Unsupported { op: String },
+    /// The server refused with a 409. `code` is its stable tag (`held`,
+    /// `stale`, `pushed`, `not_shared`...), for a client that branches on it;
+    /// `message` is what the user reads.
+    #[error("{message}")]
+    Conflict { code: String, message: String },
     #[error("the Hoard service couldn't do it: {message}")]
     Internal { message: String },
 }
@@ -859,6 +921,38 @@ mod tests {
         )
         .unwrap();
         assert!(matches!(deferred, AgentEvent::RestoreDeferred { .. }));
+
+        // The shared-world events: the desktop keys its toasts off these names
+        // and the CLI prints them.
+        let claimed = AgentEvent::WorldClaimed {
+            save_id: "s1".into(),
+            game_slug: "valheim".into(),
+            role: WorldRole::Host,
+            auto: true,
+        };
+        let json = serde_json::to_value(&claimed).unwrap();
+        assert_eq!(json["type"], "world_claimed");
+        assert_eq!(json["role"], "host");
+        assert_eq!(json["auto"], true);
+        let released = serde_json::to_value(AgentEvent::WorldReleased {
+            save_id: "s1".into(),
+            game_slug: "valheim".into(),
+        })
+        .unwrap();
+        assert_eq!(released["type"], "world_released");
+        let hosted = serde_json::to_value(AgentEvent::WorldHostedElsewhere {
+            save_id: "s1".into(),
+            game_slug: "valheim".into(),
+            holder: "bob".into(),
+        })
+        .unwrap();
+        assert_eq!(hosted["type"], "world_hosted_elsewhere");
+        assert_eq!(hosted["holder"], "bob");
+        let lost: AgentEvent = serde_json::from_str(
+            r#"{"type":"world_lease_lost","save_id":"s1","game_slug":"valheim"}"#,
+        )
+        .unwrap();
+        assert!(matches!(lost, AgentEvent::WorldLeaseLost { .. }));
     }
 
     /// The goodbye carries its reason, so the client can show it ("`hoard sync

@@ -29,8 +29,8 @@ use rand::{rngs::StdRng, Rng, SeedableRng};
 use time::{Duration, OffsetDateTime};
 
 use super::{
-    session, Action, ConflictStall, Decision, Observation, Op, OpResult, RestoreFailures, State,
-    World,
+    session, Action, ConflictStall, Decision, LeaseObs, Observation, Op, OpResult, RestoreFailures,
+    State, World,
 };
 
 // ---- pacing constants (sans-IO twins of the ones in `agent.rs`)
@@ -86,6 +86,12 @@ pub const CONFLICT_STALL_GIVE_UP_AFTER: u32 = 5;
 /// it as "this needs you to look at it", so it is a constant rather than a
 /// literal, same as [`HOLD_BACKUP_MIN_INTERVAL`].
 pub const HOLD_BACKUP_NEEDS_ATTENTION: &str = "backup conflict needs the user";
+/// A shared save whose lease another member holds: the push is theirs. The
+/// shell announces the holder off this reason.
+pub const HOLD_LEASE_OTHER: &str = "world is hosted by another member";
+/// A shared save nobody is hosting, or whose lease is not known yet. The shell
+/// acquires it off this reason when there is something to push.
+pub const HOLD_LEASE_NEEDED: &str = "hosting lease not held";
 
 /// Rest after a 402 (account full). Far longer than an ordinary failure's:
 /// freeing space is a human action (archiving games, upgrading), not a network
@@ -333,6 +339,17 @@ fn decide_backup(
     // more specific, and gives the real reason instead of "waiting".
     if obs.save_files_locked {
         return Some(hold("save files are open in another process"));
+    }
+    // A shared save is pushed by its host and nobody else: the server refuses
+    // the upload without the lease (`409 lease_required`), so the tick holds
+    // rather than burning an attempt. `Unknown` holds too: a push on a guess is
+    // the race the lease exists to prevent.
+    if next.shared {
+        match obs.lease {
+            LeaseObs::Mine => {}
+            LeaseObs::Other => return Some(hold(HOLD_LEASE_OTHER)),
+            LeaseObs::Free | LeaseObs::Unknown => return Some(hold(HOLD_LEASE_NEEDED)),
+        }
     }
     // Error backoff (an upload 429, or exhausted backup retries): never skipped.
     // Skipping it means hammering a dead backend or burning the quota.
@@ -2195,6 +2212,7 @@ mod tests {
         /// Arbitrary state with times anchored to `BASE` (bounded offsets).
         fn arb_state()(
             track_only in any::<bool>(),
+            shared in any::<bool>(),
             restore_enabled in any::<bool>(),
             is_running in any::<bool>(),
             running_seen in prop::option::of(-100i64..100),
@@ -2220,6 +2238,7 @@ mod tests {
         ) -> State {
             State {
                 track_only,
+                shared,
                 restore_enabled,
                 is_running,
                 last_running_seen: running_seen.map(at),
@@ -2253,6 +2272,12 @@ mod tests {
             local_empty in any::<bool>(),
             local_fp in prop::option::of(0u64..8),
             process_alive in any::<bool>(),
+            lease in prop_oneof![
+                Just(LeaseObs::Unknown),
+                Just(LeaseObs::Free),
+                Just(LeaseObs::Mine),
+                Just(LeaseObs::Other),
+            ],
             cloud_version in prop::option::of(0i64..20),
             // Covers the fresh feed, the stale one and the deployment with no
             // poller, so the invariants hold with a blind cloud cache too.
@@ -2289,6 +2314,7 @@ mod tests {
                 // pacing brake (only Windows can assert it) and leaving it always
                 // false keeps the state space to what this test covers.
                 save_files_locked: false,
+                lease,
                 cloud_version,
                 cloud_version_as_of: cloud_as_of.map(at),
                 cloud_feed_expected_since: cloud_expected.map(at),
@@ -2378,6 +2404,7 @@ mod tests {
                 && state.in_flight.is_none()
                 && obs.op_result.is_none()
                 && !state.backup_conflict.needs_attention
+                && !(state.shared && obs.lease != LeaseObs::Mine)
                 && (state.has_pending || obs.fs_event)
                 && local_diverged(&state, &obs)
                 && state.next_backup_at.is_none_or(|t| w.now >= t)
@@ -2386,6 +2413,21 @@ mod tests {
                 prop_assert!(
                     acts(&ds).contains(&&Action::Backup),
                     "cambios pendientes sin subida: el slot queda encallado: {ds:?}"
+                );
+            }
+        }
+
+        /// A shared save is pushed only by its host: never `Act(Backup)` while
+        /// the lease is somebody else's, free, or not known.
+        #[test]
+        fn inv_shared_save_pushes_only_as_host(
+            state in arb_state(), obs in arb_obs(false), w in arb_world()
+        ) {
+            let (_n, ds) = reconcile(&state, &obs, w);
+            if state.shared && obs.lease != LeaseObs::Mine {
+                prop_assert!(
+                    !acts(&ds).contains(&&Action::Backup),
+                    "a push on a shared save without the lease: {ds:?}"
                 );
             }
         }

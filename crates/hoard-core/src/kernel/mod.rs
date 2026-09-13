@@ -47,6 +47,19 @@ pub enum Op {
     Restore,
 }
 
+/// Who holds the hosting lease on a shared save, as last told by the server.
+/// The kernel keeps no holder name: the shell does, for the events it emits.
+/// An unshared save ignores it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum LeaseObs {
+    /// Nothing heard yet. A shared save with unknown lease is not pushed.
+    #[default]
+    Unknown,
+    Free,
+    Mine,
+    Other,
+}
+
 /// Restore failure escalation, keyed by cloud *version* rather than by save: a
 /// new version is new content and a fresh reason to try again, so it resets the
 /// escalation instead of inheriting the old version's penalty. Sans-IO twin of
@@ -166,6 +179,9 @@ pub struct State {
     // ---- resolved policy
     /// Playtime-only entry: there is no folder to sync.
     pub track_only: bool,
+    /// The save lives in a group namespace: pushes need the hosting lease
+    /// ([`Observation::lease`]). Pulls are unaffected.
+    pub shared: bool,
     pub restore_enabled: bool,
     /// Floor between committing backups (ADR 0018, axis A). `0` means no floor.
     /// Measured from [`Self::last_backup_at`], which only advances on a real
@@ -289,6 +305,8 @@ pub struct Observation {
     /// writing, so this arrives `false` and the usual guards decide. See
     /// `hoard_agent::locks`.
     pub save_files_locked: bool,
+    /// The hosting lease on a shared save. Read only when [`State::shared`].
+    pub lease: LeaseObs,
 
     // ---- server head
     /// Latest cloud version known for this save. `None` means unknown:

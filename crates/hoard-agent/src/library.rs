@@ -573,6 +573,7 @@ fn playtime_watched_save(slug: &str, install_dir: Option<PathBuf>) -> WatchedSav
         known_version: None,
         set_hash: None,
         track_only: true,
+        shared: false,
     }
 }
 
@@ -727,6 +728,7 @@ pub fn watched_saves_from_state(
             known_version: s.last_version_num,
             set_hash: s.set_hash.clone(),
             track_only: false,
+            shared: s.shared.is_some(),
         });
     }
     out.extend(playtime_saves);
@@ -772,6 +774,7 @@ pub fn watched_save_from(
         known_version: None,
         set_hash: None,
         track_only: false,
+        shared: false,
     }
 }
 
@@ -1226,6 +1229,7 @@ pub async fn add_to_tracking(client: &ApiClient, args: AddGameArgs) -> Result<Tr
                 processes: pinned_processes.clone(),
                 shared_processes: args.shared_processes,
                 allow_device_local: None,
+                shared: None,
             },
         );
         cli_state.save(&path)?;
@@ -1325,6 +1329,7 @@ pub async fn add_to_tracking(client: &ApiClient, args: AddGameArgs) -> Result<Tr
             processes: pinned_processes.clone(),
             shared_processes: args.shared_processes,
             allow_device_local: None,
+            shared: None,
         },
     );
     cli_state.save(&path)?;
@@ -1430,6 +1435,7 @@ pub async fn adopt(client: &ApiClient, args: AdoptArgs) -> Result<TrackOutcome> 
             processes: Vec::new(),
             shared_processes: false,
             allow_device_local: None,
+            shared: None,
         },
     );
     cli_state.save(&path)?;
@@ -2559,6 +2565,7 @@ mod tests {
             paused: false,
             preset: None,
             allow_device_local: None,
+            shared: None,
             set_hash: None,
             processes: Vec::new(),
             shared_processes: false,

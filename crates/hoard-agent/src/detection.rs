@@ -6880,6 +6880,7 @@ mod tests {
                 paused: false,
                 preset: None,
                 allow_device_local: None,
+                shared: None,
                 set_hash: None,
                 processes: Vec::new(),
                 shared_processes: false,

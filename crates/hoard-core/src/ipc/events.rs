@@ -381,6 +381,42 @@ pub enum AgentEvent {
         /// The guard that vetoed, straight from `mid_session_reason`.
         reason: String,
     },
+    /// This machine took a role on a shared world. `auto` is the engine
+    /// deciding on its own (the unanswered prompt); `false` is the user asking.
+    WorldClaimed {
+        save_id: String,
+        game_slug: String,
+        role: WorldRole,
+        auto: bool,
+    },
+    /// This machine gave the hosting lease back.
+    WorldReleased {
+        save_id: String,
+        game_slug: String,
+    },
+    /// Local changes on a shared world whose lease another member holds: they
+    /// stay local until the lease is free. Once per hold, not per tick.
+    WorldHostedElsewhere {
+        save_id: String,
+        game_slug: String,
+        /// The holder's username.
+        holder: String,
+    },
+    /// The lease this machine held is gone: forced by a member, or expired
+    /// while the renew could not reach the server. Nothing pushes from here.
+    WorldLeaseLost {
+        save_id: String,
+        game_slug: String,
+    },
+}
+
+/// What a machine does with a shared world during a session. `Host` holds the
+/// lease and pushes; `View` plays a copy and pushes nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorldRole {
+    Host,
+    View,
 }
 
 /// Why we scheduled a backup. Useful in the UI to explain "the game just

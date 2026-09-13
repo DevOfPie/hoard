@@ -246,6 +246,7 @@ pub fn collapse_key(event: &AgentEvent) -> Option<String> {
             | AgentEvent::BackupFilesUnreadable { .. }
             | AgentEvent::BackupNeedsAttention { .. }
             | AgentEvent::HeavyProcessDetected { .. }
+            | AgentEvent::WorldHostedElsewhere { .. }
     );
     if !restful {
         return None;

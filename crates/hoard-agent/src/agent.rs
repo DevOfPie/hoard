@@ -261,6 +261,10 @@ pub struct WatchedSave {
     /// in amber in the UI. `default` keeps older `state.json` files loading.
     #[serde(default)]
     pub track_only: bool,
+    /// The save lives in a group namespace: a push needs the hosting lease,
+    /// which the reducer holds for until the lease task says it is ours.
+    #[serde(default)]
+    pub shared: bool,
 }
 
 /// The event and per-slot status contract lives in the leaf kernel: with the engine
@@ -268,7 +272,7 @@ pub struct WatchedSave {
 /// need the engine's crate to read them (ADR 0021, part A and C.6). They are
 /// re-exported here, so `hoard_agent::agent::AgentEvent` is still the right path for
 /// the desktop and the CLI.
-pub use hoard_core::ipc::events::{AgentEvent, AgentSlotStatus, BackupReason};
+pub use hoard_core::ipc::events::{AgentEvent, AgentSlotStatus, BackupReason, WorldRole};
 
 /// How a spawned auto-restore attempt ended. Drives how the slot's
 /// `next_auto_restore_at` is re-armed and whether the consecutive-failure
@@ -487,6 +491,29 @@ enum AgentCommand {
         /// probe). Only a definite value moves the latch.
         is_cloud: Option<bool>,
     },
+    /// The lease task's handle. It arrives after `spawn` because the task
+    /// needs the [`AgentHandle`] to answer through; until then the shared
+    /// slots hold and ask for nothing.
+    AttachLease(crate::lease::LeaseHandle),
+    /// What the server said about a shared save's lease, from the lease task
+    /// or the live stream. `holder` is the holder's username when there is one.
+    SetLease {
+        save_id: String,
+        lease: kernel::LeaseObs,
+        holder: Option<String>,
+    },
+    /// The user takes a role on a shared world. `Host` asks for the lease.
+    ClaimWorld {
+        save_id: String,
+        role: WorldRole,
+    },
+    ReleaseWorld {
+        save_id: String,
+    },
+    /// Take the lease off its holder, then acquire it.
+    ForceWorld {
+        save_id: String,
+    },
     QueryStatus(oneshot::Sender<Vec<AgentSlotStatus>>),
     Shutdown,
 }
@@ -584,6 +611,47 @@ impl AgentHandle {
                 version_num,
             })
             .await?;
+        Ok(())
+    }
+
+    /// Wire the lease task in. See [`AgentCommand::AttachLease`].
+    pub async fn attach_lease(&self, lease: crate::lease::LeaseHandle) -> Result<()> {
+        self.tx.send(AgentCommand::AttachLease(lease)).await?;
+        Ok(())
+    }
+
+    /// The server's word on a shared save's lease. See [`AgentCommand::SetLease`].
+    pub async fn set_lease(
+        &self,
+        save_id: String,
+        lease: kernel::LeaseObs,
+        holder: Option<String>,
+    ) -> Result<()> {
+        self.tx
+            .send(AgentCommand::SetLease {
+                save_id,
+                lease,
+                holder,
+            })
+            .await?;
+        Ok(())
+    }
+
+    /// Take a role on a shared world. See [`AgentCommand::ClaimWorld`].
+    pub async fn claim_world(&self, save_id: String, role: WorldRole) -> Result<()> {
+        self.tx
+            .send(AgentCommand::ClaimWorld { save_id, role })
+            .await?;
+        Ok(())
+    }
+
+    pub async fn release_world(&self, save_id: String) -> Result<()> {
+        self.tx.send(AgentCommand::ReleaseWorld { save_id }).await?;
+        Ok(())
+    }
+
+    pub async fn force_world(&self, save_id: String) -> Result<()> {
+        self.tx.send(AgentCommand::ForceWorld { save_id }).await?;
         Ok(())
     }
 
@@ -858,6 +926,20 @@ struct SaveSlot {
     /// the deferred pull finally fires. Mapea a
     /// [`kernel::State::deferred_notified`].
     deferred_notified: bool,
+    /// The hosting lease as last told by the server, for a shared save. It maps
+    /// to [`kernel::Observation::lease`]; only `SetLease` writes it.
+    lease: kernel::LeaseObs,
+    /// The holder's username when the lease is somebody's, for the events.
+    lease_holder: Option<String>,
+    /// What this machine does with the world this session. `Host` by default:
+    /// a shared save that is written gets its lease asked for.
+    role: WorldRole,
+    /// An acquire is out and unanswered. Set on the hold's rising edge, cleared
+    /// by `SetLease`, so a hold that repeats every tick asks once.
+    lease_requested: bool,
+    /// `WorldHostedElsewhere` has gone out for the current hold. Cleared when
+    /// the lease stops being somebody else's.
+    hosted_elsewhere_notified: bool,
 }
 
 /// The kernel's deterministic RNG seed for this save (ADR 0021 C.2): the throttle
@@ -913,6 +995,7 @@ fn observe_local_fingerprint(path: &Path, game_slug: &str) -> Option<u64> {
 fn state_from_slot(slot: &SaveSlot, config: &AgentConfig, now: OffsetDateTime) -> kernel::State {
     kernel::State {
         track_only: slot.save.track_only,
+        shared: slot.save.shared,
         restore_enabled: slot
             .save
             .policy
@@ -1353,6 +1436,7 @@ fn observe_slot(slot: &mut SaveSlot, cloud: &CloudHeads) -> kernel::Observation 
         save_files_locked: !slot.is_running
             && !slot.save.track_only
             && crate::locks::any_file_locked(&slot.save.local_path),
+        lease: slot.lease,
         cloud_version: cloud.version_for(&slot.save),
         // The stamp belongs to the *feed*, not to the save: the manifest arrives
         // whole, so a save missing from it has `cloud_version: None` with an equally
@@ -1394,6 +1478,7 @@ fn reconcile_all(
     config: &AgentConfig,
     done_tx: &mpsc::Sender<BackupDone>,
     cloud: &CloudHeads,
+    lease: Option<&crate::lease::LeaseHandle>,
 ) {
     let now = OffsetDateTime::now_utc();
     let ids: Vec<String> = slots.keys().cloned().collect();
@@ -1501,11 +1586,62 @@ fn reconcile_all(
                     tracing::debug!(save_id = %id, reason, "agent: reconcile hold");
                     if kernel::reconcile::hold_is_paced_backup(reason) {
                         announce_backup_wait(slots, &id, floor, now, events_tx);
+                    } else if reason == kernel::reconcile::HOLD_LEASE_NEEDED {
+                        request_lease(slots, &id, lease);
+                    } else if reason == kernel::reconcile::HOLD_LEASE_OTHER {
+                        announce_hosted_elsewhere(slots, &id, events_tx);
                     }
                 }
             }
         }
     }
+}
+
+/// The reducer held a push for want of the lease: ask for it, once per hold.
+/// The answer (`SetLease`) clears the flag; a refusal leaves the hold standing
+/// and the next answer, from the live stream or a later claim, asks again. Only
+/// a host asks: a viewer's writes stay local by choice.
+fn request_lease(
+    slots: &mut HashMap<String, SaveSlot>,
+    id: &str,
+    lease: Option<&crate::lease::LeaseHandle>,
+) {
+    let Some(slot) = slots.get_mut(id) else {
+        return;
+    };
+    if !slot.save.shared
+        || !slot.has_pending
+        || slot.role != WorldRole::Host
+        || slot.lease_requested
+    {
+        return;
+    }
+    let Some(lease) = lease else {
+        return;
+    };
+    slot.lease_requested = true;
+    lease.acquire(id.to_string(), slot.known_version.unwrap_or(0));
+}
+
+/// The reducer held a push because another member hosts the world: say so
+/// once per hold, not per tick.
+fn announce_hosted_elsewhere(
+    slots: &mut HashMap<String, SaveSlot>,
+    id: &str,
+    events_tx: &mpsc::Sender<AgentEvent>,
+) {
+    let Some(slot) = slots.get_mut(id) else {
+        return;
+    };
+    if !slot.has_pending || slot.hosted_elsewhere_notified {
+        return;
+    }
+    slot.hosted_elsewhere_notified = true;
+    let _ = events_tx.try_send(AgentEvent::WorldHostedElsewhere {
+        save_id: id.to_string(),
+        game_slug: slot.save.game_slug.clone(),
+        holder: slot.lease_holder.clone().unwrap_or_default(),
+    });
 }
 
 /// Show a deferred backup instead of just logging it.
@@ -1752,6 +1888,10 @@ async fn run_agent(
     let mut playtime_ship: Option<JoinHandle<()>> = None;
     let mut playtime_ship_due = tokio::time::Instant::now();
 
+    // The lease task, once hoardd attaches it. `None` in a headless test and
+    // before the attach: shared slots then hold and ask for nothing.
+    let mut lease_task: Option<crate::lease::LeaseHandle> = None;
+
     // Channel used by every fs watcher: debounced events all funnel here
     // and we route them by path. mpsc::unbounded would be fine since the
     // debouncer already throttles, but we cap at 256 to be defensive.
@@ -1856,7 +1996,7 @@ async fn run_agent(
                         handle_add(&mut slots, *save, &fs_tx);
                         reconcile_all(
                             &mut slots, &api, &events_tx, &cmd_tx, &config, &done_tx,
-                            &cloud_heads,
+                            &cloud_heads, lease_task.as_ref(),
                         );
                     }
                     Some(AgentCommand::RearmWatcher(id)) => {
@@ -1911,7 +2051,7 @@ async fn run_agent(
                         }
                         reconcile_all(
                             &mut slots, &api, &events_tx, &cmd_tx, &config, &done_tx,
-                            &cloud_heads,
+                            &cloud_heads, lease_task.as_ref(),
                         );
                     }
                     Some(AgentCommand::SetAutoRestore(enabled)) => {
@@ -1928,7 +2068,7 @@ async fn run_agent(
                         if !was && enabled {
                             reconcile_all(
                                 &mut slots, &api, &events_tx, &cmd_tx, &config, &done_tx,
-                                &cloud_heads,
+                                &cloud_heads, lease_task.as_ref(),
                             );
                         }
                     }
@@ -1942,7 +2082,7 @@ async fn run_agent(
                         if !was && enabled {
                             reconcile_all(
                                 &mut slots, &api, &events_tx, &cmd_tx, &config, &done_tx,
-                                &cloud_heads,
+                                &cloud_heads, lease_task.as_ref(),
                             );
                         }
                     }
@@ -1959,7 +2099,7 @@ async fn run_agent(
                         }
                         reconcile_all(
                             &mut slots, &api, &events_tx, &cmd_tx, &config, &done_tx,
-                            &cloud_heads,
+                            &cloud_heads, lease_task.as_ref(),
                         );
                     }
                     Some(AgentCommand::SetCloudVersions { versions: map, aliases }) => {
@@ -1994,7 +2134,7 @@ async fn run_agent(
                         // updates that have just been unblocked.
                         reconcile_all(
                             &mut slots, &api, &events_tx, &cmd_tx, &config, &done_tx,
-                            &cloud_heads,
+                            &cloud_heads, lease_task.as_ref(),
                         );
                     }
                     Some(AgentCommand::CloudHeadsObserved { versions, aliases, digests, is_cloud }) => {
@@ -2019,7 +2159,7 @@ async fn run_agent(
                         }
                         reconcile_all(
                             &mut slots, &api, &events_tx, &cmd_tx, &config, &done_tx,
-                            &cloud_heads,
+                            &cloud_heads, lease_task.as_ref(),
                         );
                     }
                     Some(AgentCommand::SetProbeCandidates(dirs)) => {
@@ -2068,7 +2208,7 @@ async fn run_agent(
                         }
                         reconcile_all(
                             &mut slots, &api, &events_tx, &cmd_tx, &config, &done_tx,
-                            &cloud_heads,
+                            &cloud_heads, lease_task.as_ref(),
                         );
                     }
                     Some(AgentCommand::RetryBackupAfterFailure(id)) => {
@@ -2091,7 +2231,7 @@ async fn run_agent(
                         }
                         reconcile_all(
                             &mut slots, &api, &events_tx, &cmd_tx, &config, &done_tx,
-                            &cloud_heads,
+                            &cloud_heads, lease_task.as_ref(),
                         );
                     }
                     Some(AgentCommand::ParkBackupConflict { id, error }) => {
@@ -2114,7 +2254,7 @@ async fn run_agent(
                         }
                         reconcile_all(
                             &mut slots, &api, &events_tx, &cmd_tx, &config, &done_tx,
-                            &cloud_heads,
+                            &cloud_heads, lease_task.as_ref(),
                         );
                     }
                     Some(AgentCommand::ParkBackupQuotaFull(id)) => {
@@ -2133,7 +2273,7 @@ async fn run_agent(
                         }
                         reconcile_all(
                             &mut slots, &api, &events_tx, &cmd_tx, &config, &done_tx,
-                            &cloud_heads,
+                            &cloud_heads, lease_task.as_ref(),
                         );
                     }
                     Some(AgentCommand::ParkBackupThrottled { id, retry_after_secs }) => {
@@ -2153,7 +2293,7 @@ async fn run_agent(
                         }
                         reconcile_all(
                             &mut slots, &api, &events_tx, &cmd_tx, &config, &done_tx,
-                            &cloud_heads,
+                            &cloud_heads, lease_task.as_ref(),
                         );
                     }
                     Some(AgentCommand::SweepAll { window_secs }) => {
@@ -2179,8 +2319,75 @@ async fn run_agent(
                         }
                         reconcile_all(
                             &mut slots, &api, &events_tx, &cmd_tx, &config, &done_tx,
-                            &cloud_heads,
+                            &cloud_heads, lease_task.as_ref(),
                         );
+                    }
+                    Some(AgentCommand::AttachLease(handle)) => {
+                        lease_task = Some(handle);
+                    }
+                    Some(AgentCommand::SetLease { save_id, lease: obs, holder }) => {
+                        if let Some(slot) = slots.get_mut(&save_id) {
+                            let was = slot.lease;
+                            slot.lease = obs;
+                            slot.lease_holder = holder;
+                            slot.lease_requested = false;
+                            if obs != kernel::LeaseObs::Other {
+                                slot.hosted_elsewhere_notified = false;
+                            }
+                            // The lease this machine held is gone: forced, or
+                            // expired while the renew could not get through.
+                            if was == kernel::LeaseObs::Mine && obs != kernel::LeaseObs::Mine {
+                                tracing::warn!(save_id = %save_id, ?obs, "agent: hosting lease lost");
+                                let _ = events_tx.try_send(AgentEvent::WorldLeaseLost {
+                                    save_id: save_id.clone(),
+                                    game_slug: slot.save.game_slug.clone(),
+                                });
+                            }
+                            reconcile_all(
+                                &mut slots, &api, &events_tx, &cmd_tx, &config, &done_tx,
+                                &cloud_heads, lease_task.as_ref(),
+                            );
+                        }
+                    }
+                    Some(AgentCommand::ClaimWorld { save_id, role }) => {
+                        if let Some(slot) = slots.get_mut(&save_id) {
+                            slot.role = role;
+                            if role == WorldRole::Host {
+                                if let Some(lease) = lease_task.as_ref() {
+                                    slot.lease_requested = true;
+                                    lease.acquire(save_id.clone(), slot.known_version.unwrap_or(0));
+                                }
+                            }
+                            let _ = events_tx.try_send(AgentEvent::WorldClaimed {
+                                save_id: save_id.clone(),
+                                game_slug: slot.save.game_slug.clone(),
+                                role,
+                                auto: false,
+                            });
+                        }
+                    }
+                    Some(AgentCommand::ReleaseWorld { save_id }) => {
+                        if let Some(slot) = slots.get(&save_id) {
+                            if let Some(lease) = lease_task.as_ref() {
+                                lease.release(save_id.clone());
+                            }
+                            let _ = events_tx.try_send(AgentEvent::WorldReleased {
+                                save_id: save_id.clone(),
+                                game_slug: slot.save.game_slug.clone(),
+                            });
+                        }
+                    }
+                    Some(AgentCommand::ForceWorld { save_id }) => {
+                        if let Some(slot) = slots.get_mut(&save_id) {
+                            slot.role = WorldRole::Host;
+                            if let Some(lease) = lease_task.as_ref() {
+                                // The task runs them in order: the takeover,
+                                // then the acquire with this machine's head.
+                                slot.lease_requested = true;
+                                lease.force(save_id.clone());
+                                lease.acquire(save_id.clone(), slot.known_version.unwrap_or(0));
+                            }
+                        }
                     }
                     Some(AgentCommand::QueryStatus(resp)) => {
                         let snapshot: Vec<AgentSlotStatus> = slots
@@ -2374,6 +2581,7 @@ async fn run_agent(
                 // level-triggered, with no policy in the loop.
                 reconcile_all(
                     &mut slots, &api, &events_tx, &cmd_tx, &config, &done_tx, &cloud_heads,
+                    lease_task.as_ref(),
                 );
 
                 // DETECTION (phase 3, ADR 0020): probing the candidates. `sys`
@@ -2430,6 +2638,7 @@ async fn run_agent(
                 }
                 reconcile_all(
                     &mut slots, &api, &events_tx, &cmd_tx, &config, &done_tx, &cloud_heads,
+                    lease_task.as_ref(),
                 );
             }
 
@@ -2440,6 +2649,7 @@ async fn run_agent(
                 while nudge_rx.try_recv().is_ok() {}
                 reconcile_all(
                     &mut slots, &api, &events_tx, &cmd_tx, &config, &done_tx, &cloud_heads,
+                    lease_task.as_ref(),
                 );
             }
         }
@@ -2527,6 +2737,11 @@ fn handle_add(
         known_version,
         pull_pending: false,
         deferred_notified: false,
+        lease: kernel::LeaseObs::Unknown,
+        lease_holder: None,
+        role: WorldRole::Host,
+        lease_requested: false,
+        hosted_elsewhere_notified: false,
     };
     // Playtime-only entries exist purely to be matched by the process poll
     // so their hours accrue for the recap. They own no save folder, so we
@@ -5842,6 +6057,11 @@ mod tests {
             known_version: None,
             pull_pending: false,
             deferred_notified: false,
+            lease: kernel::LeaseObs::Unknown,
+            lease_holder: None,
+            role: WorldRole::Host,
+            lease_requested: false,
+            hosted_elsewhere_notified: false,
         }
     }
 
@@ -5860,6 +6080,7 @@ mod tests {
             known_version: None,
             set_hash: None,
             track_only: false,
+            shared: false,
         }
     }
 
@@ -5983,6 +6204,7 @@ mod tests {
             known_version: None,
             set_hash: None,
             track_only: false,
+            shared: false,
         };
         let mut slots = HashMap::new();
         slots.insert("abc".to_string(), test_slot(save));
@@ -6023,6 +6245,7 @@ mod tests {
             known_version: None,
             set_hash: None,
             track_only: false,
+            shared: false,
         };
         let mut slots = HashMap::new();
         slots.insert("burst-1".to_string(), test_slot(save));
@@ -6145,6 +6368,7 @@ mod tests {
             known_version: None,
             set_hash: None,
             track_only: false,
+            shared: false,
         };
 
         // Short debounce so the test completes well under the 10s timeout.
@@ -6194,6 +6418,102 @@ mod tests {
         assert_eq!(save_id, "watcher-bug-1");
     }
 
+    /// A shared world is pushed by its host only. With the lease somebody
+    /// else's, a write to the folder holds (no `BackupStarted`) and says who is
+    /// hosting exactly once, however many ticks the hold lasts; once the lease
+    /// is ours the same pending change goes up.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_shared_world_backs_up_only_as_host() {
+        let tmp = tempfile::tempdir().expect("create tempdir");
+        let save_path = tmp.path().to_path_buf();
+
+        let api = ApiClient::new("http://127.0.0.1:1", "fake").expect("fake api client");
+        let (events_tx, mut events_rx) = mpsc::channel::<AgentEvent>(64);
+
+        let save = WatchedSave {
+            save_id: "world-1".into(),
+            game_slug: "valheim".into(),
+            display_name: "Valheim".into(),
+            label: "main".into(),
+            local_path: save_path.clone(),
+            steam_install_dir: None,
+            processes: vec![],
+            shared_processes: false,
+            policy: Default::default(),
+            allow_device_local: None,
+            known_version: None,
+            set_hash: None,
+            track_only: false,
+            shared: true,
+        };
+        let config = AgentConfig {
+            debounce_secs: 1,
+            poll_secs: 1,
+            max_retries: 0,
+            auto_restore: false,
+            global_sync: false,
+            conflict_root: None,
+            conflict_retention_days: 14,
+            min_snapshot_interval_secs: 0,
+        };
+
+        let (handle, task) = spawn(api, config, vec![save], events_tx);
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        handle
+            .set_lease(
+                "world-1".into(),
+                kernel::LeaseObs::Other,
+                Some("bob".into()),
+            )
+            .await
+            .unwrap();
+
+        let mut f = std::fs::File::create(save_path.join("world.db")).expect("create save file");
+        f.write_all(b"seed").expect("write save file");
+        f.sync_all().expect("sync save file");
+        drop(f);
+
+        // Several polls' worth: the hold repeats every tick, the notice must not.
+        let mut hosted = 0;
+        let mut started = false;
+        let until = tokio::time::Instant::now() + Duration::from_secs(4);
+        loop {
+            match tokio::time::timeout_at(until, events_rx.recv()).await {
+                Ok(Some(AgentEvent::WorldHostedElsewhere { holder, .. })) => {
+                    assert_eq!(holder, "bob");
+                    hosted += 1;
+                }
+                Ok(Some(AgentEvent::BackupStarted { .. })) => started = true,
+                Ok(Some(_)) => {}
+                Ok(None) | Err(_) => break,
+            }
+        }
+        assert!(!started, "a push while another member hosts");
+        assert_eq!(hosted, 1, "one notice per hold, not per tick");
+
+        handle
+            .set_lease("world-1".into(), kernel::LeaseObs::Mine, Some("me".into()))
+            .await
+            .unwrap();
+        let started = tokio::time::timeout(Duration::from_secs(10), async {
+            while let Some(evt) = events_rx.recv().await {
+                if let AgentEvent::BackupStarted { save_id, .. } = evt {
+                    return save_id;
+                }
+            }
+            "<channel closed>".to_string()
+        })
+        .await;
+
+        let _ = handle.shutdown().await;
+        let _ = tokio::time::timeout(Duration::from_secs(2), task).await;
+
+        assert_eq!(
+            started.expect("the pending change goes up once the lease is ours"),
+            "world-1"
+        );
+    }
+
     /// A backup that burns its whole retry budget used to leave the slot in a
     /// corner it could never climb out of: no `BackupDone` (correctly, since the
     /// changes never reached a version, so `has_pending` must stay set to keep
@@ -6226,6 +6546,7 @@ mod tests {
             known_version: None,
             set_hash: None,
             track_only: false,
+            shared: false,
         };
 
         // `max_retries: 0` → the first failure is already the last.

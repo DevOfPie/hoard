@@ -242,6 +242,40 @@ async fn commands_without_an_engine_say_why() {
     );
 }
 
+/// The shared-world verbs cross the wire and need an engine: `ClaimWorld` is an
+/// engine command, `ListGroups` a server call on the engine's client, and with
+/// no engine both say so rather than hanging up.
+#[tokio::test]
+async fn the_world_and_group_verbs_round_trip_and_want_an_engine() {
+    let fx = Fixture::start();
+    let mut client = fx.client().await;
+
+    let err = client
+        .request(Request::ClaimWorld {
+            save_id: "w1".into(),
+            role: hoard_core::ipc::WorldRole::Host,
+        })
+        .await
+        .expect_err("no engine, no claim");
+    let text = err.to_string();
+    assert!(text.contains("no engine"), "{text}");
+    assert!(
+        !text.contains("EngineDown"),
+        "leaked the Debug shape: {text}"
+    );
+
+    let err = client
+        .request(Request::ListGroups)
+        .await
+        .expect_err("no engine, no client to list with");
+    let text = err.to_string();
+    assert!(text.contains("no engine"), "{text}");
+
+    // Still connected: a refused request is an answer, not a farewell.
+    let (_, pid) = client.ping().await.unwrap();
+    assert_eq!(pid, std::process::id());
+}
+
 /// Asking for an engine restart is **not** answered with `EngineDown` when there is
 /// no engine: it is precisely the request that can bring it back (the keeper
 /// resolves the session again). Answering "I cannot because it is broken" would
