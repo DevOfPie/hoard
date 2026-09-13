@@ -142,6 +142,8 @@ trait LeaseApi: Send + Sync + 'static {
         &self,
         save_id: String,
     ) -> impl Future<Output = anyhow::Result<Option<Lease>>> + Send;
+    /// This account\'s id, to tell a lease of ours from anybody else\'s.
+    fn me(&self) -> impl Future<Output = anyhow::Result<String>> + Send;
 }
 
 impl LeaseApi for ApiClient {
@@ -159,6 +161,9 @@ impl LeaseApi for ApiClient {
     }
     async fn current(&self, save_id: String) -> anyhow::Result<Option<Lease>> {
         self.get_lease(&save_id).await
+    }
+    async fn me(&self) -> anyhow::Result<String> {
+        Ok(self.whoami().await?.user_id)
     }
 }
 
@@ -203,6 +208,9 @@ fn refusal(err: &anyhow::Error) -> Option<Option<String>> {
 
 async fn run<A: LeaseApi, S: LeaseSink>(api: A, sink: S, mut rx: mpsc::Receiver<Cmd>) {
     let mut held: HashMap<String, Held> = HashMap::new();
+    // Who this account is, asked once, when a refresh first needs to tell
+    // a lease of ours from anybody else\'s.
+    let mut me: Option<String> = None;
     // Acquires the server never answered (transport), retried on the tick:
     // the engine asks once and waits for a verdict, so the retry is ours.
     let mut wanted: HashMap<String, i64> = HashMap::new();
@@ -248,14 +256,24 @@ async fn run<A: LeaseApi, S: LeaseSink>(api: A, sink: S, mut rx: mpsc::Receiver<
                 Some(Cmd::Refresh { save_id }) => {
                     // Only a verdict changes the slot: a transport error keeps
                     // the last state, like everywhere else in this task.
+                    if me.is_none() {
+                        me = api.me().await.ok();
+                    }
                     match api.current(save_id.clone()).await {
-                        Ok(Some(l)) if held.contains_key(&save_id) => {
-                            let me = l.holder_username.as_str().to_string();
-                            sink.set_lease(save_id, LeaseObs::Mine, Some(me)).await;
-                        }
                         Ok(Some(l)) => {
+                            // Ours only when the server names this account; a
+                            // takeover the renew has not seen yet reads as theirs.
+                            let ours = match &me {
+                                Some(id) => *id == l.holder_user_id,
+                                None => held.contains_key(&save_id),
+                            };
                             let holder = l.holder_username.as_str().to_string();
-                            sink.set_lease(save_id, LeaseObs::Other, Some(holder)).await;
+                            if ours {
+                                sink.set_lease(save_id, LeaseObs::Mine, Some(holder)).await;
+                            } else {
+                                held.remove(&save_id);
+                                sink.set_lease(save_id, LeaseObs::Other, Some(holder)).await;
+                            }
                         }
                         Ok(None) => sink.set_lease(save_id, LeaseObs::Free, None).await,
                         Err(e) => {
@@ -470,6 +488,9 @@ mod tests {
         ) -> impl Future<Output = anyhow::Result<Option<Lease>>> + Send {
             let r = self.0.current.lock().unwrap().clone();
             async move { Ok(r) }
+        }
+        async fn me(&self) -> anyhow::Result<String> {
+            Ok("id-me".to_string())
         }
     }
 
@@ -738,6 +759,31 @@ mod tests {
             sink.0.lock().unwrap().as_slice(),
             &[("w1".to_string(), LeaseObs::Mine, Some("me".to_string()))],
             "one verdict, no noise for the failed try"
+        );
+    }
+
+    /// A refresh reads mine only when the server names this account, whatever
+    /// the task still thinks it holds.
+    #[tokio::test(start_paused = true)]
+    async fn a_refresh_names_mine_only_for_this_account() {
+        let fake = Fake::default();
+        fake.0.acquire.lock().unwrap().push(Ok(lease("me")));
+        let (h, sink, _task) = start(fake.clone());
+        h.acquire("w1", 1);
+        settle().await;
+        *fake.0.current.lock().unwrap() = Some(lease("bob"));
+        h.refresh("w1");
+        settle().await;
+        assert_eq!(
+            sink.0.lock().unwrap().last(),
+            Some(&("w1".to_string(), LeaseObs::Other, Some("bob".to_string())))
+        );
+        *fake.0.current.lock().unwrap() = Some(lease("me"));
+        h.refresh("w1");
+        settle().await;
+        assert_eq!(
+            sink.0.lock().unwrap().last(),
+            Some(&("w1".to_string(), LeaseObs::Mine, Some("me".to_string())))
         );
     }
 }
