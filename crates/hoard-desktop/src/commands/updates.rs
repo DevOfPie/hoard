@@ -2,7 +2,7 @@
 //!
 //! Two independent probes:
 //!
-//! - **Client**: hits `https://api.github.com/repos/rleeon/hoard/releases/latest`
+//! - **Client**: hits `https://api.github.com/repos/DevOfPie/hoard/releases/latest`
 //!   and compares the tag to our compile-time `CARGO_PKG_VERSION`. We treat a
 //!   newer GitHub release as "update available" without parsing semver: a
 //!   simple string inequality is enough since our tags are always
@@ -72,7 +72,7 @@ struct HealthResp {
 }
 
 const CLIENT_VERSION: &str = env!("CARGO_PKG_VERSION");
-const GH_RELEASES_URL: &str = "https://api.github.com/repos/rleeon/hoard/releases/latest";
+const GH_RELEASES_URL: &str = "https://api.github.com/repos/DevOfPie/hoard/releases/latest";
 const PROBE_TIMEOUT: Duration = Duration::from_secs(8);
 
 /// The result of checking a freshly downloaded installer against the release key.
