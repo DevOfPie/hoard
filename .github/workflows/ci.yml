@@ -9,8 +9,17 @@ on:
   push:
     tags:
       - "v*.*.*"
+  # ready_for_review is here so taking a PR out of draft runs the jobs a draft
+  # skips (see build-test and sqlx-check) without needing another push.
   pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
   workflow_dispatch:
+
+# A newer push to the same PR cancels the run of the older one; on a tag or a
+# manual run every ref is its own group and nothing is cancelled.
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
 
 env:
   CARGO_TERM_COLOR: always
@@ -114,12 +123,18 @@ jobs:
   # ARM Linux is here because we now publish ARM Linux bundles. Without it the
   # first thing to compile an aarch64 build would be the release workflow, on a
   # tag, with nothing left to fix it before the assets go out.
+  #
+  # This fork pushes to pull requests many times a day, so a PR runs the matrix
+  # on ubuntu only and only once it is out of draft; the release gate on a tag,
+  # and a manual run, still cover every platform, Windows first among them
+  # because that is where the fork's builds are actually played.
   build-test:
     name: build + test (${{ matrix.os }})
+    if: github.event_name != 'pull_request' || !github.event.pull_request.draft
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, ubuntu-24.04-arm, windows-latest, macos-14]
+        os: ${{ fromJSON(github.event_name == 'pull_request' && '["ubuntu-latest"]' || '["ubuntu-latest", "ubuntu-24.04-arm", "windows-latest", "macos-14"]') }}
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -186,6 +201,8 @@ jobs:
   # `--check` mode against the migrations under crates/hoard-server.
   sqlx-check:
     name: sqlx offline cache
+    # A second full workspace build; drafts skip it like build-test.
+    if: github.event_name != 'pull_request' || !github.event.pull_request.draft
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
