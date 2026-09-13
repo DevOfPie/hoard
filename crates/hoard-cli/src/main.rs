@@ -165,6 +165,36 @@ enum Commands {
         #[command(subcommand)]
         action: commands::saves::SaveCommand,
     },
+    /// Groups you share saves with: create, list, invite, join, leave
+    Group {
+        #[command(subcommand)]
+        action: commands::group::GroupCommand,
+    },
+    /// Share a save with a group: members pull it, and one of them hosts it at
+    /// a time (`hoard world`). A game that keeps several worlds in one folder
+    /// shares one world, named with `--world`.
+    Share {
+        /// Save id (UUID), see `hoard saves`
+        save_id: String,
+        /// Group id or exact name, see `hoard group list`
+        #[arg(long)]
+        group: String,
+        /// The world to share, for a game that keeps several in one folder
+        /// (Valheim: the name of `worlds_local/<name>.fwl`)
+        #[arg(long)]
+        world: Option<String>,
+    },
+    /// Take a save back out of its group: it returns to your own namespace and
+    /// members stop seeing it
+    Unshare {
+        /// Save id (UUID), see `hoard saves`
+        save_id: String,
+    },
+    /// Host or view a shared world, and see who holds its lease
+    World {
+        #[command(subcommand)]
+        action: commands::world::WorldCommand,
+    },
     /// Manage snapshots (list / delete / undelete)
     Snapshots {
         #[command(subcommand)]
@@ -329,6 +359,11 @@ fn supports_json(cmd: &Commands) -> bool {
                 | commands::saves::SaveCommand::Untrack { .. }
         ),
         Commands::Snapshots { action } => matches!(action, SnapshotCommand::List { .. }),
+        Commands::Group { action } => matches!(action, commands::group::GroupCommand::List),
+        Commands::World { action } => {
+            matches!(action, commands::world::WorldCommand::Lease { .. })
+        }
+        Commands::Share { .. } => true,
         _ => false,
     }
 }
@@ -343,7 +378,8 @@ async fn dispatch(cli: Cli) -> Result<()> {
             "json_unsupported",
             "this command has no --json output yet. The ones that do: saves, \
              doctor, status, devices, whoami, scan, restore, save list, \
-             save show, save untrack, snapshots list.",
+             save show, save untrack, snapshots list, group list, share, \
+             world lease.",
         ));
     }
 
@@ -404,6 +440,14 @@ async fn dispatch(cli: Cli) -> Result<()> {
             list_excluded,
         } => commands::scan::run(verbose, deep, exclude, unexclude, list_excluded).await,
         Commands::Save { action } => commands::saves::run(action).await,
+        Commands::Group { action } => commands::group::run(action).await,
+        Commands::Share {
+            save_id,
+            group,
+            world,
+        } => commands::share::share(save_id, group, world).await,
+        Commands::Unshare { save_id } => commands::share::unshare(save_id).await,
+        Commands::World { action } => commands::world::run(action).await,
         Commands::Snapshots { action } => snapshots_dispatch(action).await,
         Commands::Backup {
             save_id,

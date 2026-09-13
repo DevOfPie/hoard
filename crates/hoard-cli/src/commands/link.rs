@@ -68,6 +68,18 @@ pub async fn attached(role: &str) -> Option<Client> {
     }
 }
 
+/// Connect to the service *if it is already up*, and fail otherwise. For the
+/// commands that have nobody to ask without it (groups, sharing, leases): the
+/// session and the server client live in the service.
+pub async fn require(role: &str) -> Result<Client> {
+    attached(role).await.ok_or_else(|| {
+        crate::output::err(
+            "no_service",
+            "the Hoard service isn't running; start it with `hoard sync start`",
+        )
+    })
+}
+
 /// A capped request over an established connection.
 pub async fn ask(client: &mut Client, request: Request) -> Result<Payload> {
     tokio::time::timeout(REQUEST_TIMEOUT, client.request(request))

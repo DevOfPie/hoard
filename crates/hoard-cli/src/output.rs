@@ -146,6 +146,16 @@ pub fn classify(e: &anyhow::Error) -> Classified {
         return plain(c.code, exit);
     }
 
+    // Refusals relayed by the service keep the server's grouping: a 409 is
+    // `conflict` whether it came over HTTP or the socket, and a request the
+    // user has to change is `bad_request`. Every other service failure stays
+    // generic; its message already says what happened.
+    match e.downcast_ref::<hoard_core::ipc::IpcError>() {
+        Some(hoard_core::ipc::IpcError::Conflict { .. }) => return plain("conflict", 1),
+        Some(hoard_core::ipc::IpcError::Invalid { .. }) => return plain("bad_request", 1),
+        _ => {}
+    }
+
     match e.downcast_ref::<ApiError>() {
         Some(ApiError::Unauthorized) => plain("unauthorized", 2),
         Some(ApiError::Forbidden) => plain("forbidden", 2),
@@ -236,6 +246,26 @@ mod tests {
         let c = classify(&anyhow::anyhow!("something odd"));
         assert_eq!(c.code, "error");
         assert_eq!(c.exit, 1);
+    }
+
+    /// A 409 the service relays keeps the `conflict` code the HTTP one has, so
+    /// a script branches the same way whichever road the refusal took; and it
+    /// prints as the server's one line, not as the variant.
+    #[test]
+    fn a_relayed_conflict_is_a_conflict() {
+        use hoard_core::ipc::IpcError;
+        let e = anyhow::Error::new(IpcError::Conflict {
+            code: "held".into(),
+            message: "another member is hosting this save".into(),
+        });
+        assert_eq!(classify(&e).code, "conflict");
+        assert_eq!(classify(&e).exit, 1);
+        assert_eq!(format!("{e:#}"), "another member is hosting this save");
+        let e = anyhow::Error::new(IpcError::Invalid {
+            message: "`a/b` is not a world name".into(),
+        });
+        assert_eq!(classify(&e).code, "bad_request");
+        assert_eq!(format!("{e:#}"), "`a/b` is not a world name");
     }
 
     /// Context added with `.context(…)` must not hide the typed cause.

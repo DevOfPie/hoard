@@ -1,7 +1,10 @@
 //! `hoard saves`: the saves this machine tracks, meaning what `daemon` and `sync`
-//! watch. Purely local: it reads `contexts/<id>.json` of the active context (Cloud
-//! or self-host) and never touches the network, so it works offline and is
-//! instant.
+//! watch. Local: it reads `contexts/<id>.json` of the active context (Cloud or
+//! self-host) and never touches the network itself, so it works offline and is
+//! instant. The one exception is the holder of a shared save, which it asks the
+//! resident service for and leaves out when there is none.
+
+use std::collections::HashMap;
 
 use anyhow::Result;
 use serde::Serialize;
@@ -10,6 +13,7 @@ use time::format_description::well_known::Rfc3339;
 use hoard_agent::session;
 use hoard_agent::state::CliState;
 
+use super::{link, world};
 use crate::output;
 
 /// One tracked save as agents and scripts see it. Declared here on purpose:
@@ -28,6 +32,10 @@ pub struct SaveRow {
     pub preset: Option<String>,
     /// The group this save is shared into, or null.
     pub group: Option<String>,
+    /// "hosted here" or "hosted by <name>" while somebody holds a live lease on
+    /// a shared save. Absent when nobody does, or with no service to ask.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hosted: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -49,6 +57,26 @@ pub async fn run() -> Result<()> {
             .then_with(|| a.label.cmp(&b.label))
     });
 
+    // The holder is the service's to know (it holds the session). No service
+    // means no column, not a column of dashes claiming nobody hosts.
+    let mut service = if rows.iter().any(|(_, s)| s.shared.is_some()) {
+        link::attached("saves").await
+    } else {
+        None
+    };
+    let my_fp = world::this_device();
+    let mut hosted = HashMap::new();
+    if let Some(client) = service.as_mut() {
+        for (id, s) in &rows {
+            if s.shared.is_some() {
+                if let Some(label) = world::hosted(client, id, &my_fp).await {
+                    hosted.insert((*id).clone(), label);
+                }
+            }
+        }
+    }
+    let host_column = service.is_some();
+
     let out = SavesOut {
         saves: rows
             .into_iter()
@@ -62,6 +90,7 @@ pub async fn run() -> Result<()> {
                 last_backup_at: s.last_backup_at.and_then(|t| t.format(&Rfc3339).ok()),
                 preset: s.preset.clone(),
                 group: s.shared.as_ref().map(|g| g.group_name.clone()),
+                hosted: hosted.remove(id),
             })
             .collect(),
         state_file: path.display().to_string(),
@@ -75,9 +104,22 @@ pub async fn run() -> Result<()> {
             );
             return;
         }
+        let host = |cell: &str| {
+            if host_column {
+                format!("{cell:<16}  ")
+            } else {
+                String::new()
+            }
+        };
         println!(
-            "{:<24}  {:<10}  {:>6}  {:<20}  {:<8}  {:<12}  PATH",
-            "GAME", "LABEL", "VER", "LAST", "STATE", "GROUP"
+            "{:<24}  {:<10}  {:>6}  {:<20}  {:<8}  {:<12}  {}PATH",
+            "GAME",
+            "LABEL",
+            "VER",
+            "LAST",
+            "STATE",
+            "GROUP",
+            host("HOST")
         );
         for s in &out.saves {
             let ver = s
@@ -95,14 +137,20 @@ pub async fn run() -> Result<()> {
                 .as_deref()
                 .map(|g| truncate(g, 12))
                 .unwrap_or_else(|| "—".to_string());
+            let hosted = s
+                .hosted
+                .as_deref()
+                .map(|h| truncate(h, 16))
+                .unwrap_or_else(|| "—".to_string());
             println!(
-                "{:<24}  {:<10}  {:>6}  {:<20}  {:<8}  {:<12}  {}",
+                "{:<24}  {:<10}  {:>6}  {:<20}  {:<8}  {:<12}  {}{}",
                 truncate(&s.game_slug, 24),
                 truncate(&s.label, 10),
                 ver,
                 last,
                 state_label,
                 group,
+                host(&hosted),
                 s.local_path
             );
         }
