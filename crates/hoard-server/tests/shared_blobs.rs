@@ -11,12 +11,12 @@ use axum::http::StatusCode;
 use axum::response::Json;
 use hoard_core::ids::Sha256 as Sha256Hex;
 use hoard_core::wire::{
-    CasCommit, CasFile, CasInit, CreateGroupRequest, CreateInviteRequest, JoinGroupRequest, Save,
-    ShareSaveRequest,
+    CasCommit, CasFile, CasInit, CreateGroupRequest, CreateInviteRequest, JoinGroupRequest,
+    LeaseAcquireRequest, Save, ShareSaveRequest,
 };
 use hoard_server::auth::AuthUser;
 use hoard_server::routes::health::ServerState;
-use hoard_server::routes::{admin, cas, groups, share, snapshots};
+use hoard_server::routes::{admin, cas, groups, leases, share, snapshots};
 use sha2::{Digest, Sha256};
 use sqlx::SqlitePool;
 use std::sync::Arc;
@@ -236,6 +236,27 @@ async fn backup_as(
     .1
      .0;
     (asked, snap)
+}
+
+/// A shared save is pushed by its host: take the lease at `base`, then back up.
+async fn host(
+    h: &Harness,
+    who: &AuthUser,
+    files: &[(&str, &[u8])],
+    base: Option<i64>,
+) -> (Vec<String>, hoard_core::wire::Snapshot) {
+    let Json(_) = leases::acquire(
+        st(h),
+        Extension(who.clone()),
+        Path(SAVE.to_string()),
+        axum::http::HeaderMap::new(),
+        Json(LeaseAcquireRequest {
+            base_version: base.unwrap_or(0),
+        }),
+    )
+    .await
+    .expect("lease");
+    backup_as(h, who, files, base).await
 }
 
 /// A group owned by the payer, with the save's owner and the member in it.
@@ -462,7 +483,7 @@ async fn a_member_pushes_into_the_group_namespace_on_the_group_owners_bill() {
     let pool = &h.state.pool;
 
     let d = vec![4u8; 5_000];
-    let (asked, snap) = backup_as(
+    let (asked, snap) = host(
         &h,
         &h.member,
         &[("world.db", &f.a), ("world.fwl", &d)],

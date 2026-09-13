@@ -18,6 +18,7 @@ pub mod events;
 pub mod games;
 pub mod groups;
 pub mod health;
+pub mod leases;
 pub mod logs;
 pub mod overview;
 pub mod panel;

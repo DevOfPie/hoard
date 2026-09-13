@@ -8,6 +8,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 ## [Unreleased]
 
 ### Added
+- **A self-hosted server can share a save between accounts.** Create a group,
+  invite the people you play with, and share a save into it: every member sees
+  it in their own list, pulls it, and pushes to it, and the bytes move into the
+  group's storage so the group's owner pays for them rather than whoever
+  happened to push last. A shared world is played on one machine at a time, so
+  each shared save carries a hosting lease: the member holding it is the only
+  one who can push, the others read, and the lease expires five minutes after
+  its last heartbeat, so a machine that dies mid-session frees the world on its
+  own instead of holding it until somebody notices. This is the server side; the
+  desktop app and the CLI follow.
 - **The size limit per save is yours to set.** Free stays at 1 GB by default and
   Pro at 10 GB, but the number is no longer fixed: there is a pencil next to
   "Per-save size" on the account screen, and it opens a slider that goes from

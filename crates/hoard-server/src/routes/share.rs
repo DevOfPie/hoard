@@ -27,12 +27,10 @@ use crate::auth::AuthUser;
 use crate::namespace::{self, Namespace};
 use crate::routes::access::{save_access, Role, SaveAccess};
 use crate::routes::health::ServerState;
+use crate::routes::leases::LEASE_TTL_SECS;
 use crate::routes::snapshots::{err, internal, internal_logged};
 
 type ApiError = (StatusCode, Json<serde_json::Value>);
-
-/// Seconds a lease stays live after its last renewal (HRD-D-0003).
-const LEASE_TTL_SECS: i64 = 300;
 
 fn conflict(code: &str, msg: &str) -> ApiError {
     (

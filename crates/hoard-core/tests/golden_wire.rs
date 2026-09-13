@@ -19,8 +19,9 @@
 use std::path::PathBuf;
 
 use hoard_core::wire::{
-    CreateSaveRequest, Game, Group, Health, InviteOut, LogBatch, LogIngestResponse,
-    MaxVersionsBody, MaxVersionsResponse, Save, Snapshot, SnapshotDetail, Whoami,
+    CreateSaveRequest, Game, Group, Health, InviteOut, Lease, LeaseEvent, LogBatch,
+    LogIngestResponse, MaxVersionsBody, MaxVersionsResponse, Save, Snapshot, SnapshotDetail,
+    Whoami,
 };
 use serde::{de::DeserializeOwned, Serialize};
 
@@ -67,6 +68,7 @@ fn health_round_trips() {
         "absent means the server only understands the multipart"
     );
     assert!(!h.devices, "ausente → no lleva censo, no le mandes latidos");
+    assert!(!h.groups, "absent means no groups, no leases");
 }
 
 /// A 1.1.3 server's `/v1/health`. The flags have to survive the round-trip **and**
@@ -132,6 +134,25 @@ fn group_round_trips() {
 #[test]
 fn invite_round_trips() {
     round_trip::<InviteOut>("invite");
+}
+
+/// The lease as first emitted, and the `event: lease` frame beside it. A lease
+/// with no `holder_device_fp` drops the key rather than writing `null`.
+#[test]
+fn lease_round_trips() {
+    round_trip::<Lease>("lease");
+    let l: Lease = parses("lease");
+    assert_eq!(l.base_version, 12);
+    assert!(l.pushed_since && l.live);
+    assert_eq!(l.holder_username.as_str(), "player-two");
+}
+
+#[test]
+fn lease_event_round_trips() {
+    round_trip::<LeaseEvent>("lease_event");
+    let e: LeaseEvent = parses("lease_event");
+    assert!(e.live && !e.pushed_since);
+    assert!(e.holder_user_id.is_some());
 }
 
 #[test]

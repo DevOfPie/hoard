@@ -268,6 +268,11 @@ pub async fn init(
         .fetch_one(&state.pool)
         .await
         .map_err(|e| internal_logged("reading the save's latest version", e))?;
+    // A shared save is pushed by its host alone, the owner included. Before
+    // the superset exception below, which it must not be able to bypass.
+    if let Namespace::Group(_) = ns {
+        crate::routes::leases::require_host(&state.pool, &save_id, &user_id).await?;
+    }
     if let Some(base) = body.base_version {
         // A base that does not match the head is rejected so a push cannot bury
         // a version it never saw. But a manifest that brings that version
@@ -895,7 +900,15 @@ pub async fn commit(
             internal_logged("reading the save's latest version", e)
         })?;
     // The init already looked, but minutes can pass between init and commit and
-    // another machine may have pushed. This is the check that counts.
+    // another machine may have pushed, or the lease may have moved. These are
+    // the checks that count.
+    if let Namespace::Group(_) = ns {
+        if let Err(e) = crate::routes::leases::require_host(&mut *tx, &save_id, &user_id).await {
+            rollback(&placed);
+            cleanup_staging();
+            return Err(e);
+        }
+    }
     if let Some(base) = body.base_version {
         if base != head {
             rollback(&placed);
@@ -1023,6 +1036,15 @@ pub async fn commit(
         cleanup_staging();
         fail(e, "updating storage accounting")
     })?;
+    if let Namespace::Group(_) = ns {
+        crate::routes::leases::mark_pushed(&mut *tx, &save_id, &user_id)
+            .await
+            .map_err(|e| {
+                rollback(&placed);
+                cleanup_staging();
+                fail(e, "marking the lease pushed")
+            })?;
+    }
 
     let metadata = serde_json::json!({
         "save_id": save_id,
@@ -1081,13 +1103,24 @@ pub async fn commit(
         });
     }
 
-    state.events.publish(
-        user.user_id,
-        crate::routes::events::SaveEvent {
-            save_id: save_id.clone(),
-            version_num: new_version,
-        },
-    );
+    // The owner and, on a shared save, every member of its group.
+    if let Err(e) = state
+        .events
+        .publish_save(
+            &state.pool,
+            &save_id,
+            crate::routes::events::Frame::Save(crate::routes::events::SaveEvent {
+                save_id: save_id.clone(),
+                version_num: new_version,
+            }),
+        )
+        .await
+    {
+        warn!(error = %e, save_id = %save_id, "save event: recipients not resolved");
+    }
+    if let Namespace::Group(_) = ns {
+        crate::routes::leases::announce_push(&state, &save_id, &user_id).await;
+    }
 
     // What the history row will say. After the commit and never fatal: the
     // version is stored, and a row that fails to get a label is cosmetic.

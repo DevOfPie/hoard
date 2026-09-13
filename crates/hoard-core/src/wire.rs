@@ -102,6 +102,12 @@ pub struct Health {
     /// which should not be sent heartbeats.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub devices: bool,
+    /// This server has groups, shared saves and hosting leases (`/v1/groups`,
+    /// `/v1/saves/{id}/share`, `/v1/saves/{id}/lease`). Same discipline as
+    /// [`Health::cas`]: absent means a server that knows none of it, and the
+    /// client keeps every save private.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub groups: bool,
 }
 
 // ---- GET /v1/auth/whoami and PUT /v1/me/max-versions
@@ -330,6 +336,60 @@ pub struct JoinGroupRequest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ShareSaveRequest {
     pub group_id: String,
+}
+
+// ---- /v1/saves/{id}/lease
+
+/// Who is hosting a shared save. `live` is computed on read: a lease is live
+/// while it is unreleased and `renewed_at` is within the server's TTL, so a
+/// host whose machine died drops out on its own.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Lease {
+    pub save_id: String,
+    pub holder_user_id: String,
+    pub holder_username: Username,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub holder_device_fp: Option<String>,
+    #[serde(with = "ts")]
+    pub acquired_at: OffsetDateTime,
+    #[serde(with = "ts")]
+    pub renewed_at: OffsetDateTime,
+    /// The save's head when the holder took the lease.
+    pub base_version: i64,
+    /// The holder has pushed a version since acquiring. A lease with this set
+    /// cannot be forced: the play it covers already reached the server.
+    #[serde(default)]
+    pub pushed_since: bool,
+    #[serde(default)]
+    pub live: bool,
+}
+
+/// `GET /v1/saves/{id}/lease`. `lease` is absent when nobody is hosting.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct LeaseOut {
+    #[serde(default)]
+    pub lease: Option<Lease>,
+}
+
+/// Body of `POST /v1/saves/{id}/lease/acquire`: the head the caller has. The
+/// server refuses (`409 stale`) when the save moved past it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LeaseAcquireRequest {
+    pub base_version: i64,
+}
+
+/// `event: lease` on `/v1/events`: the lease of `save_id` changed hands, was
+/// released, expired or covered a push. `holder_user_id` is absent when the
+/// save has no live holder.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LeaseEvent {
+    pub save_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub holder_user_id: Option<String>,
+    #[serde(default)]
+    pub live: bool,
+    #[serde(default)]
+    pub pushed_since: bool,
 }
 
 // ---- /v1/saves/{id}/snapshots
@@ -914,6 +974,7 @@ mod tests {
         assert!(!old.blob_zstd, "silence means the server cannot take zstd");
         assert!(!old.cas);
         assert!(!old.devices);
+        assert!(!old.groups);
 
         let new: Health = serde_json::from_str(
             r#"{"status":"ok","version":"1.1.7","mode":"cloud","log_min_level":"warn","blob_zstd":true}"#,

@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "UPDATE save_leases SET released_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')\n         WHERE save_id = ? AND holder_user_id = ? AND released_at IS NULL",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 2
+    },
+    "nullable": []
+  },
+  "hash": "227463962ac1b70eb70eb24951ef803a557f755ed1c97d04ccb7b9d3abfe6bfa"
+}

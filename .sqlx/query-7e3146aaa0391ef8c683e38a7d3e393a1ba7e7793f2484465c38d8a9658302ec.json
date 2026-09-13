@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "UPDATE save_leases SET pushed_since = 1 WHERE save_id = ? AND holder_user_id = ?",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 2
+    },
+    "nullable": []
+  },
+  "hash": "7e3146aaa0391ef8c683e38a7d3e393a1ba7e7793f2484465c38d8a9658302ec"
+}

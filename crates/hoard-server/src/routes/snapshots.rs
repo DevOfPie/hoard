@@ -658,6 +658,15 @@ pub async fn create(
             internal_logged("reading the save's latest version", e)
         })?;
 
+    // A shared save is pushed by its host alone, the owner included.
+    if let Namespace::Group(_) = ns {
+        if let Err(e) = crate::routes::leases::require_host(&mut *tx, &save_id, &user_id).await {
+            rollback_blobs(&created_blobs);
+            cleanup_tmp();
+            return Err(e);
+        }
+    }
+
     // Fast-forward check (the DAG's enforcement). A client that declares a
     // base version which is no longer the head has diverged: another device
     // pushed since it last synced. Reject so the client can pull + merge
@@ -800,6 +809,15 @@ pub async fn create(
             cleanup_tmp();
             internal_logged("updating storage accounting", e)
         })?;
+    if let Namespace::Group(_) = ns {
+        crate::routes::leases::mark_pushed(&mut *tx, &save_id, &user_id)
+            .await
+            .map_err(|e| {
+                rollback_blobs(&created_blobs);
+                cleanup_tmp();
+                internal_logged("marking the lease pushed", e)
+            })?;
+    }
 
     let audit_id = Uuid::new_v4().to_string();
     let metadata = serde_json::json!({
@@ -859,17 +877,27 @@ pub async fn create(
         });
     }
 
-    // Push the new version to any of this user's other devices listening on
-    // `/v1/events`, so they pull within ~1s instead of waiting for the agent's
-    // reconciliation sweep. No-op when nobody is connected (incl. cloud, which
-    // never has subscribers here).
-    state.events.publish(
-        user.user_id,
-        crate::routes::events::SaveEvent {
-            save_id: save_id.clone(),
-            version_num: new_version,
-        },
-    );
+    // Push the new version to the owner's other devices and, on a shared save,
+    // to every member listening on `/v1/events`, so they pull within ~1s
+    // instead of waiting for the agent's reconciliation sweep. No-op when
+    // nobody is connected (incl. cloud, which never has subscribers here).
+    if let Err(e) = state
+        .events
+        .publish_save(
+            &state.pool,
+            &save_id,
+            crate::routes::events::Frame::Save(crate::routes::events::SaveEvent {
+                save_id: save_id.clone(),
+                version_num: new_version,
+            }),
+        )
+        .await
+    {
+        warn!(error = %e, save_id = %save_id, "save event: recipients not resolved");
+    }
+    if let Namespace::Group(_) = ns {
+        crate::routes::leases::announce_push(&state, &save_id, &user_id).await;
+    }
 
     // What the history row will say. After the commit and never fatal.
     let insight = match crate::insight::record_selfhosted(&state.pool, &save_id, new_version).await
