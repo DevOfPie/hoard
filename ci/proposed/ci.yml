@@ -1,0 +1,279 @@
+name: CI
+
+on:
+  # Full CI runs only on a version tag (the release gate) and on demand, never
+  # on routine branch pushes, so editing a single .md no longer spends Actions
+  # minutes. Validate locally before pushing with `cargo check --workspace` +
+  # `pnpm --dir crates/hoard-desktop/ui check` (see CLAUDE.md). PRs still get
+  # checked if you ever open one.
+  push:
+    tags:
+      - "v*.*.*"
+  # ready_for_review is here so taking a PR out of draft runs the jobs a draft
+  # skips (see build-test and sqlx-check) without needing another push.
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+  workflow_dispatch:
+
+# A newer push to the same PR cancels the run of the older one; on a tag or a
+# manual run every ref is its own group and nothing is cancelled.
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+  SQLX_OFFLINE: "true"
+
+jobs:
+  fmt:
+    name: cargo fmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          toolchain: stable
+          components: rustfmt
+      - run: cargo fmt --all -- --check
+
+  trailers:
+    name: no AI co-author trailers
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+      - name: Check commit messages
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          if git log --format='%B' "$BASE_SHA..$HEAD_SHA" \
+            | grep -inE '^co-authored-by:.*(cursor|copilot|claude|anthropic|openai|chatgpt|codex|devin|windsurf|aider|\[bot\])'; then
+            echo
+            echo "The commits above credit an AI tool as co-author."
+            echo "Please drop those trailers and force-push, e.g.:"
+            echo "  git rebase -i $BASE_SHA   # reword, delete the Co-authored-by lines"
+            echo "Your editor can usually stop adding them (Cursor: settings, search \"co-author\")."
+            exit 1
+          fi
+
+  clippy:
+    name: cargo clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install pnpm
+        uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6.0.10
+        with:
+          version: 9
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "24"
+          cache: pnpm
+          cache-dependency-path: crates/hoard-desktop/ui/pnpm-lock.yaml
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          toolchain: stable
+          components: clippy
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - name: System deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libssl-dev pkg-config \
+            libwebkit2gtk-4.1-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            patchelf \
+            libglib2.0-dev
+      # The desktop crate's `tauri::generate_context!()` proc-macro validates
+      # `frontendDist` ("./ui/dist") at compile time, so the frontend must be
+      # built before any cargo invocation that touches hoard-desktop.
+      - name: Install frontend deps
+        run: pnpm --dir crates/hoard-desktop/ui install --frozen-lockfile
+      - name: Build frontend
+        run: pnpm --dir crates/hoard-desktop/ui build
+      # hoard-desktop's tauri build script requires every `externalBin` to
+      # exist: the overlay (hoard-screen), the sync service (hoardd) and the
+      # terminal face (hoard). Lint/test jobs don't bundle or run them, so
+      # zero-byte placeholders satisfy the existence check; the release workflow
+      # builds the real ones.
+      - name: Placeholder sidecars (externalBin)
+        run: |
+          triple="$(rustc -Vv | sed -n 's/^host: //p')"
+          touch "crates/hoard-desktop/hoard-screen-$triple"
+          touch "crates/hoard-desktop/hoardd-$triple"
+          touch "crates/hoard-desktop/hoard-$triple"
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: svelte-check
+        run: pnpm --dir crates/hoard-desktop/ui check
+      - name: i18n locales parity
+        run: node scripts/check-i18n.mjs
+
+  # Compile + test across the host platforms we ship builds for. Ubuntu carries
+  # the full system deps for Tauri; Windows / macOS need only the Rust toolchain
+  # because the desktop crate is *not* built there in CI (the release workflow
+  # handles that). We still build the workspace minus hoard-desktop to validate
+  # the agent / server / CLI on all platforms.
+  #
+  # ARM Linux is here because we now publish ARM Linux bundles. Without it the
+  # first thing to compile an aarch64 build would be the release workflow, on a
+  # tag, with nothing left to fix it before the assets go out.
+  #
+  # This fork pushes to pull requests many times a day, so a PR runs the matrix
+  # on ubuntu only and only once it is out of draft; the release gate on a tag,
+  # and a manual run, still cover every platform, Windows first among them
+  # because that is where the fork's builds are actually played.
+  build-test:
+    name: build + test (${{ matrix.os }})
+    if: github.event_name != 'pull_request' || !github.event.pull_request.draft
+    strategy:
+      fail-fast: false
+      matrix:
+        os: ${{ fromJSON(github.event_name == 'pull_request' && '["ubuntu-latest"]' || '["ubuntu-latest", "ubuntu-24.04-arm", "windows-latest", "macos-14"]') }}
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install pnpm
+        if: runner.os == 'Linux'
+        uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6.0.10
+        with:
+          version: 9
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        if: runner.os == 'Linux'
+        with:
+          node-version: "24"
+          cache: pnpm
+          cache-dependency-path: crates/hoard-desktop/ui/pnpm-lock.yaml
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - name: System deps
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libssl-dev pkg-config \
+            libwebkit2gtk-4.1-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            patchelf \
+            libglib2.0-dev
+      - name: Install frontend deps
+        if: runner.os == 'Linux'
+        run: pnpm --dir crates/hoard-desktop/ui install --frozen-lockfile
+      - name: Build frontend
+        if: runner.os == 'Linux'
+        run: pnpm --dir crates/hoard-desktop/ui build
+      # See the clippy job: hoard-desktop's build script needs the sidecars to
+      # exist. Only Linux builds the desktop crate here, so only Linux needs them.
+      - name: Placeholder sidecars (externalBin)
+        if: runner.os == 'Linux'
+        run: |
+          triple="$(rustc -Vv | sed -n 's/^host: //p')"
+          touch "crates/hoard-desktop/hoard-screen-$triple"
+          touch "crates/hoard-desktop/hoardd-$triple"
+          touch "crates/hoard-desktop/hoard-$triple"
+      # On Linux the full workspace builds (hoard-desktop included). On Windows
+      # and macOS we skip the desktop crate, it needs the prebuilt frontend
+      # plus host-specific webview shims, which the release pipeline already
+      # exercises. Server / agent / CLI must still compile + pass tests.
+      - name: cargo build (full workspace)
+        if: runner.os == 'Linux'
+        run: cargo build --workspace --verbose
+      - name: cargo test (full workspace)
+        if: runner.os == 'Linux'
+        run: cargo test --workspace --verbose
+      - name: cargo build (no desktop)
+        if: runner.os != 'Linux'
+        run: cargo build --workspace --exclude hoard-desktop --verbose
+      - name: cargo test (no desktop)
+        if: runner.os != 'Linux'
+        run: cargo test --workspace --exclude hoard-desktop --verbose
+
+  # Catches stale .sqlx/ caches before merge, same check `just sqlx-prepare`
+  # would let us run locally with a real database. Uses sqlx-cli's
+  # `--check` mode against the migrations under crates/hoard-server.
+  sqlx-check:
+    name: sqlx offline cache
+    # A second full workspace build; drafts skip it like build-test.
+    if: github.event_name != 'pull_request' || !github.event.pull_request.draft
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install pnpm
+        uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6.0.10
+        with:
+          version: 9
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "24"
+          cache: pnpm
+          cache-dependency-path: crates/hoard-desktop/ui/pnpm-lock.yaml
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      # hoard-desktop is in the workspace and `cargo sqlx prepare --workspace`
+      # invokes the build script for every member crate, including the Tauri
+      # shell. Without these system libs (and the prebuilt frontend that
+      # `generate_context!` validates at compile time) the prepare step fails
+      # before it ever reaches the SQLx macros.
+      - name: System deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libssl-dev pkg-config \
+            libwebkit2gtk-4.1-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            patchelf \
+            libglib2.0-dev
+      - name: Install frontend deps
+        run: pnpm --dir crates/hoard-desktop/ui install --frozen-lockfile
+      - name: Build frontend
+        run: pnpm --dir crates/hoard-desktop/ui build
+      # `cargo sqlx prepare --workspace` runs every member's build script,
+      # including hoard-desktop's, which needs the sidecars to exist.
+      - name: Placeholder sidecars (externalBin)
+        run: |
+          triple="$(rustc -Vv | sed -n 's/^host: //p')"
+          touch "crates/hoard-desktop/hoard-screen-$triple"
+          touch "crates/hoard-desktop/hoardd-$triple"
+          touch "crates/hoard-desktop/hoard-$triple"
+      - name: Install sqlx-cli
+        run: cargo install sqlx-cli --version 0.8.2 --no-default-features --features sqlite,rustls --locked
+      - name: Prepare database
+        run: |
+          mkdir -p /tmp/hoard-data
+          export DATABASE_URL="sqlite:///tmp/hoard-data/hoard.db?mode=rwc"
+          cargo sqlx database create
+          cargo sqlx migrate run --source crates/hoard-server/migrations
+          echo "DATABASE_URL=$DATABASE_URL" >> "$GITHUB_ENV"
+      - name: Verify .sqlx is up to date
+        run: cargo sqlx prepare --workspace --check
+
+  # Supply-chain guard: license allow list + advisory check across the
+  # workspace dep tree. Config lives in deny.toml at the repo root.
+  cargo-deny:
+    name: cargo deny
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
+        with:
+          command: check bans licenses advisories sources
+
+  # Flags unused workspace dependencies that drift in over time. Doesn't run
+  # cargo, just parses the manifests, so it's cheap.
+  cargo-machete:
+    name: cargo machete
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: bnjbvr/cargo-machete@5eaad10acf89fb0c6a31d9b197a2d48ba762d28e # v0.7.0
