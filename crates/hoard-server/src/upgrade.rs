@@ -18,7 +18,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 use tokio::io::AsyncReadExt;
 
-const GH_LATEST: &str = "https://api.github.com/repos/rleeon/hoard/releases/latest";
+const GH_LATEST: &str = "https://api.github.com/repos/DevOfPie/hoard/releases/latest";
 const USER_AGENT: &str = concat!("hoard-server/", env!("CARGO_PKG_VERSION"));
 
 /// minisign public key for Hoard release artifacts. The matching secret
@@ -32,7 +32,7 @@ const USER_AGENT: &str = concat!("hoard-server/", env!("CARGO_PKG_VERSION"));
 /// the repo's `MINISIGN_SECRET_KEY` Actions secret. Rotating this means
 /// re-keying CI *and* shipping a release that embeds the new public key
 /// before old clients can trust signatures made with it.
-const MINISIGN_PUBKEY: &str = "RWSeOL1nHXZI9oa+WOdrc6yVasLPeBurvGWnERo4tN9F+YIQn7ipx3eO";
+const MINISIGN_PUBKEY: &str = "RWTfyG64Bh/EfrZ4aJpIKDjQCy31aZ6e5fAfv5eUe5q/ThKxrJbmRDvn";
 
 #[derive(serde::Deserialize)]
 struct Release {

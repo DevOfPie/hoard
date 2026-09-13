@@ -13,7 +13,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
 
 /// GitHub repo the releases live under (matches `install.sh`'s `REPO`).
-const REPO: &str = "rleeon/hoard";
+const REPO: &str = "DevOfPie/hoard";
 
 /// How long a cached "latest version" answer is trusted before we re-check. Keeps
 /// the status panel instant on repeated `hoard` runs and stays well under
