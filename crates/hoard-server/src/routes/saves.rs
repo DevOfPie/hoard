@@ -435,7 +435,7 @@ impl SaveRow {
 
 /// The save as the caller may see it: theirs, or shared into one of their
 /// groups. A stranger gets `None`, the same as an unknown id.
-async fn fetch_save(
+pub(crate) async fn fetch_save(
     pool: &sqlx::SqlitePool,
     save_id: &str,
     user_id: &str,

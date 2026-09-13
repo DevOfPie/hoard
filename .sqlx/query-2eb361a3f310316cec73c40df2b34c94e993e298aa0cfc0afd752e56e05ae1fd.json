@@ -1,0 +1,26 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT c.chunk_sha256 AS sha, COALESCE(k.size_bytes, 0) AS \"size!: i64\"\n               FROM snapshot_file_chunks c\n               LEFT JOIN chunks k ON k.user_id = ? AND k.sha256 = c.chunk_sha256\n               WHERE c.snapshot_file_id = ?\n               ORDER BY c.ordinal",
+  "describe": {
+    "columns": [
+      {
+        "name": "sha",
+        "ordinal": 0,
+        "type_info": "Text"
+      },
+      {
+        "name": "size!: i64",
+        "ordinal": 1,
+        "type_info": "Null"
+      }
+    ],
+    "parameters": {
+      "Right": 2
+    },
+    "nullable": [
+      false,
+      null
+    ]
+  },
+  "hash": "2eb361a3f310316cec73c40df2b34c94e993e298aa0cfc0afd752e56e05ae1fd"
+}

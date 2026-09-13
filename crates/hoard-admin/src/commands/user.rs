@@ -271,9 +271,16 @@ pub async fn run(cmd: UserCommand, cfg: &Config) -> Result<()> {
             // `data_dir/<user_id>`, a path nothing has written to since the
             // content-addressed store landed, so the command reported success
             // while leaving every byte on disk.
+            //
+            // The groups they own go too, shared saves included: members lose
+            // the owner's data, and the cascade through `groups` would take the
+            // `group_blobs` rows and orphan the objects.
             let store = hoard_server::store::build_store(cfg).await?;
+            let (group_objects, group_bytes) =
+                hoard_server::store::purge_owned_groups(&pool, &store, &user_id).await?;
             let (objects, bytes) =
                 hoard_server::store::purge_user_objects(&pool, &store, &user_id).await?;
+            let (objects, bytes) = (objects + group_objects, bytes + group_bytes);
 
             sqlx::query("DELETE FROM users WHERE id = ?")
                 .bind(&user_id)

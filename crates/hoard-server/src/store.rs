@@ -86,6 +86,24 @@ pub trait BlobStore: Send + Sync {
     /// in RAM. The caller deletes the returned path iff `cleanup` is set.
     async fn local_ref(&self, key: &str, spool_dir: &Path) -> Result<LocalRef>;
 
+    /// Duplicate an object under a second key, for moving a save between
+    /// namespaces. The default spools `from` to a local file and stores it
+    /// again; the local backend hard-links instead. Content-addressed, so a
+    /// `to` that already exists is left alone.
+    async fn copy(&self, from: &str, to: &str) -> Result<()> {
+        let spool = std::env::temp_dir().join(format!("hoard-copy-{}", uuid::Uuid::new_v4()));
+        tokio::fs::create_dir_all(&spool)
+            .await
+            .with_context(|| format!("mkdir {}", spool.display()))?;
+        let r = self.local_ref(from, &spool).await?;
+        let put = self.put_from_file(to, &r.path).await;
+        if r.cleanup {
+            let _ = tokio::fs::remove_file(&r.path).await;
+        }
+        let _ = tokio::fs::remove_dir_all(&spool).await;
+        put
+    }
+
     /// The directory keys resolve under, for the one backend that has one.
     /// `None` everywhere else: a remote bucket has no directories, only keys
     /// that happen to contain slashes. Only for tidying up empty directories
@@ -163,6 +181,25 @@ impl BlobStore for LocalFs {
             path: self.resolve(key),
             cleanup: false,
         })
+    }
+
+    async fn copy(&self, from: &str, to: &str) -> Result<()> {
+        let (src, dst) = (self.resolve(from), self.resolve(to));
+        if let Some(parent) = dst.parent() {
+            tokio::fs::create_dir_all(parent)
+                .await
+                .with_context(|| format!("mkdir {}", parent.display()))?;
+        }
+        // A hard link costs nothing and both names hold the same immutable
+        // bytes; a filesystem that refuses gets a copy.
+        match tokio::fs::hard_link(&src, &dst).await {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
+            Err(_) => tokio::fs::copy(&src, &dst)
+                .await
+                .map(|_| ())
+                .with_context(|| format!("copy {from} to {to}")),
+        }
     }
 
     fn local_root(&self) -> Option<&Path> {
@@ -412,6 +449,83 @@ pub async fn purge_user_objects(
     Ok((removed, bytes))
 }
 
+/// [`purge_user_objects`] for a group: every object in its namespace, driven
+/// off `group_blobs`/`group_chunks`, which the cascade from `users` through
+/// `groups` takes away just as it takes `blobs`. Runs before deleting the user
+/// who owns the group, for the same reason.
+pub async fn purge_group_objects(
+    pool: &sqlx::SqlitePool,
+    store: &Arc<dyn BlobStore>,
+    group_id: &str,
+) -> Result<(u64, i64)> {
+    use crate::namespace::Namespace;
+    use sqlx::Row;
+
+    let ns = Namespace::Group(group_id.to_string());
+    let mut keys: Vec<(String, i64)> = Vec::new();
+    for (table, is_blob) in [("group_blobs", true), ("group_chunks", false)] {
+        let rows = sqlx::query(&format!(
+            "SELECT sha256, size_bytes FROM {table} WHERE group_id = ?"
+        ))
+        .bind(group_id)
+        .fetch_all(pool)
+        .await?;
+        keys.extend(rows.iter().map(|r| {
+            let sha: String = r.get("sha256");
+            let key = if is_blob {
+                ns.blob_key(&sha)
+            } else {
+                ns.chunk_key(&sha)
+            };
+            (key, r.get::<i64, _>("size_bytes"))
+        }));
+    }
+
+    let mut removed = 0u64;
+    let mut bytes = 0i64;
+    for (key, size) in &keys {
+        match store.delete(key).await {
+            Ok(()) => {
+                removed += 1;
+                bytes += size;
+            }
+            Err(e) => tracing::warn!(key, error = %e, "purge: could not delete object"),
+        }
+    }
+
+    if let Some(local) = store.local_root() {
+        for prefix in ["blobs", "chunks"] {
+            let dir = local.join(ns.dir(prefix));
+            if dir.exists() {
+                if let Err(e) = tokio::fs::remove_dir_all(&dir).await {
+                    tracing::warn!(dir = %dir.display(), error = %e, "purge: could not remove directory");
+                }
+            }
+        }
+    }
+
+    Ok((removed, bytes))
+}
+
+/// [`purge_group_objects`] for every group `user_id` owns. Summed counts.
+pub async fn purge_owned_groups(
+    pool: &sqlx::SqlitePool,
+    store: &Arc<dyn BlobStore>,
+    user_id: &str,
+) -> Result<(u64, i64)> {
+    let groups: Vec<String> = sqlx::query_scalar("SELECT id FROM groups WHERE owner_user_id = ?")
+        .bind(user_id)
+        .fetch_all(pool)
+        .await?;
+    let (mut removed, mut bytes) = (0u64, 0i64);
+    for gid in &groups {
+        let (r, b) = purge_group_objects(pool, store, gid).await?;
+        removed += r;
+        bytes += b;
+    }
+    Ok((removed, bytes))
+}
+
 /// Startup guard (self-host): data on disk but an **empty database**.
 ///
 /// The inverse of [`sanity_check`], and the one that really bites. If the
@@ -493,6 +607,29 @@ pub async fn sanity_check(pool: &sqlx::SqlitePool, store: &Arc<dyn BlobStore>) -
                 &r.get::<String, _>("user_id"),
                 &r.get::<String, _>("sha256"),
             )
+        })
+        .collect();
+    }
+
+    // A server whose only content is shared: the group tables, same rule.
+    for (table, is_blob) in [("group_blobs", true), ("group_chunks", false)] {
+        if !keys.is_empty() {
+            break;
+        }
+        keys = sqlx::query(&format!(
+            "SELECT group_id, sha256 FROM {table} WHERE refcount > 0 ORDER BY RANDOM() LIMIT 8"
+        ))
+        .fetch_all(pool)
+        .await?
+        .iter()
+        .map(|r| {
+            let ns = crate::namespace::Namespace::Group(r.get::<String, _>("group_id"));
+            let sha: String = r.get("sha256");
+            if is_blob {
+                ns.blob_key(&sha)
+            } else {
+                ns.chunk_key(&sha)
+            }
         })
         .collect();
     }

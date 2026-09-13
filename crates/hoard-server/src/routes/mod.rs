@@ -24,6 +24,7 @@ pub mod panel;
 pub mod playtime;
 pub mod saves;
 pub mod session;
+pub mod share;
 pub mod snapshots;
 
 use hoard_core::ids::{GameSlug, Repair, SaveId, Username};

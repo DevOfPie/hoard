@@ -1,0 +1,20 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT size_bytes FROM group_blobs WHERE group_id = ? AND sha256 = ?",
+  "describe": {
+    "columns": [
+      {
+        "name": "size_bytes",
+        "ordinal": 0,
+        "type_info": "Integer"
+      }
+    ],
+    "parameters": {
+      "Right": 2
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "214f5dca3deb74dc578669f5af7c807dc04a22515a77dce0ac43af5cf09c8020"
+}

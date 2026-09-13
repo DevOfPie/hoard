@@ -1,0 +1,20 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT refcount FROM chunks WHERE user_id = ? AND sha256 = ?",
+  "describe": {
+    "columns": [
+      {
+        "name": "refcount",
+        "ordinal": 0,
+        "type_info": "Integer"
+      }
+    ],
+    "parameters": {
+      "Right": 2
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "2f774bcd2796bb3ac7a70218df54088cc90edd0b73f31b73c20bd3027bb58b07"
+}

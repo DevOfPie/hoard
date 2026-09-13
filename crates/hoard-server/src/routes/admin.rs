@@ -235,15 +235,23 @@ pub async fn overview(
     .await
     .map_err(|e| db_error(e, "admin trash totals"))?;
 
+    // Four tables since the group namespace (0024): what is stored is the sum.
     let (objects, stored_bytes, orphan_objects, orphan_bytes): (i64, i64, i64, i64) =
         sqlx::query_as(
-            "SELECT (SELECT COUNT(*) FROM blobs) + (SELECT COUNT(*) FROM chunks), \
+            "SELECT (SELECT COUNT(*) FROM blobs) + (SELECT COUNT(*) FROM chunks) \
+                  + (SELECT COUNT(*) FROM group_blobs) + (SELECT COUNT(*) FROM group_chunks), \
                     (SELECT COALESCE(SUM(size_bytes),0) FROM blobs) \
-                  + (SELECT COALESCE(SUM(size_bytes),0) FROM chunks), \
+                  + (SELECT COALESCE(SUM(size_bytes),0) FROM chunks) \
+                  + (SELECT COALESCE(SUM(size_bytes),0) FROM group_blobs) \
+                  + (SELECT COALESCE(SUM(size_bytes),0) FROM group_chunks), \
                     (SELECT COUNT(*) FROM blobs WHERE refcount <= 0) \
-                  + (SELECT COUNT(*) FROM chunks WHERE refcount <= 0), \
+                  + (SELECT COUNT(*) FROM chunks WHERE refcount <= 0) \
+                  + (SELECT COUNT(*) FROM group_blobs WHERE refcount <= 0) \
+                  + (SELECT COUNT(*) FROM group_chunks WHERE refcount <= 0), \
                     (SELECT COALESCE(SUM(size_bytes),0) FROM blobs WHERE refcount <= 0) \
-                  + (SELECT COALESCE(SUM(size_bytes),0) FROM chunks WHERE refcount <= 0)",
+                  + (SELECT COALESCE(SUM(size_bytes),0) FROM chunks WHERE refcount <= 0) \
+                  + (SELECT COALESCE(SUM(size_bytes),0) FROM group_blobs WHERE refcount <= 0) \
+                  + (SELECT COALESCE(SUM(size_bytes),0) FROM group_chunks WHERE refcount <= 0)",
         )
         .fetch_one(pool)
         .await
@@ -284,9 +292,14 @@ pub async fn overview(
         .await
         .map_err(|e| db_error(e, "admin per-user saves"))?;
 
+        // A user's footprint includes the groups they own: that is who pays.
         let (stored_bytes,): (i64,) = sqlx::query_as(
             "SELECT (SELECT COALESCE(SUM(size_bytes),0) FROM blobs WHERE user_id = ?1) \
-                  + (SELECT COALESCE(SUM(size_bytes),0) FROM chunks WHERE user_id = ?1)",
+                  + (SELECT COALESCE(SUM(size_bytes),0) FROM chunks WHERE user_id = ?1) \
+                  + (SELECT COALESCE(SUM(gb.size_bytes),0) FROM group_blobs gb \
+                       JOIN groups g ON g.id = gb.group_id WHERE g.owner_user_id = ?1) \
+                  + (SELECT COALESCE(SUM(gc.size_bytes),0) FROM group_chunks gc \
+                       JOIN groups g ON g.id = gc.group_id WHERE g.owner_user_id = ?1)",
         )
         .bind(&id)
         .fetch_one(pool)
@@ -606,13 +619,24 @@ pub async fn delete_user(
         return Err(err(StatusCode::NOT_FOUND, "no_such_user"));
     };
 
-    let (objects_removed, bytes_removed) =
-        crate::store::purge_user_objects(&state.pool, &state.store, &target_id)
+    // The groups this user owns go with them, shared saves included: the
+    // members lose access to the owner's data, and the cascade through `groups`
+    // would otherwise take the `group_blobs` rows and orphan the objects.
+    let (mut objects_removed, mut bytes_removed) =
+        crate::store::purge_owned_groups(&state.pool, &state.store, &target_id)
             .await
             .map_err(|e| {
-                tracing::error!(error = %e, "admin user purge failed");
+                tracing::error!(error = %e, "admin group purge failed");
                 err(StatusCode::INTERNAL_SERVER_ERROR, "internal")
             })?;
+    let (objects, bytes) = crate::store::purge_user_objects(&state.pool, &state.store, &target_id)
+        .await
+        .map_err(|e| {
+            tracing::error!(error = %e, "admin user purge failed");
+            err(StatusCode::INTERNAL_SERVER_ERROR, "internal")
+        })?;
+    objects_removed += objects;
+    bytes_removed += bytes;
 
     sqlx::query("DELETE FROM users WHERE id = ?")
         .bind(&target_id)

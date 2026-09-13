@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "DELETE FROM blobs WHERE user_id = ? AND sha256 = ?",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 2
+    },
+    "nullable": []
+  },
+  "hash": "83ef4e01bc1942d2eac8857ce9dde3721847d7c84dfd13fe990e2eda9734dca2"
+}

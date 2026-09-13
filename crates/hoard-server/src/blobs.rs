@@ -132,12 +132,24 @@ pub async fn backfill_from_folders(pool: &SqlitePool, data_dir: &Path) -> anyhow
     }
 
     // Quota now means: sum of unique blob sizes plus unique chunk sizes
-    // referenced by the user (ADR 0018 axis C, ADR 0019 phase 4). Idempotent,
-    // recomputed from scratch, so re-running never drifts.
+    // referenced by the user (ADR 0018 axis C, ADR 0019 phase 4), plus the
+    // same for every group the user owns (0024). Idempotent, recomputed from
+    // scratch, so re-running never drifts.
     sqlx::query(
         "UPDATE users SET storage_used_bytes =
             (SELECT COALESCE(SUM(size_bytes),0) FROM blobs WHERE blobs.user_id = users.id)
-          + (SELECT COALESCE(SUM(size_bytes),0) FROM chunks WHERE chunks.user_id = users.id)",
+          + (SELECT COALESCE(SUM(size_bytes),0) FROM chunks WHERE chunks.user_id = users.id)
+          + (SELECT COALESCE(SUM(gb.size_bytes),0) FROM group_blobs gb
+               JOIN groups g ON g.id = gb.group_id WHERE g.owner_user_id = users.id)
+          + (SELECT COALESCE(SUM(gc.size_bytes),0) FROM group_chunks gc
+               JOIN groups g ON g.id = gc.group_id WHERE g.owner_user_id = users.id)",
+    )
+    .execute(&mut *tx)
+    .await?;
+    sqlx::query(
+        "UPDATE groups SET storage_used_bytes =
+            (SELECT COALESCE(SUM(size_bytes),0) FROM group_blobs WHERE group_blobs.group_id = groups.id)
+          + (SELECT COALESCE(SUM(size_bytes),0) FROM group_chunks WHERE group_chunks.group_id = groups.id)",
     )
     .execute(&mut *tx)
     .await?;

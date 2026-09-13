@@ -1,0 +1,20 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT refcount FROM group_chunks WHERE group_id = ? AND sha256 = ?",
+  "describe": {
+    "columns": [
+      {
+        "name": "refcount",
+        "ordinal": 0,
+        "type_info": "Integer"
+      }
+    ],
+    "parameters": {
+      "Right": 2
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "c72efacf20355a34066061e0f7890e1e4bab52764203fe835fccc68c8aa3e204"
+}

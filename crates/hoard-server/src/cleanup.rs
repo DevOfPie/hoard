@@ -8,6 +8,7 @@ use std::time::{Duration, SystemTime};
 use time::format_description::well_known::Rfc3339;
 use tracing::{info, warn};
 
+use crate::namespace::{self, Namespace};
 use crate::retention::{plan_prune, RetentionPolicy, SnapshotMeta};
 use crate::store::BlobStore;
 
@@ -278,7 +279,8 @@ struct GcTarget {
 /// Permanently delete snapshots that have outlived the trash window. With the
 /// blob store (ADR 0018, eje C) this is where bytes actually get freed: each
 /// purged snapshot decrements the refcount of every blob it referenced, and a
-/// blob that reaches 0 is GC'd (row + file deleted, owner quota refunded).
+/// blob that reaches 0 is GC'd (row + file deleted, the namespace's billing
+/// user refunded: the owner, or the group's owner for a shared save).
 async fn purge_trash(
     pool: &SqlitePool,
     data_dir: &Path,
@@ -288,11 +290,11 @@ async fn purge_trash(
     let cutoff = time::OffsetDateTime::now_utc() - time::Duration::days(retention_days as i64);
     let cutoff_str = cutoff.format(&time::format_description::well_known::Rfc3339)?;
 
-    // Pair each expired snapshot with its owner so we can credit the right user.
+    // Pair each expired snapshot with its save, whose namespace says which
+    // tables hold its references and who gets the refund.
     let rows = sqlx::query(
-        "SELECT s.id AS id, sv.user_id AS user_id
-         FROM snapshots s JOIN saves sv ON sv.id = s.save_id
-         WHERE s.deleted_at IS NOT NULL AND s.deleted_at < ?",
+        "SELECT id, save_id FROM snapshots
+         WHERE deleted_at IS NOT NULL AND deleted_at < ?",
     )
     .bind(&cutoff_str)
     .fetch_all(pool)
@@ -301,7 +303,11 @@ async fn purge_trash(
     let mut removed = 0u64;
     for row in &rows {
         let snap_id: String = row.get("id");
-        let user_id: String = row.get("user_id");
+        let save_id: String = row.get("save_id");
+        let Some(ns) = Namespace::for_save(pool, &save_id).await? else {
+            continue;
+        };
+        let billing = ns.billing_user(pool).await?;
 
         // The whole-file shas this snapshot referenced (one row per file, dups
         // included so the refcount decrement matches the increment from
@@ -336,36 +342,14 @@ async fn purge_trash(
         let mut gc_paths: Vec<GcTarget> = Vec::new();
 
         for sha in &shas {
-            sqlx::query(
-                "UPDATE blobs SET refcount = refcount - 1 WHERE user_id = ? AND sha256 = ?",
-            )
-            .bind(&user_id)
-            .bind(sha)
-            .execute(&mut *tx)
-            .await?;
-
-            let remaining = sqlx::query(
-                "SELECT refcount, size_bytes FROM blobs WHERE user_id = ? AND sha256 = ?",
-            )
-            .bind(&user_id)
-            .bind(sha)
-            .fetch_optional(&mut *tx)
-            .await?;
-
-            if let Some(r) = remaining {
-                let rc: i64 = r.get("refcount");
+            if let Some((rc, size)) = namespace::blob_decref(&mut tx, &ns, sha, 1).await? {
                 if rc <= 0 {
-                    let size: i64 = r.get("size_bytes");
-                    sqlx::query("DELETE FROM blobs WHERE user_id = ? AND sha256 = ?")
-                        .bind(&user_id)
-                        .bind(sha)
-                        .execute(&mut *tx)
-                        .await?;
+                    namespace::blob_delete_row(&mut tx, &ns, sha).await?;
                     freed_bytes += size;
                     gc_paths.push(GcTarget {
                         is_chunk: false,
                         sha: sha.clone(),
-                        key: crate::store::blob_key(&user_id, sha),
+                        key: ns.blob_key(sha),
                     });
                 }
             }
@@ -375,36 +359,14 @@ async fn purge_trash(
         // refund the freed bytes. Done in the same tx as the blob pass so a
         // crash can't leave a chunk refcounted but unreferenced.
         for sha in &chunk_shas {
-            sqlx::query(
-                "UPDATE chunks SET refcount = refcount - 1 WHERE user_id = ? AND sha256 = ?",
-            )
-            .bind(&user_id)
-            .bind(sha)
-            .execute(&mut *tx)
-            .await?;
-
-            let remaining = sqlx::query(
-                "SELECT refcount, size_bytes FROM chunks WHERE user_id = ? AND sha256 = ?",
-            )
-            .bind(&user_id)
-            .bind(sha)
-            .fetch_optional(&mut *tx)
-            .await?;
-
-            if let Some(r) = remaining {
-                let rc: i64 = r.get("refcount");
+            if let Some((rc, size)) = namespace::chunk_decref(&mut tx, &ns, sha, 1).await? {
                 if rc <= 0 {
-                    let size: i64 = r.get("size_bytes");
-                    sqlx::query("DELETE FROM chunks WHERE user_id = ? AND sha256 = ?")
-                        .bind(&user_id)
-                        .bind(sha)
-                        .execute(&mut *tx)
-                        .await?;
+                    namespace::chunk_delete_row(&mut tx, &ns, sha).await?;
                     freed_bytes += size;
                     gc_paths.push(GcTarget {
                         is_chunk: true,
                         sha: sha.clone(),
-                        key: crate::store::chunk_key(&user_id, sha),
+                        key: ns.chunk_key(sha),
                     });
                 }
             }
@@ -417,13 +379,7 @@ async fn purge_trash(
             .await?;
 
         if freed_bytes > 0 {
-            sqlx::query(
-                "UPDATE users SET storage_used_bytes = MAX(0, storage_used_bytes - ?) WHERE id = ?",
-            )
-            .bind(freed_bytes)
-            .bind(&user_id)
-            .execute(&mut *tx)
-            .await?;
+            ns.charge(&mut tx, &billing, -freed_bytes).await?;
         }
 
         tx.commit().await?;
@@ -434,15 +390,12 @@ async fn purge_trash(
         // (refcount > 0) and re-writing the object; deleting it here would
         // corrupt that live object. Re-check per target and skip any revived.
         for t in gc_paths {
-            let table = if t.is_chunk { "chunks" } else { "blobs" };
-            let q = format!("SELECT refcount FROM {table} WHERE user_id = ? AND sha256 = ?");
-            let revived = sqlx::query(&q)
-                .bind(&user_id)
-                .bind(&t.sha)
-                .fetch_optional(pool)
-                .await?
-                .map(|r| r.get::<i64, _>("refcount") > 0)
-                .unwrap_or(false);
+            let revived = if t.is_chunk {
+                namespace::chunk_refcount(pool, &ns, &t.sha).await?
+            } else {
+                namespace::blob_refcount(pool, &ns, &t.sha).await?
+            }
+            .is_some_and(|rc| rc > 0);
             if revived {
                 continue;
             }

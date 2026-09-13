@@ -1,0 +1,20 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT COUNT(*) AS \"n: i64\" FROM save_leases\n           WHERE save_id = ? AND released_at IS NULL\n             AND renewed_at > strftime('%Y-%m-%dT%H:%M:%SZ', 'now', ? || ' seconds')",
+  "describe": {
+    "columns": [
+      {
+        "name": "n: i64",
+        "ordinal": 0,
+        "type_info": "Integer"
+      }
+    ],
+    "parameters": {
+      "Right": 2
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "92dbc9a05efa8a6a611b05e575ae22550c97ae8a0d05e3594c95d10bbf7a1fb9"
+}

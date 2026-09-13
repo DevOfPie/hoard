@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "DELETE FROM group_chunks WHERE group_id = ? AND sha256 = ?",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 2
+    },
+    "nullable": []
+  },
+  "hash": "69d28b4c9bb06bd84802417ddb53b0961786084c7b6cee775ffc955a323c4cc5"
+}

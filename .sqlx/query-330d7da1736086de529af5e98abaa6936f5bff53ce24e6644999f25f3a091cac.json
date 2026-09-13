@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "INSERT INTO group_chunks (group_id, sha256, size_bytes, refcount) VALUES (?,?,?,?)\n                 ON CONFLICT(group_id, sha256) DO UPDATE SET refcount = refcount + excluded.refcount",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 4
+    },
+    "nullable": []
+  },
+  "hash": "330d7da1736086de529af5e98abaa6936f5bff53ce24e6644999f25f3a091cac"
+}

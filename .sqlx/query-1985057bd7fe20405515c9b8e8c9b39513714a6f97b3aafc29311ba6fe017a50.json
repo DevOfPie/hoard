@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "UPDATE group_blobs SET refcount = refcount - ? WHERE group_id = ? AND sha256 = ?",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 3
+    },
+    "nullable": []
+  },
+  "hash": "1985057bd7fe20405515c9b8e8c9b39513714a6f97b3aafc29311ba6fe017a50"
+}

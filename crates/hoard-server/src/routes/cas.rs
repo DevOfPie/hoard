@@ -74,10 +74,12 @@ use tracing::{info, warn};
 use uuid::Uuid;
 
 use crate::auth::AuthUser;
+use crate::namespace::{self, Namespace};
+use crate::routes::access::save_access;
 use crate::routes::health::ServerState;
 use crate::routes::snapshots::{
     blob_in_db, chunk_in_db, err, internal, internal_logged, is_safe_relative_path,
-    ownership_check, prune_over_version_cap, snapshot_too_large, snapshot_too_large_declared,
+    prune_over_version_cap, snapshot_too_large, snapshot_too_large_declared,
 };
 
 type ApiError = (StatusCode, Json<serde_json::Value>);
@@ -105,41 +107,50 @@ impl Stored {
     }
 }
 
-/// Does the server already have this sha's bytes for this user, and in what shape?
+/// Does the server already have this sha's bytes in this namespace, and in what
+/// shape?
 ///
-/// It asks `blobs` first (the normal case) and, failing that, looks for one of the
-/// user's `snapshot_files` with that sha and chunks. Trashed snapshots are
-/// deliberately included: a deleted snapshot still pins its bytes against the
+/// It asks the blob table first (the normal case) and, failing that, looks for one
+/// of the namespace's `snapshot_files` with that sha and chunks. Trashed snapshots
+/// are deliberately included: a deleted snapshot still pins its bytes against the
 /// quota until the purge frees them, so its content is available and referencing
 /// it is correct.
 async fn stored_representation(
     pool: &sqlx::SqlitePool,
-    user_id: &str,
+    ns: &Namespace,
     sha: &str,
 ) -> Result<Option<Stored>, sqlx::Error> {
-    if let Some(size) =
-        sqlx::query_scalar::<_, i64>("SELECT size_bytes FROM blobs WHERE user_id=? AND sha256=?")
-            .bind(user_id)
-            .bind(sha)
-            .fetch_optional(pool)
-            .await?
-    {
+    if let Some(size) = namespace::blob_size(pool, ns, sha).await? {
         return Ok(Some(Stored::Blob { size_bytes: size }));
     }
 
-    let row = sqlx::query(
-        "SELECT sf.id AS id, sf.size_bytes AS size_bytes
-           FROM snapshot_files sf
-           JOIN snapshots s ON s.id = sf.snapshot_id
-           JOIN saves sv ON sv.id = s.save_id
-          WHERE sv.user_id = ? AND sf.sha256 = ?
-            AND EXISTS (SELECT 1 FROM snapshot_file_chunks c WHERE c.snapshot_file_id = sf.id)
-          LIMIT 1",
-    )
-    .bind(user_id)
-    .bind(sha)
-    .fetch_optional(pool)
-    .await?;
+    let (sql, scope) = match ns {
+        Namespace::User(id) => (
+            "SELECT sf.id AS id, sf.size_bytes AS size_bytes
+               FROM snapshot_files sf
+               JOIN snapshots s ON s.id = sf.snapshot_id
+               JOIN saves sv ON sv.id = s.save_id
+              WHERE sv.user_id = ? AND sf.sha256 = ?
+                AND EXISTS (SELECT 1 FROM snapshot_file_chunks c WHERE c.snapshot_file_id = sf.id)
+              LIMIT 1",
+            id,
+        ),
+        Namespace::Group(id) => (
+            "SELECT sf.id AS id, sf.size_bytes AS size_bytes
+               FROM snapshot_files sf
+               JOIN snapshots s ON s.id = sf.snapshot_id
+               JOIN shared_saves ss ON ss.save_id = s.save_id
+              WHERE ss.group_id = ? AND sf.sha256 = ?
+                AND EXISTS (SELECT 1 FROM snapshot_file_chunks c WHERE c.snapshot_file_id = sf.id)
+              LIMIT 1",
+            id,
+        ),
+    };
+    let row = sqlx::query(sql)
+        .bind(scope)
+        .bind(sha)
+        .fetch_optional(pool)
+        .await?;
 
     Ok(row.map(|r| Stored::Chunks {
         size_bytes: r.get("size_bytes"),
@@ -219,10 +230,17 @@ pub async fn init(
     Json(body): Json<CasInit>,
 ) -> Result<Json<CasInitOut>, ApiError> {
     let user_id = user.user_id.to_string();
-    ownership_check(&state.pool, &save_id, &user_id)
+    let access = save_access(&state.pool, &save_id, &user_id)
         .await
-        .map_err(|e| internal_logged("ownership lookup", e))?
+        .map_err(|e| internal_logged("access lookup", e))?
         .ok_or_else(|| err(StatusCode::NOT_FOUND, "save not found"))?;
+    // A shared save's bytes live in its group and the group's owner pays,
+    // whoever pushes.
+    let ns = Namespace::of(&access.owner_user_id, access.group_id.as_deref());
+    let billing = ns
+        .billing_user(&state.pool)
+        .await
+        .map_err(|e| internal_logged("billing lookup", e))?;
 
     validate_manifest(&body.files)?;
 
@@ -282,7 +300,7 @@ pub async fn init(
         if !valid_sha256(&sha) {
             return Err(err(StatusCode::BAD_REQUEST, "invalid sha256 in manifest"));
         }
-        if stored_representation(&state.pool, &user_id, &sha)
+        if stored_representation(&state.pool, &ns, &sha)
             .await
             .map_err(|e| internal_logged("blob dedup lookup", e))?
             .is_none()
@@ -305,7 +323,7 @@ pub async fn init(
     // only to have them refused at the end.
     let (quota, used): (i64, i64) =
         sqlx::query_as("SELECT storage_quota_bytes, storage_used_bytes FROM users WHERE id=?")
-            .bind(&user_id)
+            .bind(&billing)
             .fetch_one(&state.pool)
             .await
             .map_err(|e| internal_logged("quota lookup", e))?;
@@ -630,10 +648,15 @@ pub async fn commit(
     Json(body): Json<CasCommit>,
 ) -> Result<(StatusCode, Json<Snapshot>), ApiError> {
     let user_id = user.user_id.to_string();
-    ownership_check(&state.pool, &save_id, &user_id)
+    let access = save_access(&state.pool, &save_id, &user_id)
         .await
-        .map_err(|e| internal_logged("ownership lookup", e))?
+        .map_err(|e| internal_logged("access lookup", e))?
         .ok_or_else(|| err(StatusCode::NOT_FOUND, "save not found"))?;
+    let ns = Namespace::of(&access.owner_user_id, access.group_id.as_deref());
+    let billing = ns
+        .billing_user(&state.pool)
+        .await
+        .map_err(|e| internal_logged("billing lookup", e))?;
     validate_manifest(&body.files)?;
     if !valid_upload_id(&body.upload_id) {
         return Err(err(StatusCode::BAD_REQUEST, "invalid upload id"));
@@ -674,7 +697,7 @@ pub async fn commit(
                 staged.insert(sha, (path, meta.len() as i64));
             }
             Err(_) => {
-                let Some(stored) = stored_representation(&state.pool, &user_id, &sha)
+                let Some(stored) = stored_representation(&state.pool, &ns, &sha)
                     .await
                     .map_err(|e| {
                         cleanup_staging();
@@ -723,7 +746,7 @@ pub async fn commit(
                 if new_chunks.contains(&c.sha256) {
                     continue;
                 }
-                if !chunk_in_db(&state.pool, &user_id, &c.sha256)
+                if !chunk_in_db(&state.pool, &ns, &c.sha256)
                     .await
                     .map_err(|e| {
                         cleanup_staging();
@@ -741,7 +764,7 @@ pub async fn commit(
 
     let (quota, used): (i64, i64) =
         sqlx::query_as("SELECT storage_quota_bytes, storage_used_bytes FROM users WHERE id=?")
-            .bind(&user_id)
+            .bind(&billing)
             .fetch_one(&state.pool)
             .await
             .map_err(|e| {
@@ -784,13 +807,13 @@ pub async fn commit(
     let rollback = {
         let store = store.clone();
         let pool = state.pool.clone();
-        let user_id = user_id.clone();
+        let ns = ns.clone();
         move |done: &[Placed]| {
             let keys: Vec<(String, String, bool)> = done
                 .iter()
                 .map(|p| (p.key.clone(), p.sha.clone(), p.chunk))
                 .collect();
-            let (store, pool, user_id) = (store.clone(), pool.clone(), user_id.clone());
+            let (store, pool, ns) = (store.clone(), pool.clone(), ns.clone());
             tokio::spawn(async move {
                 for (key, sha, is_chunk) in keys {
                     // Only what nothing references gets deleted: between the
@@ -799,9 +822,9 @@ pub async fn commit(
                     // error we assume it is referenced: an orphan costs space, an
                     // over-eager delete costs data.
                     let referenced = if is_chunk {
-                        chunk_in_db(&pool, &user_id, &sha).await.unwrap_or(true)
+                        chunk_in_db(&pool, &ns, &sha).await.unwrap_or(true)
                     } else {
-                        blob_in_db(&pool, &user_id, &sha).await.unwrap_or(true)
+                        blob_in_db(&pool, &ns, &sha).await.unwrap_or(true)
                     };
                     if !referenced {
                         let _ = store.delete(&key).await;
@@ -817,7 +840,7 @@ pub async fn commit(
                 if !new_chunks.contains(&c.sha256) || !placed_chunks.insert(c.sha256.clone()) {
                     continue;
                 }
-                let key = crate::store::chunk_key(&user_id, &c.sha256);
+                let key = ns.chunk_key(&c.sha256);
                 let stage = dir.join("_stage").join(&c.sha256);
                 if let Some(parent) = stage.parent() {
                     let _ = tokio::fs::create_dir_all(parent).await;
@@ -840,7 +863,7 @@ pub async fn commit(
             }
             continue;
         }
-        let key = crate::store::blob_key(&user_id, sha);
+        let key = ns.blob_key(sha);
         if store.put_from_file(&key, path).await.is_err() {
             warn!(sha = %sha, "cas: blob placement failed");
             rollback(&placed);
@@ -937,45 +960,25 @@ pub async fn commit(
                 .map(|c| (c.sha256.clone(), c.len as i64))
                 .collect()
         } else if let Some(Stored::Chunks { file_id: src, .. }) = reused.get(sha) {
-            sqlx::query(
-                "SELECT c.chunk_sha256 AS sha, COALESCE(k.size_bytes, 0) AS size
-                   FROM snapshot_file_chunks c
-                   LEFT JOIN chunks k ON k.user_id = ? AND k.sha256 = c.chunk_sha256
-                  WHERE c.snapshot_file_id = ?
-                  ORDER BY c.ordinal",
-            )
-            .bind(&user_id)
-            .bind(src)
-            .fetch_all(&mut *tx)
-            .await
-            .map_err(|e| {
-                rollback(&placed);
-                cleanup_staging();
-                fail(e, "copying a chunk list")
-            })?
-            .into_iter()
-            .map(|r| (r.get::<String, _>("sha"), r.get::<i64, _>("size")))
-            .collect()
+            namespace::chunk_list(&mut *tx, &ns, src)
+                .await
+                .map_err(|e| {
+                    rollback(&placed);
+                    cleanup_staging();
+                    fail(e, "copying a chunk list")
+                })?
         } else {
             Vec::new()
         };
 
         if chunks.is_empty() {
-            sqlx::query(
-                "INSERT INTO blobs (user_id, sha256, size_bytes, refcount)
-                 VALUES (?,?,?,1)
-                 ON CONFLICT(user_id, sha256) DO UPDATE SET refcount = refcount + 1",
-            )
-            .bind(&user_id)
-            .bind(sha)
-            .bind(size)
-            .execute(&mut *tx)
-            .await
-            .map_err(|e| {
-                rollback(&placed);
-                cleanup_staging();
-                fail(e, "reference-counting a blob")
-            })?;
+            namespace::blob_incref(&mut tx, &ns, sha, size, 1)
+                .await
+                .map_err(|e| {
+                    rollback(&placed);
+                    cleanup_staging();
+                    fail(e, "reference-counting a blob")
+                })?;
             continue;
         }
 
@@ -994,21 +997,13 @@ pub async fn commit(
                 cleanup_staging();
                 fail(e, "recording a file's chunks")
             })?;
-            sqlx::query(
-                "INSERT INTO chunks (user_id, sha256, size_bytes, refcount)
-                 VALUES (?,?,?,1)
-                 ON CONFLICT(user_id, sha256) DO UPDATE SET refcount = refcount + 1",
-            )
-            .bind(&user_id)
-            .bind(csha)
-            .bind(csize)
-            .execute(&mut *tx)
-            .await
-            .map_err(|e| {
-                rollback(&placed);
-                cleanup_staging();
-                fail(e, "reference-counting a chunk")
-            })?;
+            namespace::chunk_incref(&mut tx, &ns, csha, *csize, 1)
+                .await
+                .map_err(|e| {
+                    rollback(&placed);
+                    cleanup_staging();
+                    fail(e, "reference-counting a chunk")
+                })?;
         }
     }
 
@@ -1023,17 +1018,11 @@ pub async fn commit(
             fail(e, "advancing the save head")
         })?;
 
-    let new_used = used + new_bytes;
-    sqlx::query("UPDATE users SET storage_used_bytes=? WHERE id=?")
-        .bind(new_used)
-        .bind(&user_id)
-        .execute(&mut *tx)
-        .await
-        .map_err(|e| {
-            rollback(&placed);
-            cleanup_staging();
-            fail(e, "updating storage accounting")
-        })?;
+    ns.charge(&mut tx, &billing, new_bytes).await.map_err(|e| {
+        rollback(&placed);
+        cleanup_staging();
+        fail(e, "updating storage accounting")
+    })?;
 
     let metadata = serde_json::json!({
         "save_id": save_id,
@@ -1080,9 +1069,10 @@ pub async fn commit(
         "cas commit"
     );
 
+    // The cap is the save owner's, whoever pushed.
     {
         let pool = state.pool.clone();
-        let uid = user_id.clone();
+        let uid = access.owner_user_id.clone();
         let sid = save_id.clone();
         tokio::spawn(async move {
             if let Err(e) = prune_over_version_cap(&pool, &uid, Some(&sid)).await {
@@ -1251,10 +1241,11 @@ mod tests {
         .await
         .unwrap();
 
-        let got = stored_representation(&pool, "u1", &whole).await.unwrap();
+        let u1 = Namespace::User("u1".into());
+        let got = stored_representation(&pool, &u1, &whole).await.unwrap();
         assert!(matches!(got, Some(Stored::Blob { size_bytes: 100 })));
 
-        let got = stored_representation(&pool, "u1", &chunked).await.unwrap();
+        let got = stored_representation(&pool, &u1, &chunked).await.unwrap();
         match got {
             Some(Stored::Chunks {
                 size_bytes,
@@ -1266,14 +1257,16 @@ mod tests {
             other => panic!("expected chunked, got {other:?}"),
         }
 
-        assert!(stored_representation(&pool, "u1", &absent)
+        assert!(stored_representation(&pool, &u1, &absent)
             .await
             .unwrap()
             .is_none());
         // Dedup does not cross accounts: another user does not see this content.
-        assert!(stored_representation(&pool, "u2", &whole)
-            .await
-            .unwrap()
-            .is_none());
+        assert!(
+            stored_representation(&pool, &Namespace::User("u2".into()), &whole)
+                .await
+                .unwrap()
+                .is_none()
+        );
     }
 }

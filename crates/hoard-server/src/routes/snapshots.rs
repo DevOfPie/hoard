@@ -17,6 +17,7 @@ use tracing::{info, warn};
 use uuid::Uuid;
 
 use crate::auth::AuthUser;
+use crate::namespace::{self, Namespace};
 use crate::routes::access::{save_access, Role};
 use crate::routes::health::ServerState;
 use crate::routes::repair_ts;
@@ -141,39 +142,27 @@ fn too_large_body(
     (StatusCode::PAYLOAD_TOO_LARGE, Json(body))
 }
 
-/// Is this whole-file blob already stored for the user? The `blobs` table is
+/// Is this whole-file blob already stored in the namespace? The blob table is
 /// the source of truth (a row exists iff the object is stored and refcounted),
 /// so dedup and quota consult it instead of a per-key HEAD against the store,
 /// which on the S3 backend would be one network round-trip per file.
 pub(crate) async fn blob_in_db(
     pool: &sqlx::SqlitePool,
-    user_id: &str,
+    ns: &Namespace,
     sha: &str,
 ) -> Result<bool, sqlx::Error> {
-    Ok(
-        sqlx::query_scalar::<_, i64>("SELECT 1 FROM blobs WHERE user_id=? AND sha256=? LIMIT 1")
-            .bind(user_id)
-            .bind(sha)
-            .fetch_optional(pool)
-            .await?
-            .is_some(),
-    )
+    namespace::blob_size(pool, ns, sha)
+        .await
+        .map(|s| s.is_some())
 }
 
 /// Chunk-store analogue of [`blob_in_db`] (ADR 0019 chunk table).
 pub(crate) async fn chunk_in_db(
     pool: &sqlx::SqlitePool,
-    user_id: &str,
+    ns: &Namespace,
     sha: &str,
 ) -> Result<bool, sqlx::Error> {
-    Ok(
-        sqlx::query_scalar::<_, i64>("SELECT 1 FROM chunks WHERE user_id=? AND sha256=? LIMIT 1")
-            .bind(user_id)
-            .bind(sha)
-            .fetch_optional(pool)
-            .await?
-            .is_some(),
-    )
+    namespace::chunk_exists(pool, ns, sha).await
 }
 
 /// Validate that a relative path stays inside its parent directory.
@@ -192,9 +181,9 @@ pub(crate) fn is_safe_relative_path(p: &str) -> bool {
     true
 }
 
-/// `(game_slug, label)` when the caller owns the save, `None` otherwise. The
-/// write paths gate on this; the read paths take [`save_access`] and let a
-/// group member through.
+/// `(game_slug, label)` when the caller owns the save, `None` otherwise. Soft
+/// delete and restore gate on this; reads and pushes take [`save_access`] and
+/// let a group member through.
 pub(crate) async fn ownership_check(
     pool: &sqlx::SqlitePool,
     save_id: &str,
@@ -216,15 +205,23 @@ pub async fn create(
 ) -> Result<(StatusCode, Json<Snapshot>), (StatusCode, Json<serde_json::Value>)> {
     let user_id = user.user_id.to_string();
 
-    let (game_slug, label) = ownership_check(&state.pool, &save_id, &user_id)
+    let access = save_access(&state.pool, &save_id, &user_id)
         .await
-        .map_err(|e| internal_logged("ownership lookup", e))?
+        .map_err(|e| internal_logged("access lookup", e))?
         .ok_or_else(|| err(StatusCode::NOT_FOUND, "save not found"))?;
+    let (game_slug, label) = (access.game_slug.clone(), access.label.clone());
+    // A shared save's bytes live in its group and the group's owner pays,
+    // whoever pushes.
+    let ns = Namespace::of(&access.owner_user_id, access.group_id.as_deref());
+    let billing = ns
+        .billing_user(&state.pool)
+        .await
+        .map_err(|e| internal_logged("billing lookup", e))?;
 
     // Quota check setup
     let (quota, used): (i64, i64) = sqlx::query!(
         "SELECT storage_quota_bytes, storage_used_bytes FROM users WHERE id=?",
-        user_id
+        billing
     )
     .fetch_one(&state.pool)
     .await
@@ -509,7 +506,7 @@ pub async fn create(
         if let Some(plan) = chunk_plans.get(&i) {
             for c in plan {
                 if seen_chunks.insert(c.sha256.clone())
-                    && !chunk_in_db(&state.pool, &user_id, &c.sha256)
+                    && !chunk_in_db(&state.pool, &ns, &c.sha256)
                         .await
                         .map_err(|e| {
                             cleanup_tmp();
@@ -521,7 +518,7 @@ pub async fn create(
                 }
             }
         } else if seen_blobs.insert(sha.clone())
-            && !blob_in_db(&state.pool, &user_id, sha).await.map_err(|e| {
+            && !blob_in_db(&state.pool, &ns, sha).await.map_err(|e| {
                 cleanup_tmp();
                 internal_logged("blob dedup lookup", e)
             })?
@@ -566,13 +563,13 @@ pub async fn create(
     let rollback_blobs = {
         let store = store.clone();
         let pool = state.pool.clone();
-        let user_id = user_id.clone();
+        let ns = ns.clone();
         move |placed: &[Placed]| {
             let keys: Vec<(String, String, bool)> = placed
                 .iter()
                 .map(|p| (p.key.clone(), p.sha.clone(), p.chunk))
                 .collect();
-            let (store, pool, user_id) = (store.clone(), pool.clone(), user_id.clone());
+            let (store, pool, ns) = (store.clone(), pool.clone(), ns.clone());
             tokio::spawn(async move {
                 for (key, sha, is_chunk) in keys {
                     // Only drop bytes nothing references. Between our placement
@@ -582,9 +579,9 @@ pub async fn create(
                     // assume referenced: an orphan costs space, a wrong delete
                     // costs data.
                     let referenced = if is_chunk {
-                        chunk_in_db(&pool, &user_id, &sha).await.unwrap_or(true)
+                        chunk_in_db(&pool, &ns, &sha).await.unwrap_or(true)
                     } else {
-                        blob_in_db(&pool, &user_id, &sha).await.unwrap_or(true)
+                        blob_in_db(&pool, &ns, &sha).await.unwrap_or(true)
                     };
                     if !referenced {
                         let _ = store.delete(&key).await;
@@ -604,7 +601,7 @@ pub async fn create(
                 // We can't rename a byte range, so extract the chunk to a
                 // staging file under tmp/ first, then hand it to the backend
                 // (same-filesystem rename for local, upload for S3).
-                let key = crate::store::chunk_key(&user_id, &c.sha256);
+                let key = ns.chunk_key(&c.sha256);
                 let stage = tmp_root.join("_stage").join(&c.sha256);
                 if crate::chunking::place_chunk(&src, c.offset, c.len, &stage)
                     .await
@@ -629,7 +626,7 @@ pub async fn create(
         if !new_blobs.contains(sha) || !placed_blobs.insert(sha.clone()) {
             continue;
         }
-        let key = crate::store::blob_key(&user_id, sha);
+        let key = ns.blob_key(sha);
         let src = tmp_root.join(rel_path);
         if store.put_from_file(&key, &src).await.is_err() {
             warn!(sha = %sha, "blob placement failed");
@@ -759,17 +756,9 @@ pub async fn create(
                     cleanup_tmp();
                     return Err(internal());
                 }
-                if sqlx::query(
-                    "INSERT INTO chunks (user_id, sha256, size_bytes, refcount)
-                     VALUES (?,?,?,1)
-                     ON CONFLICT(user_id, sha256) DO UPDATE SET refcount = refcount + 1",
-                )
-                .bind(&user_id)
-                .bind(&c.sha256)
-                .bind(csize)
-                .execute(&mut *tx)
-                .await
-                .is_err()
+                if namespace::chunk_incref(&mut tx, &ns, &c.sha256, csize, 1)
+                    .await
+                    .is_err()
                 {
                     rollback_blobs(&created_blobs);
                     cleanup_tmp();
@@ -781,17 +770,9 @@ pub async fn create(
         }
 
         // Reference-count the blob (insert at 1, or bump an existing one).
-        if sqlx::query(
-            "INSERT INTO blobs (user_id, sha256, size_bytes, refcount)
-             VALUES (?,?,?,1)
-             ON CONFLICT(user_id, sha256) DO UPDATE SET refcount = refcount + 1",
-        )
-        .bind(&user_id)
-        .bind(sha)
-        .bind(size)
-        .execute(&mut *tx)
-        .await
-        .is_err()
+        if namespace::blob_incref(&mut tx, &ns, sha, *size, 1)
+            .await
+            .is_err()
         {
             rollback_blobs(&created_blobs);
             cleanup_tmp();
@@ -812,19 +793,13 @@ pub async fn create(
         internal_logged("reading the save's latest version", e)
     })?;
 
-    let new_used = used + newly_stored_bytes;
-    sqlx::query!(
-        "UPDATE users SET storage_used_bytes=? WHERE id=?",
-        new_used,
-        user_id
-    )
-    .execute(&mut *tx)
-    .await
-    .map_err(|e| {
-        rollback_blobs(&created_blobs);
-        cleanup_tmp();
-        internal_logged("updating storage accounting", e)
-    })?;
+    ns.charge(&mut tx, &billing, newly_stored_bytes)
+        .await
+        .map_err(|e| {
+            rollback_blobs(&created_blobs);
+            cleanup_tmp();
+            internal_logged("updating storage accounting", e)
+        })?;
 
     let audit_id = Uuid::new_v4().to_string();
     let metadata = serde_json::json!({
@@ -870,12 +845,12 @@ pub async fn create(
         "snapshot created"
     );
 
-    // Enforce the user's own "max versions per save" cap: trash the oldest
+    // Enforce the save owner's "max versions per save" cap: trash the oldest
     // non-pinned snapshots beyond it. Off the response path: a failed prune
     // must not fail an upload that already committed.
     {
         let pool = state.pool.clone();
-        let uid = user_id.clone();
+        let uid = access.owner_user_id.clone();
         let sid = save_id.clone();
         tokio::spawn(async move {
             if let Err(e) = prune_over_version_cap(&pool, &uid, Some(&sid)).await {
@@ -1128,8 +1103,8 @@ pub async fn download(
     .await
     .map_err(|e| internal_logged("listing snapshot rows", e))?;
 
-    // The bytes live in the owner's namespace, whoever is asking.
-    let uid = access.owner_user_id.clone();
+    // The bytes live in the save's namespace, whoever is asking.
+    let ns = Namespace::of(&access.owner_user_id, access.group_id.as_deref());
 
     // How to source one entry's bytes when building the tar, as storage-backend
     // keys (resolved to readable local paths inside the tar-builder task).
@@ -1155,13 +1130,13 @@ pub async fn download(
         .map_err(|e| internal_logged("listing snapshot rows", e))?;
 
         if chunk_rows.is_empty() {
-            entries.push((rel, DlSource::Blob(crate::store::blob_key(&uid, &sha))));
+            entries.push((rel, DlSource::Blob(ns.blob_key(&sha))));
         } else {
             let keys = chunk_rows
                 .iter()
                 .map(|c| {
                     let csha: String = c.get("chunk_sha256");
-                    crate::store::chunk_key(&uid, &csha)
+                    ns.chunk_key(&csha)
                 })
                 .collect();
             entries.push((

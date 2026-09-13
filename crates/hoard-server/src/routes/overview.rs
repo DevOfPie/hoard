@@ -195,12 +195,17 @@ pub async fn overview(
     .map_err(|e| internal(e, "overview trash"))?;
 
     // Blobs and chunks are two generations of the same idea living side by
-    // side, so the physical footprint is the sum of both. A row with
-    // refcount 0 is an orphan the cleanup sweep hasn't collected yet: it is
-    // still occupying the disk, so it still counts here.
+    // side, so the physical footprint is the sum of both, plus the groups the
+    // user owns and pays for. A row with refcount 0 is an orphan the cleanup
+    // sweep hasn't collected yet: it is still occupying the disk, so it still
+    // counts here.
     let stored_bytes: i64 = sqlx::query_as::<_, (i64,)>(
         "SELECT (SELECT COALESCE(SUM(size_bytes),0) FROM blobs WHERE user_id = ?1) \
-              + (SELECT COALESCE(SUM(size_bytes),0) FROM chunks WHERE user_id = ?1)",
+              + (SELECT COALESCE(SUM(size_bytes),0) FROM chunks WHERE user_id = ?1) \
+              + (SELECT COALESCE(SUM(gb.size_bytes),0) FROM group_blobs gb \
+                   JOIN groups g ON g.id = gb.group_id WHERE g.owner_user_id = ?1) \
+              + (SELECT COALESCE(SUM(gc.size_bytes),0) FROM group_chunks gc \
+                   JOIN groups g ON g.id = gc.group_id WHERE g.owner_user_id = ?1)",
     )
     .bind(&uid)
     .fetch_one(pool)

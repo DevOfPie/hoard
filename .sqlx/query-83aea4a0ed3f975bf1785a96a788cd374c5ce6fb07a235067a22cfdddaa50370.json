@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "DELETE FROM group_blobs WHERE group_id = ? AND sha256 = ?",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 2
+    },
+    "nullable": []
+  },
+  "hash": "83aea4a0ed3f975bf1785a96a788cd374c5ce6fb07a235067a22cfdddaa50370"
+}

@@ -326,6 +326,12 @@ pub struct JoinGroupRequest {
     pub token: String,
 }
 
+/// Body of `POST /v1/saves/{id}/share`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ShareSaveRequest {
+    pub group_id: String,
+}
+
 // ---- /v1/saves/{id}/snapshots
 
 /// Who asked for this version.

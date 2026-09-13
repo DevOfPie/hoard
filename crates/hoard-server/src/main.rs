@@ -19,7 +19,7 @@ use hoard_server::routes::{
     events as event_routes, games as game_routes, groups as group_routes, health,
     logs as log_routes, overview as overview_routes, panel as panel_routes,
     playtime as playtime_routes, saves as save_routes, session as session_routes,
-    snapshots as snap_routes,
+    share as share_routes, snapshots as snap_routes,
 };
 
 #[derive(Parser)]
@@ -313,8 +313,8 @@ async fn run_self_hosted(cfg: Config) -> Result<()> {
             "/v1/saves/:save_id/snapshots/:version/restore",
             post(snap_routes::restore),
         )
-        // Groups and their membership (see `routes::groups`). Sharing a save
-        // into one and the lease on a shared save mount here too, later.
+        // Groups and their membership (see `routes::groups`), and sharing a
+        // save into one (see `routes::share`). The lease mounts here too, later.
         .route(
             "/v1/groups",
             get(group_routes::list).post(group_routes::create),
@@ -328,6 +328,10 @@ async fn run_self_hosted(cfg: Config) -> Result<()> {
         .route(
             "/v1/groups/:id/members/:user",
             axum::routing::delete(group_routes::remove_member),
+        )
+        .route(
+            "/v1/saves/:save_id/share",
+            post(share_routes::share).delete(share_routes::unshare),
         )
         // Content-addressed upload: declare the manifest, upload only the
         // missing blobs, commit (see `routes::cas`). The multipart above stays

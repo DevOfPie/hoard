@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "UPDATE blobs SET refcount = refcount - ? WHERE user_id = ? AND sha256 = ?",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 3
+    },
+    "nullable": []
+  },
+  "hash": "e79f0f85bde5539aa1296803f66b239cb1f1c4cc577c63b52287d0a1a7366924"
+}

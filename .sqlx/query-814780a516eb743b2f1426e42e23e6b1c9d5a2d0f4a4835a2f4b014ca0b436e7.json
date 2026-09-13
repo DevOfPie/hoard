@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "UPDATE chunks SET refcount = refcount - ? WHERE user_id = ? AND sha256 = ?",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 3
+    },
+    "nullable": []
+  },
+  "hash": "814780a516eb743b2f1426e42e23e6b1c9d5a2d0f4a4835a2f4b014ca0b436e7"
+}

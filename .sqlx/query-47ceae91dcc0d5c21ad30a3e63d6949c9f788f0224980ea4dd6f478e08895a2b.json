@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "UPDATE group_chunks SET refcount = refcount - ? WHERE group_id = ? AND sha256 = ?",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 3
+    },
+    "nullable": []
+  },
+  "hash": "47ceae91dcc0d5c21ad30a3e63d6949c9f788f0224980ea4dd6f478e08895a2b"
+}
