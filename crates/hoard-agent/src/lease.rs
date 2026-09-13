@@ -169,6 +169,12 @@ fn refusal(err: &anyhow::Error) -> Option<Option<String>> {
 
 async fn run<A: LeaseApi, S: LeaseSink>(api: A, sink: S, mut rx: mpsc::Receiver<Cmd>) {
     let mut held: HashMap<String, Held> = HashMap::new();
+    // Acquires the server never answered (transport), retried on the tick:
+    // the engine asks once and waits for a verdict, so the retry is ours.
+    let mut wanted: HashMap<String, i64> = HashMap::new();
+    // The base each save was refused as stale with. The engine asks again on
+    // every hold with the same head until a pull moves it; the server is not.
+    let mut stale: HashMap<String, i64> = HashMap::new();
 
     let mut tick = interval(Duration::from_secs(RENEW_SECS));
     tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
@@ -178,7 +184,7 @@ async fn run<A: LeaseApi, S: LeaseSink>(api: A, sink: S, mut rx: mpsc::Receiver<
             cmd = rx.recv() => match cmd {
                 None => break,
                 Some(Cmd::Acquire { save_id, base_version }) => {
-                    acquire(&api, &sink, &mut held, save_id, base_version).await;
+                    acquire(&api, &sink, &mut held, &mut wanted, &mut stale, save_id, base_version).await;
                 }
                 Some(Cmd::Release { save_id }) => {
                     match api.release(save_id.clone()).await {
@@ -222,6 +228,9 @@ async fn run<A: LeaseApi, S: LeaseSink>(api: A, sink: S, mut rx: mpsc::Receiver<
                 }
             },
             _ = tick.tick() => {
+                for (save_id, base) in wanted.clone() {
+                    acquire(&api, &sink, &mut held, &mut wanted, &mut stale, save_id, base).await;
+                }
                 renew_all(&api, &sink, &mut held).await;
             }
         }
@@ -232,11 +241,21 @@ async fn acquire<A: LeaseApi, S: LeaseSink>(
     api: &A,
     sink: &S,
     held: &mut HashMap<String, Held>,
+    wanted: &mut HashMap<String, i64>,
+    stale: &mut HashMap<String, i64>,
     save_id: String,
     base_version: i64,
 ) {
+    if stale.get(&save_id) == Some(&base_version) {
+        // Refused as stale with this very head: asking again returns the same
+        // answer. Nothing is reported, so the engine waits until its head moves.
+        tracing::debug!(save_id = %save_id, base_version, "lease: still behind the head; not asking again");
+        return;
+    }
     match api.acquire(save_id.clone(), base_version).await {
         Ok(lease) => {
+            wanted.remove(&save_id);
+            stale.remove(&save_id);
             held.entry(save_id.clone()).or_insert(Held {
                 since: Instant::now(),
             });
@@ -247,18 +266,28 @@ async fn acquire<A: LeaseApi, S: LeaseSink>(
             Some(ApiError::LeaseHeld(c)) => {
                 let holder = c.holder().map(String::from);
                 tracing::info!(save_id = %save_id, holder = holder.as_deref().unwrap_or("?"), "lease: held by another member");
+                wanted.remove(&save_id);
                 held.remove(&save_id);
                 sink.set_lease(save_id, LeaseObs::Other, holder).await;
             }
             Some(ApiError::LeaseStale(st)) => {
                 // Nobody holds it; this machine is behind. The pull is the
-                // reducer's business, and the next hold asks again.
+                // reducer's business, and it asks again once its head moved.
                 tracing::info!(save_id = %save_id, head = ?st.head(), "lease: refused, pull first");
+                wanted.remove(&save_id);
                 held.remove(&save_id);
+                stale.insert(save_id.clone(), base_version);
                 sink.set_lease(save_id, LeaseObs::Free, None).await;
             }
+            _ if refusal(&e).is_some() => {
+                // A verdict with nothing to hold: not shared, not found, not
+                // ours to ask. The engine's request stands unanswered on purpose.
+                tracing::info!(save_id = %save_id, error = %e, "lease: acquire refused");
+                wanted.remove(&save_id);
+            }
             _ => {
-                tracing::debug!(save_id = %save_id, error = %e, "lease: acquire failed (state kept)");
+                tracing::debug!(save_id = %save_id, error = %e, "lease: acquire failed; retrying on the tick");
+                wanted.insert(save_id, base_version);
             }
         },
     }
@@ -333,6 +362,13 @@ mod tests {
 
     fn transport() -> anyhow::Error {
         anyhow::anyhow!("connection refused")
+    }
+    fn stale(head: i64, base: i64) -> anyhow::Error {
+        ApiError::LeaseStale(crate::api::LeaseStale {
+            head_version: head,
+            base_version: base,
+        })
+        .into()
     }
 
     /// A scripted server: what each call answers, and what it was asked.
@@ -510,20 +546,17 @@ mod tests {
 
         h.acquire("w1", 1);
         settle().await;
-        assert!(sink.0.lock().unwrap().is_empty(), "no verdict, no update");
-
-        h.acquire("w1", 1);
-        settle().await;
-        // One tick per jump: a delayed interval fires once however far the
-        // clock moves.
+        // The failed acquire is the task's to retry on its tick; the engine is
+        // told nothing until there is a verdict. One tick per jump: a delayed
+        // interval fires once however far the clock moves.
         for _ in 0..2 {
             tokio::time::advance(Duration::from_secs(RENEW_SECS + 1)).await;
             settle().await;
         }
         assert_eq!(
-            sink.0.lock().unwrap().len(),
-            1,
-            "a failed renew is not a loss"
+            sink.0.lock().unwrap().as_slice(),
+            &[("w1".to_string(), LeaseObs::Mine, Some("me".to_string()))],
+            "one verdict; a failed renew is not a loss"
         );
         assert!(
             *fake.0.renews.lock().unwrap() >= 2,
@@ -569,5 +602,57 @@ mod tests {
         released.sort();
         assert_eq!(released, vec!["w1".to_string(), "w2".to_string()]);
         assert!(task.await.is_ok(), "the task ends after closing");
+    }
+
+    /// Refused as stale, the task asks the server once per head: the engine
+    /// keeps asking on every hold until its head moves, the server is not.
+    #[tokio::test(start_paused = true)]
+    async fn a_stale_acquire_is_asked_once_per_head() {
+        let fake = Fake::default();
+        fake.0.acquire.lock().unwrap().push(Err(stale(2, 1)));
+        fake.0.acquire.lock().unwrap().push(Ok(lease("me")));
+        let (h, sink, _task) = start(fake.clone());
+        h.acquire("w1", 1);
+        settle().await;
+        assert_eq!(
+            sink.0.lock().unwrap().last(),
+            Some(&("w1".to_string(), LeaseObs::Free, None))
+        );
+        h.acquire("w1", 1);
+        settle().await;
+        assert_eq!(
+            fake.0.acquire.lock().unwrap().len(),
+            1,
+            "not asked again for the same head"
+        );
+        assert_eq!(sink.0.lock().unwrap().len(), 1, "nothing reported either");
+        h.acquire("w1", 2);
+        settle().await;
+        assert_eq!(
+            sink.0.lock().unwrap().last(),
+            Some(&("w1".to_string(), LeaseObs::Mine, Some("me".to_string())))
+        );
+    }
+
+    /// The server never answered: the task keeps the request and asks again on
+    /// its tick, so a stumble at the first push does not silence the session.
+    #[tokio::test(start_paused = true)]
+    async fn an_unanswered_acquire_is_retried_on_the_tick() {
+        let fake = Fake::default();
+        fake.0.acquire.lock().unwrap().push(Err(transport()));
+        fake.0.acquire.lock().unwrap().push(Ok(lease("me")));
+        let (h, sink, _task) = start(fake.clone());
+        h.acquire("w1", 1);
+        settle().await;
+        // The first answer was no verdict; the tick (immediate on a fresh
+        // interval, then every RENEW_SECS) asks again and gets the lease.
+        tokio::time::advance(Duration::from_secs(RENEW_SECS + 1)).await;
+        settle().await;
+        assert!(fake.0.acquire.lock().unwrap().is_empty(), "asked twice");
+        assert_eq!(
+            sink.0.lock().unwrap().as_slice(),
+            &[("w1".to_string(), LeaseObs::Mine, Some("me".to_string()))],
+            "one verdict, no noise for the failed try"
+        );
     }
 }
