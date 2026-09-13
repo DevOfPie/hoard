@@ -33,6 +33,10 @@
    * the engine's state is only re-emitted when it changes. With the `listen()`s
    * perfectly in place, the HUD came up with an empty log, "service down" in red
    * with the service alive, zero saves watched and no backup scheduled.
+   *
+   * The claim prompt (HRD-D-0014) sits above the columns, drawn from the same
+   * snapshot: the engine's pending prompts ride on its status. Escape closes
+   * the HUD and answers nothing; the prompt stays pending in the engine.
    */
   import { onMount } from "svelte";
   import { _ } from "svelte-i18n";
@@ -44,6 +48,7 @@
   import * as api from "../api";
   import type { AgentSlotStatus, TrackedSave } from "../api";
   import { status } from "../stores/agent";
+  import { adoptPrompts } from "../stores/groups";
   import {
     activityFeed,
     adoptCloud,
@@ -53,6 +58,7 @@
   } from "../stores/live";
   import { feedRelativeTime, feedSummary } from "../utils/feedText";
   import { formatBytes } from "../utils/format";
+  import ClaimPanel from "./ClaimPanel.svelte";
   import OverlayDebug from "./OverlayDebug.svelte";
   import { OVERLAY_DEBUG_PANEL, overlayDebug } from "./debug.svelte";
 
@@ -108,6 +114,12 @@
       if (!document.hidden) tick = tick + 1;
     }, 1000);
     return () => clearInterval(id);
+  });
+
+  /** The same clock as a timestamp, for the claim prompt's countdown. */
+  const now = $derived.by(() => {
+    tick;
+    return Date.now();
   });
 
   /**
@@ -238,6 +250,7 @@
       const snap = await api.agentSnapshot();
       status.set(snap.status);
       slots = snap.slots;
+      adoptPrompts(snap.prompts ?? []);
       adoptJournal(snap.rows);
       adoptCloud(snap.cloud, snap.cloud_retry_in);
     } catch (e) {
@@ -389,6 +402,9 @@
     </div>
   </header>
 
+  <!-- The claim prompt, when the engine is asking. -->
+  <ClaimPanel {now} />
+
   <div class="flex min-h-0 flex-1">
     <!-- ── Zona 2 · Registro ──────────────────────────────────────────── -->
     <section class="flex min-h-0 flex-[3] flex-col border-r border-white/[0.08]">
@@ -473,11 +489,31 @@
         {:else}
           <ul class="space-y-2">
             {#each savesSorted as s (s.save_id)}
-              {@const playing = slotOf.get(s.save_id)?.process_running ?? false}
+              {@const slot = slotOf.get(s.save_id)}
+              {@const playing = slot?.process_running ?? false}
               {@const behind = isBehind(s)}
               <li class="rounded-lg border border-white/[0.08] bg-white/[0.03] px-3 py-2">
                 <div class="flex items-baseline justify-between gap-2">
                   <span class="min-w-0 truncate font-medium">{s.game_slug}</span>
+                  <!-- The lease, as the service last heard it, for a shared
+                       save: whose the world is right now. -->
+                  {#if slot?.shared && slot.lease && slot.lease !== "unknown"}
+                    <span
+                      class="ml-auto shrink-0 rounded-full px-1.5 py-px ring-1 ring-inset {slot.lease ===
+                      'mine'
+                        ? 'bg-emerald-500/10 text-emerald-300 ring-emerald-500/30'
+                        : slot.lease === 'other'
+                          ? 'bg-amber-500/10 text-amber-300 ring-amber-500/30'
+                          : 'bg-white/[0.05] text-zinc-400 ring-white/[0.08]'}"
+                      style="font-size: 0.7em;"
+                    >
+                      {slot.lease === "mine"
+                        ? $_("lease.pill_hosting")
+                        : slot.lease === "other"
+                          ? (slot.lease_holder ?? $_("lease.unknown"))
+                          : $_("lease.free")}
+                    </span>
+                  {/if}
                   {#if playing}
                     <span class="shrink-0 text-emerald-300" style="font-size: 0.75em;"
                       >{$_("overlay.save_playing")}</span

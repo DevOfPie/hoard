@@ -494,4 +494,15 @@ pub struct AgentSlotStatus {
     pub last_fs_event_at: Option<OffsetDateTime>,
     #[serde(with = "time::serde::rfc3339::option")]
     pub next_scheduled_backup_at: Option<OffsetDateTime>,
+    /// The save is shared into a group. A surface that only reads the status
+    /// (the desktop's HUD) draws the lease from the two fields below when this
+    /// is set. Defaults keep an older daemon's rows parsing.
+    #[serde(default)]
+    pub shared: bool,
+    /// The lease as the engine last heard it, for a shared save.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lease: Option<WorldLease>,
+    /// Who hosts it, when the lease is somebody else's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lease_holder: Option<String>,
 }

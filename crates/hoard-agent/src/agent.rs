@@ -283,6 +283,7 @@ pub struct WatchedSave {
 /// re-exported here, so `hoard_agent::agent::AgentEvent` is still the right path for
 /// the desktop and the CLI.
 pub use hoard_core::ipc::events::{AgentEvent, AgentSlotStatus, BackupReason, WorldRole};
+use hoard_core::ipc::WorldPrompt;
 
 /// How a spawned auto-restore attempt ended. Drives how the slot's
 /// `next_auto_restore_at` is re-armed and whether the consecutive-failure
@@ -544,6 +545,9 @@ enum AgentCommand {
         save_id: String,
     },
     QueryStatus(oneshot::Sender<Vec<AgentSlotStatus>>),
+    /// The claim prompts still waiting for an answer (`claim::pending_prompts`),
+    /// for the daemon's status.
+    QueryPrompts(oneshot::Sender<Vec<WorldPrompt>>),
     Shutdown,
 }
 
@@ -592,6 +596,15 @@ impl AgentHandle {
     pub async fn status(&self) -> Result<Vec<AgentSlotStatus>> {
         let (resp_tx, resp_rx) = oneshot::channel();
         self.tx.send(AgentCommand::QueryStatus(resp_tx)).await?;
+        Ok(resp_rx.await?)
+    }
+
+    /// The claim prompts nobody has answered yet, one per game. What the
+    /// daemon puts in `EngineStatus::prompts`, so a client that reads instead
+    /// of listening still sees the question.
+    pub async fn prompts(&self) -> Result<Vec<WorldPrompt>> {
+        let (resp_tx, resp_rx) = oneshot::channel();
+        self.tx.send(AgentCommand::QueryPrompts(resp_tx)).await?;
         Ok(resp_rx.await?)
     }
 
@@ -2477,6 +2490,7 @@ async fn run_agent(
                                 role,
                                 auto: false,
                             });
+                            crate::claim::dismiss_siblings(&mut slots, &save_id);
                         }
                     }
                     Some(AgentCommand::ReleaseWorld { save_id }) => {
@@ -2536,6 +2550,7 @@ async fn run_agent(
                                 lease.force(save_id.clone());
                                 lease.acquire(save_id.clone(), slot.known_version.unwrap_or(0));
                             }
+                            crate::claim::dismiss_siblings(&mut slots, &save_id);
                         }
                     }
                     Some(AgentCommand::QueryStatus(resp)) => {
@@ -2549,9 +2564,15 @@ async fn run_agent(
                                 process_running: s.is_running,
                                 last_fs_event_at: s.last_fs_event_at,
                                 next_scheduled_backup_at: s.next_scheduled_backup_at,
+                                shared: s.save.shared,
+                                lease: s.save.shared.then(|| crate::claim::lease_for_prompt(s.lease)),
+                                lease_holder: s.save.shared.then(|| s.lease_holder.clone()).flatten(),
                             })
                             .collect();
                         let _ = resp.send(snapshot);
+                    }
+                    Some(AgentCommand::QueryPrompts(resp)) => {
+                        let _ = resp.send(crate::claim::pending_prompts(&slots, TokioInstant::now()));
                     }
                     Some(AgentCommand::Shutdown) | None => {
                         tracing::info!("agent: shutting down");

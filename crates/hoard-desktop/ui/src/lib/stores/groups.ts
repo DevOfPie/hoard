@@ -1,16 +1,32 @@
 /**
- * The groups this account belongs to, and who hosts each shared world.
+ * The groups this account belongs to, who hosts each shared world, and the
+ * claim prompt.
  *
- * Two small stores fed by the service, on the `devices.ts` model: the page
- * asks once (`refreshGroups`, `refreshLease`) and the `agent://world-*`
- * events keep `leases` current afterwards. Nothing here decides a lease
- * rule; it mirrors what the engine reported so the cards can draw it.
+ * Small stores fed by the service, on the `devices.ts` model: the page asks
+ * once (`refreshGroups`, `refreshLease`) and the `agent://world-*` events
+ * keep `leases` current afterwards. Nothing here decides a lease rule; it
+ * mirrors what the engine reported so the cards can draw it.
+ *
+ * The prompt (`prompts`) is the engine's `EngineStatus.prompts`, mirrored.
+ * Two windows draw it from the same store: the HUD over the game, which
+ * cannot listen (it is born after the event went out) and so adopts it from
+ * the snapshot it polls; and the main window, which hears
+ * `agent://world-claim-wanted` and then reads the same snapshot, because the
+ * event carries the worlds but the status carries the clock. Answering is
+ * sending the verb (`claimWorld`, `dismissWorld`); whether to host is never
+ * computed here.
  */
 import { get, writable, type Readable } from "svelte/store";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
+import { getCurrentWindow } from "@tauri-apps/api/window";
+import { _ } from "svelte-i18n";
 import * as api from "../api";
-import type { AgentEvent, Group } from "../api";
+import type { AgentEvent, Group, WorldPrompt, WorldRole } from "../api";
+import { prettifySlug } from "../utils/format";
+import { isReplaying } from "./agent";
 import { auth } from "./auth";
+import { pushNotification, updateNotification } from "./notifications";
+import { toastInfo } from "./toasts";
 
 /** The lease on one shared save, as last heard. `holder` and `since` only
  *  mean something for `other` (who, since when). */
@@ -75,6 +91,9 @@ export function applyWorldEvent(ev: AgentEvent, at: string = new Date().toISOStr
       // A view role changes nothing about who hosts; the lease is whoever's it
       // was, and `refreshLease` says. Only a host claim is a hold here.
       if (ev.role === "host") patch(ev.save_id, { state: "mine", since: at });
+      // The engine answered for this game (the user, the clock or a write):
+      // the question is closed whichever window asked it.
+      dropPrompt(ev.game_slug);
       break;
     case "world_released":
       patch(ev.save_id, { state: "free" });
@@ -88,18 +107,193 @@ export function applyWorldEvent(ev: AgentEvent, at: string = new Date().toISOStr
       patch(ev.save_id, { state: "unknown" });
       break;
     }
+    case "game_stopped":
+      dropPrompt(ev.game_slug);
+      break;
     default:
       break;
   }
 }
 
+// ── The claim prompt ──────────────────────────────────────────────────────
+
+/** The prompts the engine is still waiting on, as last read. */
+export const prompts = writable<WorldPrompt[]>([]);
+
+/** The main window's dialog is up. Only meaningful there; the HUD draws its
+ *  panel whenever `prompts` has rows. */
+export const claimModalOpen = writable(false);
+
+/** Prompts answered from this window, by game, with the `raised_at` they
+ *  had. A snapshot read between the answer and the engine's next status still
+ *  lists the question; without this the panel would flash back for a poll. A
+ *  re-prompt (the same game started again) has a new `raised_at` and shows. */
+const answered = new Map<string, string>();
+
+/** Adopt what the status says. Both windows come through here: the HUD with
+ *  every snapshot, the main window on `world-claim-wanted`. */
+export function adoptPrompts(list: WorldPrompt[]): void {
+  for (const [game, raised] of answered) {
+    if (!list.some((p) => p.game_slug === game && p.raised_at === raised)) {
+      answered.delete(game);
+    }
+  }
+  prompts.set(list.filter((p) => answered.get(p.game_slug) !== p.raised_at));
+}
+
+function dropPrompt(gameSlug: string): void {
+  prompts.update((list) => {
+    const gone = list.find((p) => p.game_slug === gameSlug);
+    if (!gone) return list;
+    answered.set(gameSlug, gone.raised_at);
+    return list.filter((p) => p !== gone);
+  });
+}
+
+/** Host or view one world of a prompt. The prompt leaves the store at once;
+ *  the engine's status confirms it on the next read. */
+export async function answerPrompt(prompt: WorldPrompt, saveId: string, role: WorldRole): Promise<void> {
+  await api.claimWorld(saveId, role);
+  dropPrompt(prompt.game_slug);
+}
+
+/** "Not playing" for the whole prompt: every world of it is dismissed. */
+export async function declinePrompt(prompt: WorldPrompt): Promise<void> {
+  await Promise.all(prompt.worlds.map((w) => api.dismissWorld(w.save_id)));
+  dropPrompt(prompt.game_slug);
+}
+
+async function mainWindowFocused(): Promise<boolean> {
+  try {
+    return await getCurrentWindow().isFocused();
+  } catch {
+    return false;
+  }
+}
+
+/** The engine asked which world (main window only; the HUD polls). The
+ *  question is shown where the user is: in this window when it is the one in
+ *  front, otherwise in the HUD over the game, which the Rust side raises.
+ *  Never both. A prompt replayed from the journal raises nothing: the status
+ *  says whether it is still open, and the HUD's poll draws that. */
+async function onClaimWanted(ev: AgentEvent): Promise<void> {
+  if (ev.type !== "world_claim_wanted" || isReplaying()) return;
+  // The status carries the clock the event does not; the relay re-reads it
+  // before emitting this event, so the snapshot is current. Should the read
+  // fail, the event's worlds are drawn without a countdown.
+  let list: WorldPrompt[] = [];
+  try {
+    list = (await api.agentSnapshot()).prompts;
+  } catch {
+    /* drawn from the event below */
+  }
+  if (!list.some((p) => p.game_slug === ev.game_slug)) {
+    list = [
+      ...list,
+      {
+        game_slug: ev.game_slug,
+        worlds: ev.worlds,
+        auto_host_at: null,
+        raised_at: new Date().toISOString(),
+      },
+    ];
+  }
+  answered.delete(ev.game_slug);
+  adoptPrompts(list);
+  if (await mainWindowFocused()) {
+    claimModalOpen.set(true);
+  } else {
+    await api.overlayShow().catch((e) => console.warn("couldn't raise the HUD for the claim prompt:", e));
+  }
+}
+
+// ── The bell ──────────────────────────────────────────────────────────────
+
+type InterpolationValue = string | number | boolean | Date | null | undefined;
+function tr(key: string, values?: Record<string, InterpolationValue>): string {
+  return get(_)(key, values ? { values } : undefined);
+}
+
+/** The notification id for a hold on a save, so the side copy's folder can
+ *  be attached to it when it lands. */
+function hostedElsewhereId(saveId: string): string {
+  return `world-hosted-elsewhere-${saveId}`;
+}
+
+/** The bell items and toasts for the world events that need the user. Live
+ *  events only: the relay does not fan the backlog out to these topics, and
+ *  a hold from last night is not news. */
+async function noticeWorldEvent(ev: AgentEvent): Promise<void> {
+  switch (ev.type) {
+    case "world_hosted_elsewhere": {
+      const world = prettifySlug(ev.game_slug);
+      pushNotification({
+        id: hostedElsewhereId(ev.save_id),
+        title: tr("claim.notice_hosted_elsewhere_title", { holder: ev.holder, world }),
+        body: tr("claim.notice_hosted_elsewhere_body"),
+        priority: "normal",
+      });
+      if (await mainWindowFocused()) {
+        toastInfo(tr("claim.toast_hosted_elsewhere", { holder: ev.holder, world }));
+      }
+      break;
+    }
+    case "world_lease_lost": {
+      const world = prettifySlug(ev.game_slug);
+      pushNotification({
+        id: `world-lease-lost-${ev.save_id}-${Date.now()}`,
+        title: tr("claim.notice_lease_lost_title", { world }),
+        body: tr("claim.notice_lease_lost_body"),
+        priority: "high",
+      });
+      if (await mainWindowFocused()) {
+        toastInfo(tr("claim.toast_lease_lost", { world }));
+      }
+      break;
+    }
+    case "view_session_writing": {
+      const world = prettifySlug(ev.game_slug);
+      pushNotification({
+        id: `view-session-writing-${ev.save_id}`,
+        title: tr("claim.notice_view_writing_title", { world }),
+        body: tr("claim.notice_view_writing_body"),
+        priority: "high",
+        actions: [
+          {
+            url: `hoard-op:claim-host:${ev.save_id}`,
+            label: tr("claim.notice_host_it"),
+            op: { kind: "claim_world", save_id: ev.save_id, role: "host" },
+          },
+        ],
+      });
+      break;
+    }
+    default:
+      break;
+  }
+}
+
+/** The side copy of a session under somebody else's lease landed: the hold's
+ *  bell item gains the button that opens it. Called from the
+ *  `save-conflicts-backed-up` listener (`automatic.ts`), which is where the
+ *  folder arrives. Nothing happens for a save with no such item. */
+export function noteSideCopy(saveId: string, dir: string): void {
+  updateNotification(hostedElsewhereId(saveId), {
+    actions: [
+      {
+        url: `hoard-op:open-folder:${saveId}`,
+        label: tr("claim.notice_open_side_copy"),
+        op: { kind: "open_folder", path: dir },
+      },
+    ],
+  });
+}
+
 let unlisteners: UnlistenFn[] = [];
 
 /** Subscribe to the world events. Called from `subscribeAgent()` before the
- *  relay is attached, so the backlog lands on a listening store. The claim
- *  prompt's two topics (`agent://world-claim-wanted`,
- *  `agent://view-session-writing`) are the prompt's, not this store's: they
- *  are registered by the modal that answers them. */
+ *  relay is attached, so the backlog lands on a listening store. Main window
+ *  only: the HUD reads the snapshot instead. */
 export async function subscribeWorldEvents(): Promise<void> {
   await unsubscribeWorldEvents();
   const topics = [
@@ -107,15 +301,21 @@ export async function subscribeWorldEvents(): Promise<void> {
     "agent://world-released",
     "agent://world-hosted-elsewhere",
     "agent://world-lease-lost",
-    // "agent://world-claim-wanted"  -> the claim prompt (step 5)
-    // "agent://view-session-writing" -> the claim prompt (step 5)
+    "agent://view-session-writing",
+    "agent://game-stopped",
   ];
   try {
-    unlisteners = await Promise.all(
-      topics.map((t) =>
-        listen<AgentEvent>(t, (event) => applyWorldEvent(event.payload)),
+    unlisteners = await Promise.all([
+      ...topics.map((t) =>
+        listen<AgentEvent>(t, (event) => {
+          applyWorldEvent(event.payload);
+          void noticeWorldEvent(event.payload);
+        }),
       ),
-    );
+      listen<AgentEvent>("agent://world-claim-wanted", (event) => {
+        void onClaimWanted(event.payload);
+      }),
+    ]);
   } catch {
     /* Tauri not available (dev in browser): the stores stay empty. */
   }

@@ -99,6 +99,7 @@
   import { tapVersion } from "./lib/stores/versionTap";
   import Modal from "./lib/components/Modal.svelte";
   import DeviceLimitModal from "./lib/components/DeviceLimitModal.svelte";
+  import ClaimWorldModal from "./lib/components/ClaimWorldModal.svelte";
   import HylianUser from "./lib/components/HylianUser.svelte";
   import MarioStar from "./lib/components/MarioStar.svelte";
   import Triforce from "./lib/components/Triforce.svelte";
@@ -1310,6 +1311,10 @@
     </Button>
   {/snippet}
 </Modal>
+
+<!-- The claim prompt, when this window is the one in front; otherwise the
+     HUD over the game asks (HRD-D-0014). Opened by `stores/groups.ts`. -->
+<ClaimWorldModal />
 
 <DeviceLimitModal
   open={deviceLimit !== null || $debugDeviceLimit !== null}

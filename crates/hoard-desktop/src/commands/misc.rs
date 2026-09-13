@@ -28,13 +28,38 @@ pub async fn open_external(url: String) -> Result<(), String> {
     if !allowed {
         return Err("refusing to open non-web URL".into());
     }
+    platform_opener(&url)
+        .spawn()
+        .map(|_| ())
+        .map_err(|e| format!("could not open browser: {e}"))
+}
 
+/// Shows a folder in the file manager. The one caller is the bell's "Open side
+/// copy", whose path the service wrote (`SaveConflictsBackedUp::conflict_dir`);
+/// anything that is not an existing directory is refused, so a string that is
+/// not a folder never reaches the opener.
+#[tauri::command]
+pub async fn open_folder(path: String) -> Result<(), String> {
+    let dir = std::path::Path::new(&path);
+    if !dir.is_absolute() || !dir.is_dir() {
+        return Err("refusing to open something that isn't a folder".into());
+    }
+    platform_opener(&path)
+        .spawn()
+        .map(|_| ())
+        .map_err(|e| format!("could not open the folder: {e}"))
+}
+
+/// The platform's "open this" command with `arg`, not yet spawned. Web URLs
+/// and folders take the same road.
+fn platform_opener(arg: &str) -> tokio::process::Command {
+    let url = arg;
     use tokio::process::Command;
 
     #[cfg(target_os = "linux")]
-    let mut cmd = {
+    let cmd = {
         let mut c = Command::new("xdg-open");
-        c.arg(&url);
+        c.arg(url);
         // AppImage-injected loader/toolkit vars: restore the pre-AppImage value
         // if AppRun stashed it as `<VAR>_ORIG`, otherwise drop it entirely so
         // the child falls back to the host defaults.
@@ -61,14 +86,14 @@ pub async fn open_external(url: String) -> Result<(), String> {
     };
 
     #[cfg(target_os = "macos")]
-    let mut cmd = {
+    let cmd = {
         let mut c = Command::new("open");
-        c.arg(&url);
+        c.arg(url);
         c
     };
 
     #[cfg(target_os = "windows")]
-    let mut cmd = {
+    let cmd = {
         // Do NOT route through `cmd /C start`: cmd re-parses its command line
         // and treats every `&` in the URL as a command separator, so an OAuth
         // sign-in URL like `.../login?desktop=1&port=65491&state=<nonce>` was
@@ -78,13 +103,11 @@ pub async fn open_external(url: String) -> Result<(), String> {
         // sign-in failed with "auth callback state mismatch". rundll32 is not a
         // shell: it hands the URL to the registered protocol handler verbatim.
         let mut c = Command::new("rundll32.exe");
-        c.args(["url.dll,FileProtocolHandler", &url]);
+        c.args(["url.dll,FileProtocolHandler", url]);
         c
     };
 
-    cmd.spawn()
-        .map(|_| ())
-        .map_err(|e| format!("could not open browser: {e}"))
+    cmd
 }
 
 /// One line from the interface into the app's log, for what only the webview can

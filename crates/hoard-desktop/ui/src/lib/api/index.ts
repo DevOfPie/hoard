@@ -611,6 +611,13 @@ export type AgentSlotStatus = {
   last_fs_event_at: string | null;
   /** RFC3339 UTC or null if no backup pending. */
   next_scheduled_backup_at: string | null;
+  /** Shared into a group. The two below only mean something when set; an
+   *  older service sends neither, and the HUD draws no lease. */
+  shared?: boolean;
+  /** The lease as the engine last heard it, for a shared save. */
+  lease?: WorldLease | null;
+  /** Who hosts it, when the lease is somebody else's. */
+  lease_holder?: string | null;
 };
 
 export type BackupReason = "filesystem_settled" | "game_stopped" | "manual";
@@ -840,6 +847,10 @@ export type UiSnapshot = {
    *  those are *state*, and rebuilding state by replaying events means keeping
    *  the `game_started` row forever or lying about who's playing. */
   slots: AgentSlotStatus[];
+  /** The claim prompts the engine is still waiting on, from the same status
+   *  the slots come from. State, not history: the HUD draws the question from
+   *  here because `world_claim_wanted` went out before the HUD existed. */
+  prompts: WorldPrompt[];
   /** Oldest first, like the backlog. */
   rows: JournalRow[];
   cloud: CloudPulse;
@@ -1597,6 +1608,20 @@ export type WorldChoice = {
   lease: WorldLease;
 };
 
+/** One claim prompt the engine is still waiting on (`EngineStatus.prompts`):
+ *  the game started, it has shared worlds here, nothing says which one this
+ *  machine plays. It leaves the status on the answer, on the engine hosting
+ *  by itself, or on the game closing. */
+export type WorldPrompt = {
+  game_slug: string;
+  worlds: WorldChoice[];
+  /** RFC3339: when the engine hosts on its own if nobody answers. Only set
+   *  while its clock is armed (one world of the game, lease free). */
+  auto_host_at?: string | null;
+  /** RFC3339: when the prompt went out. */
+  raised_at: string;
+};
+
 /** One world a save holds and what a share of it carries: `/`-separated
  *  patterns relative to the save root, resolved by the service. */
 export type WorldFiles = {
@@ -1675,6 +1700,19 @@ export function dismissWorld(saveId: string): Promise<void> {
 
 export function getLease(saveId: string): Promise<LeaseView> {
   return invoke<LeaseView>("get_lease", { saveId });
+}
+
+/** Raise the HUD over the game (the Alt+H window). Created on first use,
+ *  shown with focus so Escape and its buttons work; the toggle and the hide
+ *  live in `stores/gameOverlay.ts`. */
+export function overlayShow(): Promise<boolean> {
+  return invoke<boolean>("overlay_set_visible", { visible: true });
+}
+
+/** Show a folder in the file manager. Refused for anything that is not an
+ *  existing absolute directory. */
+export function openFolder(path: string): Promise<void> {
+  return invoke<void>("open_folder", { path });
 }
 
 /** The worlds a tracked save holds. Empty for a game that shares whole. */

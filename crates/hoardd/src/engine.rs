@@ -274,6 +274,7 @@ impl Engine {
             last_error: None,
             reason: EngineDownReason::Unknown,
             keyring: None,
+            prompts: Vec::new(),
         };
         // A previous engine (the one that died and is being replaced, say) is dropped
         // here: `Running::aux` aborts its tasks when released.
@@ -768,6 +769,26 @@ fn spawn_cloud_live_pair(client: &ApiClient, handle: &AgentHandle) -> Vec<JoinHa
             global_sync: true,
         },
     )
+}
+
+/// The claim prompts the engine is still waiting on, with the same ceiling.
+/// Empty with no engine, or with one that does not answer: a status with no
+/// prompt is what an older daemon sent, and the client draws nothing.
+pub async fn prompt_status(engine: &Engine) -> Vec<hoard_core::ipc::WorldPrompt> {
+    let Some(handle) = engine.handle() else {
+        return Vec::new();
+    };
+    match tokio::time::timeout(STATUS_TIMEOUT, handle.prompts()).await {
+        Ok(Ok(prompts)) => prompts,
+        Ok(Err(err)) => {
+            tracing::warn!(error = %err, "hoardd: the engine didn't answer a prompts query");
+            Vec::new()
+        }
+        Err(_) => {
+            tracing::warn!("hoardd: the engine took too long to answer a prompts query");
+            Vec::new()
+        }
+    }
 }
 
 /// Estado de los slots vigilados, con tope de espera. Lo usa el `Status` del IPC.
