@@ -20,7 +20,7 @@ use serde::Deserialize;
 use super::Delivery;
 
 /// Repo de las releases. Mismo que resuelven `install.sh` / `install.ps1`.
-const REPO: &str = "rleeon/hoard";
+const REPO: &str = "DevOfPie/hoard";
 
 /// The minisign public key CI signs everything published with (ADR 0017; the
 /// signing job is isolated from the building one so no third-party dependency ever
@@ -30,7 +30,7 @@ const REPO: &str = "rleeon/hoard";
 /// defence between "I download an executable off the internet" and "I run it with
 /// privileges": GitHub's TLS says the file arrived intact, not that we published
 /// it.
-pub const MINISIGN_PUBKEY: &str = "RWSeOL1nHXZI9oa+WOdrc6yVasLPeBurvGWnERo4tN9F+YIQn7ipx3eO";
+pub const MINISIGN_PUBKEY: &str = "RWTfyG64Bh/EfrZ4aJpIKDjQCy31aZ6e5fAfv5eUe5q/ThKxrJbmRDvn";
 
 /// Un fichero publicado en la release.
 #[derive(Debug, Clone, Deserialize)]
