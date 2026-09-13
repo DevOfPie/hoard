@@ -1035,6 +1035,11 @@ fn apply_state_to_slot(slot: &mut SaveSlot, next: kernel::State) {
     slot.has_pending = next.has_pending;
     slot.last_fs_event_at = next.last_fs_event_at;
     slot.last_restore_at = next.last_restore_at;
+    // A lease refused as stale is asked for again once the head moved, and
+    // not before: the request is re-armed with the version, nowhere else.
+    if slot.known_version != next.known_version {
+        slot.lease_requested = false;
+    }
     slot.known_version = next.known_version;
     slot.synced_fingerprint = next.synced_fingerprint;
     slot.last_backup_at = next.last_backup_at;
