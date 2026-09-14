@@ -494,4 +494,9 @@ pub struct AgentSlotStatus {
     pub last_fs_event_at: Option<OffsetDateTime>,
     #[serde(with = "time::serde::rfc3339::option")]
     pub next_scheduled_backup_at: Option<OffsetDateTime>,
+    /// A shared world whose acquire was refused as stale: Hoard is pulling the
+    /// head before it can host. Absent from an older service, which reads as
+    /// `false`.
+    #[serde(default)]
+    pub lease_behind: bool,
 }
