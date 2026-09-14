@@ -140,9 +140,17 @@ From then on the world is pulled to that folder whenever the game is closed
 and the server has a newer version. Your own characters in the same folder
 are untouched, because they are not in the share's file list.
 
-Adopting is a desktop step today: the CLI lists the shared row in `hoard saves`
-and `hoard restore <SAVE_ID> --to <folder>` brings the files down, but there is
-no CLI verb that binds a shared save to a folder for ongoing sync.
+**CLI.** Once you are in the group, `hoard save list` shows the shared save
+(`hoard saves` lists only what this machine tracks). Give it a folder here:
+
+```sh
+hoard adopt <SAVE_ID> --path <folder>
+```
+
+The sync service watches that folder from then on, exactly as after the
+desktop's dialog, and `hoard saves` lists the world with who hosts it. Adopting
+a save this machine already tracks is refused; point it elsewhere with
+`hoard save path`.
 
 ## Playing
 
