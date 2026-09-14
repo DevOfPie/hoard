@@ -1078,16 +1078,22 @@ async fn restrict_to_include(
             .fetch_all(pool)
             .await
             .map_err(|e| internal_logged("listing snapshot rows", e))?;
-    let (count, size) = files
-        .iter()
-        .filter(|(path, _)| included(include, path))
-        .fold((0i64, 0i64), |(n, total), (_, bytes)| {
-            (n + 1, total + bytes)
-        });
+    let (count, size) = included_totals(include, &files);
     snap.file_count = count;
     snap.total_size_bytes = size;
     snap.insight = None;
     Ok(())
+}
+
+/// How many of `files` (path, bytes) the include list names, and their bytes.
+/// The one place a member's totals are matched, for versions and for saves.
+pub(crate) fn included_totals(include: &[String], files: &[(String, i64)]) -> (i64, i64) {
+    files
+        .iter()
+        .filter(|(path, _)| included(include, path))
+        .fold((0i64, 0i64), |(n, total), (_, bytes)| {
+            (n + 1, total + bytes)
+        })
 }
 
 // ─── GET /v1/saves/:save_id/snapshots/:version ──────────────────────────────

@@ -885,6 +885,31 @@ async fn a_member_reads_only_the_include_list_even_on_an_older_version() {
     assert_eq!(got, want);
 }
 
+/// The save's size, in the list and on its own, covers what the share names for
+/// a member and every file for the owner.
+#[tokio::test]
+async fn a_member_sees_the_size_of_the_include_list_only() {
+    let h = harness().await;
+    let f = Folder::new();
+    folder_shared_as_alpha(&h, &f).await;
+    let alpha = (f.alpha_db.len() + f.alpha_fwl.len()) as i64;
+    let all: i64 = f.files().iter().map(|(_, b)| b.len() as i64).sum();
+
+    let size_as = |who: AuthUser| {
+        let h = &h;
+        async move {
+            let listed = list_as(h, &who).await;
+            assert_eq!(listed.len(), 1);
+            let Json(one) = saves::get_one(st(h), Extension(who), Path(SAVE.to_string()))
+                .await
+                .expect("get");
+            (listed[0].total_size_bytes, one.total_size_bytes)
+        }
+    };
+    assert_eq!(size_as(h.member.clone()).await, (Some(alpha), Some(alpha)));
+    assert_eq!(size_as(h.owner.clone()).await, (Some(all), Some(all)));
+}
+
 /// The group's tables hold the character's blob, but a member hosting the save
 /// cannot reach it by its hash: `init` asks for its bytes like absent content,
 /// and a commit that references it without them is refused. Content the member
