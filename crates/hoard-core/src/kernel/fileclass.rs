@@ -185,6 +185,16 @@ pub struct Scope<'a> {
     pub include: &'a [String],
 }
 
+impl<'a> Scope<'a> {
+    /// A scope over the whole folder: the game's shields and no include list.
+    pub fn shields_only(shields: &'a [String]) -> Self {
+        Scope {
+            shields,
+            include: &[],
+        }
+    }
+}
+
 /// Is `rel_path` one of the files a shared save names?
 ///
 /// An empty list is no filter. Otherwise the path, `/`-separated as
@@ -201,6 +211,22 @@ pub fn included(include: &[String], rel_path: &str) -> bool {
         || include
             .iter()
             .any(|pattern| pattern_covers(pattern, rel_path))
+}
+
+/// Can any file under the directory `rel_dir` be [`included`]? The walk asks
+/// before descending, so a shared save's fingerprint never reads the folders
+/// its list cannot name. A pattern reaches beneath when its leading segments
+/// match the directory's, segment by segment, whichever of the two runs out
+/// first: a shorter pattern covers the directory whole, a longer one may name
+/// something inside it. An empty list is no filter.
+pub fn reaches_beneath(include: &[String], rel_dir: &str) -> bool {
+    include.is_empty()
+        || include.iter().any(|pattern| {
+            pattern
+                .split('/')
+                .zip(rel_dir.split('/'))
+                .all(|(p, s)| glob_match(p, s))
+        })
 }
 
 /// One pattern against one path, without collecting either: this runs once per
@@ -625,6 +651,27 @@ mod tests {
         assert!(!included(&list, "saves"));
         // `*` alone therefore covers the whole root, which is what it says.
         assert!(included(&inc(&["*"]), "worlds_local/Alpha.db"));
+    }
+
+    /// The walk descends only where a pattern can still match something: the
+    /// prefix test is the same segment rule as [`included`], stopped at the
+    /// directory's depth.
+    #[test]
+    fn a_directory_no_pattern_can_reach_is_not_descended() {
+        let list = inc(&["worlds_local/Alpha.db", "worlds_local/Alpha_backup_*"]);
+        assert!(reaches_beneath(&list, "worlds_local"));
+        assert!(!reaches_beneath(&list, "characters_local"));
+        // Deeper than any pattern: nothing under it can match.
+        assert!(!reaches_beneath(&list, "worlds_local/old"));
+        // A shorter pattern covers the directory and all beneath it.
+        assert!(reaches_beneath(
+            &inc(&["saves/Alpha"]),
+            "saves/Alpha/region"
+        ));
+        assert!(!reaches_beneath(&inc(&["saves/Alpha"]), "saves/Beta"));
+        assert!(reaches_beneath(&inc(&["*/*"]), "worlds_local"));
+        // No list, no pruning.
+        assert!(reaches_beneath(&[], "anything/at/all"));
     }
 
     /// Exact in case: the pattern was made from the name on disk.

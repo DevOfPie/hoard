@@ -23,7 +23,10 @@
 //! A hand-added save, or one for a game outside the catalogue, gets no shields:
 //! the kernel's name rules decide alone, which is why they are conservative.
 
-use hoard_core::kernel::fileclass::is_useful_shield;
+use hoard_core::kernel::fileclass::{is_useful_shield, RestoreGate};
+
+use crate::agent::WatchedSave;
+use crate::state::SaveState;
 
 /// The filename patterns the manifest declares as save data for `slug`, in
 /// lowercase and deduplicated.
@@ -60,6 +63,32 @@ pub fn shields_for_slug(slug: &str) -> Vec<String> {
         }
     }
     out
+}
+
+/// The gate a restore of one save runs through: the game's shields, what the
+/// save consists of when shared, and the user's answer on writing its config.
+/// Every restore of a row builds it here, so what the preview promises, what
+/// the dialog writes and what auto-restore merges come out of one decision.
+pub fn gate_for_save(game_slug: &str, include: &[String], allow_device_local: bool) -> RestoreGate {
+    RestoreGate {
+        shields: shields_for_slug(game_slug),
+        include: include.to_vec(),
+        allow_device_local,
+    }
+}
+
+impl SaveState {
+    /// See [`gate_for_save`].
+    pub fn gate(&self, allow_device_local: bool) -> RestoreGate {
+        gate_for_save(&self.game_slug, &self.include, allow_device_local)
+    }
+}
+
+impl WatchedSave {
+    /// See [`gate_for_save`].
+    pub fn gate(&self, allow_device_local: bool) -> RestoreGate {
+        gate_for_save(&self.game_slug, &self.include, allow_device_local)
+    }
 }
 
 #[cfg(test)]

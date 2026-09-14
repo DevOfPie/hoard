@@ -578,8 +578,7 @@ fn playtime_watched_save(slug: &str, install_dir: Option<PathBuf>) -> WatchedSav
         known_version: None,
         set_hash: None,
         track_only: true,
-        shared: false,
-        group_name: None,
+        shared: None,
         include: Vec::new(),
     }
 }
@@ -735,60 +734,12 @@ pub fn watched_saves_from_state(
             known_version: s.last_version_num,
             set_hash: s.set_hash.clone(),
             track_only: false,
-            shared: s.shared.is_some(),
-            group_name: s.shared.as_ref().map(|r| r.group_name.clone()),
+            shared: s.shared.clone(),
             include: s.include.clone(),
         });
     }
     out.extend(playtime_saves);
     out
-}
-
-/// A `WatchedSave` for a freshly added or renamed save, from minimal inputs. It
-/// resolves the Steam dir, the policy and the processes exactly as the hydrate does.
-#[allow(clippy::too_many_arguments)]
-pub fn watched_save_from(
-    save_id: String,
-    game_slug: String,
-    display_name: String,
-    label: String,
-    local_path: PathBuf,
-    preset: Option<&str>,
-    processes_override: Vec<String>,
-    shared_processes: bool,
-    allow_device_local: Option<bool>,
-    shared: Option<&SharedRef>,
-    include: Vec<String>,
-) -> WatchedSave {
-    let steam_apps = steam::list_installed_steam_games(Os::current()).unwrap_or_default();
-    let steam_install_dir = steam_apps
-        .iter()
-        .find(|a| name_matches(&a.name, &game_slug))
-        .map(|a| a.install_dir.clone());
-    let processes = if processes_override.is_empty() {
-        resolve_processes(&game_slug)
-    } else {
-        processes_override
-    };
-    let policy = resolve_policy(&game_slug, preset);
-    WatchedSave {
-        allow_device_local,
-        save_id,
-        game_slug: game_slug.clone(),
-        display_name,
-        label,
-        local_path,
-        steam_install_dir,
-        processes,
-        shared_processes,
-        policy,
-        known_version: None,
-        set_hash: None,
-        track_only: false,
-        shared: shared.is_some(),
-        group_name: shared.map(|r| r.group_name.clone()),
-        include,
-    }
 }
 
 // ---- add / adopt / list / rename / untrack / delete ------------------------
@@ -1228,39 +1179,25 @@ pub async fn add_to_tracking(client: &ApiClient, args: AddGameArgs) -> Result<Tr
                 .await
                 .unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
         };
-        cli_state.saves.insert(
-            save_id.clone(),
-            SaveState {
-                local_path: local_path.clone(),
-                game_slug: args.game_slug.clone(),
-                label: label.clone(),
-                last_backup_at: None,
-                last_version_num: None,
-                paused: false,
-                preset: preset_name.clone(),
-                set_hash: None,
-                processes: pinned_processes.clone(),
-                shared_processes: args.shared_processes,
-                allow_device_local: None,
-                shared: None,
-                include: Vec::new(),
-            },
-        );
+        let row = SaveState {
+            local_path: local_path.clone(),
+            game_slug: args.game_slug.clone(),
+            label: label.clone(),
+            last_backup_at: None,
+            last_version_num: None,
+            paused: false,
+            preset: preset_name.clone(),
+            set_hash: None,
+            processes: pinned_processes.clone(),
+            shared_processes: args.shared_processes,
+            allow_device_local: None,
+            shared: None,
+            include: Vec::new(),
+        };
+        cli_state.saves.insert(save_id.clone(), row.clone());
         cli_state.save(&path)?;
 
-        let watched = watched_save_from(
-            save_id.clone(),
-            args.game_slug.clone(),
-            args.game_slug.clone(),
-            label.clone(),
-            local_path.clone(),
-            preset_name.as_deref(),
-            pinned_processes.clone(),
-            args.shared_processes,
-            None,
-            None,
-            Vec::new(),
-        );
+        let watched = watched_from_snapshot(save_id.clone(), &row);
         return Ok(TrackOutcome {
             tracked: TrackedSave {
                 save_id,
@@ -1332,39 +1269,25 @@ pub async fn add_to_tracking(client: &ApiClient, args: AddGameArgs) -> Result<Tr
         );
         cli_state.saves.remove(&stale);
     }
-    cli_state.saves.insert(
-        new_id,
-        SaveState {
-            local_path: local_path.clone(),
-            game_slug: save.game_slug.to_string(),
-            label: save.label.clone(),
-            last_backup_at: None,
-            last_version_num: None,
-            paused: false,
-            preset: preset_name.clone(),
-            set_hash: None,
-            processes: pinned_processes.clone(),
-            shared_processes: args.shared_processes,
-            allow_device_local: None,
-            shared: None,
-            include: Vec::new(),
-        },
-    );
+    let row = SaveState {
+        local_path: local_path.clone(),
+        game_slug: save.game_slug.to_string(),
+        label: save.label.clone(),
+        last_backup_at: None,
+        last_version_num: None,
+        paused: false,
+        preset: preset_name.clone(),
+        set_hash: None,
+        processes: pinned_processes.clone(),
+        shared_processes: args.shared_processes,
+        allow_device_local: None,
+        shared: None,
+        include: Vec::new(),
+    };
+    cli_state.saves.insert(new_id.clone(), row.clone());
     cli_state.save(&path)?;
 
-    let watched = watched_save_from(
-        save.id.to_string(),
-        save.game_slug.to_string(),
-        args.game_slug.clone(),
-        save.label.clone(),
-        local_path.clone(),
-        preset_name.as_deref(),
-        pinned_processes.clone(),
-        args.shared_processes,
-        None,
-        None,
-        Vec::new(),
-    );
+    let watched = watched_from_snapshot(new_id, &row);
 
     Ok(TrackOutcome {
         tracked: TrackedSave {
@@ -1405,19 +1328,19 @@ pub async fn adopt(client: &ApiClient, args: AdoptArgs) -> Result<TrackOutcome> 
     // already takes the world's files and nothing else. Cloud has no groups. A
     // server that cannot answer refuses the adopt: seating the slot without the
     // list would push this machine's whole folder into the group.
-    let (shared, include) = if client.is_cloud().await {
-        (None, Vec::new())
+    let shared_info = if client.is_cloud().await {
+        None
     } else {
-        let row = client.get_save(&args.save_id).await.with_context(|| {
-            format!(
-                "couldn't read the server's row for {}; try again when the server answers",
-                args.save_id
-            )
-        })?;
-        (
-            row.shared.as_ref().map(shared_ref_from),
-            row.shared.map(|s| s.include).unwrap_or_default(),
-        )
+        client
+            .get_save(&args.save_id)
+            .await
+            .with_context(|| {
+                format!(
+                    "couldn't read the server's row for {}; try again when the server answers",
+                    args.save_id
+                )
+            })?
+            .shared
     };
     let local_path = PathBuf::from(&args.local_path);
     // Adopting is repointing a save that already exists in the cloud: overlapping
@@ -1458,39 +1381,26 @@ pub async fn adopt(client: &ApiClient, args: AdoptArgs) -> Result<TrackOutcome> 
         cli_state.saves.remove(old);
     }
     let preset = presets::builtin_preset_for(&args.game_slug).map(str::to_string);
-    cli_state.saves.insert(
-        args.save_id.clone(),
-        SaveState {
-            local_path: local_path.clone(),
-            game_slug: args.game_slug.clone(),
-            label: args.label.clone(),
-            last_backup_at: None,
-            last_version_num: None,
-            paused: false,
-            preset: preset.clone(),
-            set_hash: None,
-            processes: Vec::new(),
-            shared_processes: false,
-            allow_device_local: None,
-            shared: shared.clone(),
-            include: include.clone(),
-        },
-    );
+    let mut row = SaveState {
+        local_path: local_path.clone(),
+        game_slug: args.game_slug.clone(),
+        label: args.label.clone(),
+        last_backup_at: None,
+        last_version_num: None,
+        paused: false,
+        preset: preset.clone(),
+        set_hash: None,
+        processes: Vec::new(),
+        shared_processes: false,
+        allow_device_local: None,
+        shared: None,
+        include: Vec::new(),
+    };
+    row.set_shared(shared_info.as_ref());
+    cli_state.saves.insert(args.save_id.clone(), row.clone());
     cli_state.save(&path)?;
 
-    let watched = watched_save_from(
-        args.save_id.clone(),
-        args.game_slug.clone(),
-        args.game_slug.clone(),
-        args.label.clone(),
-        local_path.clone(),
-        preset.as_deref(),
-        Vec::new(),
-        false,
-        None,
-        shared.as_ref(),
-        include,
-    );
+    let watched = watched_from_snapshot(args.save_id.clone(), &row);
 
     Ok(TrackOutcome {
         tracked: TrackedSave {
@@ -1509,7 +1419,7 @@ pub async fn adopt(client: &ApiClient, args: AdoptArgs) -> Result<TrackOutcome> 
             local_size_bytes: None,
             preset,
             allow_device_local: None,
-            shared,
+            shared: row.shared,
         },
         watched,
     })
@@ -2133,54 +2043,25 @@ pub async fn list_tracked(client: &ApiClient) -> Result<(Vec<TrackedSave>, Vec<S
 /// rather than "your state is gone". The row is never pruned: the server
 /// listed it, so [`rows_unknown_to_server`] counts it as known.
 fn tracked_from_server_row(s: hoard_core::wire::Save, st: Option<&SaveState>) -> TrackedSave {
-    let shared = s.shared.as_ref().map(shared_ref_from);
-    match st {
-        Some(st) => TrackedSave {
-            save_id: s.id.into_inner(),
-            game_slug: s.game_slug.into_inner(),
-            name: slots::name_of(&s.label).map(str::to_string),
-            slot: slots::slot_of(&s.label),
-            label: s.label,
-            local_path: st.local_path.to_string_lossy().into_owned(),
-            cloud_version_num: s.latest_version_num,
-            local_version_num: st.last_version_num,
-            last_backup_at: format_optional_time(Some(s.updated_at)),
-            paused: st.paused,
-            total_size_bytes: s.total_size_bytes.unwrap_or(0),
-            orphan: false,
-            local_size_bytes: None,
-            preset: st.preset.clone(),
-            allow_device_local: st.allow_device_local,
-            shared,
-        },
-        None => TrackedSave {
-            save_id: s.id.into_inner(),
-            game_slug: s.game_slug.into_inner(),
-            name: slots::name_of(&s.label).map(str::to_string),
-            slot: slots::slot_of(&s.label),
-            label: s.label,
-            local_path: String::new(),
-            cloud_version_num: s.latest_version_num,
-            local_version_num: None,
-            last_backup_at: format_optional_time(Some(s.updated_at)),
-            paused: false,
-            total_size_bytes: s.total_size_bytes.unwrap_or(0),
-            orphan: true,
-            local_size_bytes: None,
-            preset: None,
-            allow_device_local: None,
-            shared,
-        },
-    }
-}
-
-/// The on-disk twin of the server's [`hoard_core::wire::SharedInfo`].
-pub fn shared_ref_from(info: &hoard_core::wire::SharedInfo) -> SharedRef {
-    SharedRef {
-        group_id: info.group_id.clone(),
-        group_name: info.group_name.clone(),
-        owner_user_id: info.owner_user_id.clone(),
-        owner_username: info.owner_username.to_string(),
+    TrackedSave {
+        save_id: s.id.into_inner(),
+        game_slug: s.game_slug.into_inner(),
+        name: slots::name_of(&s.label).map(str::to_string),
+        slot: slots::slot_of(&s.label),
+        label: s.label,
+        local_path: st.map_or_else(String::new, |st| {
+            st.local_path.to_string_lossy().into_owned()
+        }),
+        cloud_version_num: s.latest_version_num,
+        local_version_num: st.and_then(|st| st.last_version_num),
+        last_backup_at: format_optional_time(Some(s.updated_at)),
+        paused: st.is_some_and(|st| st.paused),
+        total_size_bytes: s.total_size_bytes.unwrap_or(0),
+        orphan: st.is_none(),
+        local_size_bytes: None,
+        preset: st.and_then(|st| st.preset.clone()),
+        allow_device_local: st.and_then(|st| st.allow_device_local),
+        shared: s.shared.as_ref().map(SharedRef::from),
     }
 }
 
@@ -2194,15 +2075,10 @@ fn sync_shared_from_server(state: &mut CliState, server: &[hoard_core::wire::Sav
         let Some(st) = state.saves.get_mut(row.id.as_str()) else {
             continue;
         };
-        let shared = row.shared.as_ref().map(shared_ref_from);
-        let include = row
-            .shared
-            .as_ref()
-            .map(|s| s.include.clone())
-            .unwrap_or_default();
+        let shared = row.shared.as_ref().map(SharedRef::from);
+        let include = shared.as_ref().map_or(&[][..], |s| s.include.as_slice());
         if st.shared != shared || st.include != include {
-            st.shared = shared;
-            st.include = include;
+            st.set_shared(row.shared.as_ref());
             changed += 1;
         }
     }
@@ -2325,7 +2201,7 @@ pub async fn rename_label(
             local_size_bytes: None,
             preset: entry.as_ref().and_then(|e| e.preset.clone()),
             allow_device_local: entry.as_ref().and_then(|e| e.allow_device_local),
-            shared: updated.shared.as_ref().map(shared_ref_from),
+            shared: updated.shared.as_ref().map(SharedRef::from),
         },
         watched,
     ))
@@ -2446,23 +2322,39 @@ pub enum LiveReseat {
     Noop,
 }
 
-/// Builds a fresh `WatchedSave` from a `SaveState` snapshot (a reseat after editing
-/// settings). It carries the persisted process pins over so a re-attached emulator
-/// keeps its detection without waiting for a restart.
+/// A `WatchedSave` for one row: a freshly added save, or a reseat after editing
+/// settings. It resolves the Steam dir, the policy and the processes exactly as
+/// the hydrate does, and carries the persisted process pins over so a
+/// re-attached emulator keeps its detection without waiting for a restart.
 fn watched_from_snapshot(save_id: String, s: &SaveState) -> WatchedSave {
-    watched_save_from(
+    let steam_apps = steam::list_installed_steam_games(Os::current()).unwrap_or_default();
+    let steam_install_dir = steam_apps
+        .iter()
+        .find(|a| name_matches(&a.name, &s.game_slug))
+        .map(|a| a.install_dir.clone());
+    let processes = if s.processes.is_empty() {
+        resolve_processes(&s.game_slug)
+    } else {
+        s.processes.clone()
+    };
+    WatchedSave {
+        allow_device_local: s.allow_device_local,
         save_id,
-        s.game_slug.clone(),
-        s.game_slug.clone(),
-        s.label.clone(),
-        s.local_path.clone(),
-        s.preset.as_deref(),
-        s.processes.clone(),
-        s.shared_processes,
-        s.allow_device_local,
-        s.shared.as_ref(),
-        s.include.clone(),
-    )
+        game_slug: s.game_slug.clone(),
+        // No display name in state.json; the slug stands in, as in the hydrate.
+        display_name: s.game_slug.clone(),
+        label: s.label.clone(),
+        local_path: s.local_path.clone(),
+        steam_install_dir,
+        processes,
+        shared_processes: s.shared_processes,
+        policy: resolve_policy(&s.game_slug, s.preset.as_deref()),
+        known_version: None,
+        set_hash: None,
+        track_only: false,
+        shared: s.shared.clone(),
+        include: s.include.clone(),
+    }
 }
 
 /// Pauses or resumes watching a save. A paused one stays in the list but the agent
@@ -2648,12 +2540,39 @@ pub enum ShareError {
     NoTemplate(String),
     #[error(transparent)]
     BadWorld(#[from] crate::worldfiles::BadWorld),
+    /// A game that shares by world, with none named. `worlds` are the ones
+    /// found in the save's folder, empty when it is not tracked here.
+    #[error("{}", needs_world_message(.worlds))]
+    NeedsWorld { worlds: Vec<String> },
+}
+
+fn needs_world_message(worlds: &[String]) -> String {
+    if worlds.is_empty() {
+        "this game shares one world at a time; pick one by name (none found on this machine)"
+            .to_string()
+    } else {
+        format!(
+            "this game shares one world at a time; pick one of: {}",
+            worlds.join(", ")
+        )
+    }
 }
 
 /// The include list a share of a `game_slug` save carries: `world`'s files
-/// from the game's template, or everything when no world is named.
-pub fn include_for_share(game_slug: &str, world: Option<&str>) -> Result<Vec<String>, ShareError> {
+/// from the game's template, or everything when the game has no template. A
+/// template game with no world named is refused with the worlds under
+/// `local_path`, the save's folder when it is tracked here.
+pub fn include_for_share(
+    game_slug: &str,
+    world: Option<&str>,
+    local_path: Option<&std::path::Path>,
+) -> Result<Vec<String>, ShareError> {
     match world {
+        None if crate::worldfiles::has_template(game_slug) => Err(ShareError::NeedsWorld {
+            worlds: local_path
+                .map(|root| crate::worldfiles::worlds(game_slug, root))
+                .unwrap_or_default(),
+        }),
         None => Ok(Vec::new()),
         Some(w) => crate::worldfiles::template(game_slug, w)?
             .ok_or_else(|| ShareError::NoTemplate(game_slug.to_string())),
@@ -2661,42 +2580,42 @@ pub fn include_for_share(game_slug: &str, world: Option<&str>) -> Result<Vec<Str
 }
 
 /// Shares `save_id` into `group_id`, naming `world` when the game shares by
-/// world (see [`crate::worldfiles`]). On success this machine's row takes the
-/// server's `shared` and `include`, and the `WatchedSave` to reseat comes back
-/// so the owner's next push already carries only the world's files. `None`
-/// when the save is not tracked here (the server row is still shared).
+/// world (see [`crate::worldfiles`]); such a game with no world is refused
+/// with [`ShareError::NeedsWorld`]. On success this machine's row takes the
+/// server's `shared` and `include`, and the [`LiveReseat`] that comes back
+/// puts the owner's next push over the world's files alone. `Noop` when the
+/// save is not tracked here (the server row is still shared) or is paused.
 pub async fn share_save(
     client: &ApiClient,
     save_id: &str,
     group_id: &str,
     world: Option<&str>,
-) -> Result<(hoard_core::wire::Save, Option<WatchedSave>)> {
-    let include = match world {
-        None => Vec::new(),
-        Some(w) => {
-            // The template goes by game, and the row is the cheapest place to
-            // read it; a save not tracked here still has a game on the server.
-            let local_slug = CliState::load_default()
-                .ok()
-                .and_then(|(state, _)| state.saves.get(save_id).map(|st| st.game_slug.clone()));
-            let slug = match local_slug {
-                Some(slug) => slug,
-                None => client.get_save(save_id).await?.game_slug.into_inner(),
-            };
-            include_for_share(&slug, Some(w))?
-        }
+) -> Result<(hoard_core::wire::Save, LiveReseat)> {
+    // The template goes by game, and the row is the cheapest place to read it;
+    // a save not tracked here still has a game on the server, and no folder.
+    let local = CliState::load_default().ok().and_then(|(state, _)| {
+        state
+            .saves
+            .get(save_id)
+            .map(|st| (st.game_slug.clone(), st.local_path.clone()))
+    });
+    let (slug, root) = match local {
+        Some((slug, root)) => (slug, Some(root)),
+        None => (client.get_save(save_id).await?.game_slug.into_inner(), None),
     };
+    let include = include_for_share(&slug, world, root.as_deref())?;
     hoard_core::wire::validate_include(&include).map_err(|m| anyhow::anyhow!(m))?;
     let save = client.share_save(save_id, group_id, &include).await?;
-    let watched = record_sharing(save_id, save.shared.as_ref());
-    Ok((save, watched))
+    let reseat = record_sharing(save_id.to_string(), save.shared.clone()).await?;
+    Ok((save, reseat))
 }
 
 /// Moves `save_id` back to its owner and clears `shared` and `include` on this
-/// machine's row. The `WatchedSave` to reseat, when the save is tracked here.
-pub async fn unshare_save(client: &ApiClient, save_id: &str) -> Result<Option<WatchedSave>> {
+/// machine's row. The [`LiveReseat`] for the slot, `Noop` when the save is not
+/// tracked here or is paused.
+pub async fn unshare_save(client: &ApiClient, save_id: &str) -> Result<LiveReseat> {
     client.unshare_save(save_id).await?;
-    Ok(record_sharing(save_id, None))
+    record_sharing(save_id.to_string(), None).await
 }
 
 /// Writes the server's answer onto this machine's row, after the server has
@@ -2705,30 +2624,42 @@ pub async fn unshare_save(client: &ApiClient, save_id: &str) -> Result<Option<Wa
 /// and not returned: the server row is the truth and `reconcile_with_server`
 /// repairs the row at the next start. A paused row stays paused: nothing is
 /// reseated for it, as `set_preset` does.
-fn record_sharing(
-    save_id: &str,
-    shared: Option<&hoard_core::wire::SharedInfo>,
-) -> Option<WatchedSave> {
-    let (mut state, path) = match CliState::load_default() {
-        Ok(v) => v,
-        Err(e) => {
-            tracing::warn!(save_id, error = %format!("{e:#}"), "sharing: couldn't read state; the row lags until reconcile");
-            return None;
+///
+/// Blocking work, the state file and the Steam scan in
+/// [`watched_from_snapshot`], so it runs off the caller's task: the daemon
+/// calls this from the IPC loop.
+async fn record_sharing(
+    save_id: String,
+    shared: Option<hoard_core::wire::SharedInfo>,
+) -> Result<LiveReseat> {
+    let reseat = tokio::task::spawn_blocking(move || {
+        let (mut state, path) = match CliState::load_default() {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!(save_id, error = %format!("{e:#}"), "sharing: couldn't read state; the row lags until reconcile");
+                return LiveReseat::Noop;
+            }
+        };
+        let Some(st) = state.saves.get_mut(&save_id) else {
+            return LiveReseat::Noop;
+        };
+        st.set_shared(shared.as_ref());
+        let snapshot = st.clone();
+        if let Err(e) = state.save(&path) {
+            tracing::warn!(save_id, error = %format!("{e:#}"), "sharing: couldn't write state; the row lags until reconcile");
+            return LiveReseat::Noop;
         }
-    };
-    let st = state.saves.get_mut(save_id)?;
-    st.shared = shared.map(shared_ref_from);
-    st.include = shared.map(|s| s.include.clone()).unwrap_or_default();
-    let snapshot = st.clone();
-    if let Err(e) = state.save(&path) {
-        tracing::warn!(save_id, error = %format!("{e:#}"), "sharing: couldn't write state; the row lags until reconcile");
-        return None;
-    }
-    if snapshot.paused {
-        None
-    } else {
-        Some(watched_from_snapshot(save_id.to_string(), &snapshot))
-    }
+        if snapshot.paused {
+            LiveReseat::Noop
+        } else {
+            LiveReseat::Reseat(
+                save_id.clone(),
+                Box::new(watched_from_snapshot(save_id, &snapshot)),
+            )
+        }
+    })
+    .await?;
+    Ok(reseat)
 }
 
 #[cfg(test)]
@@ -4079,6 +4010,10 @@ mod sharing_tests {
                 group_name: "the boys".into(),
                 owner_user_id: "u-owner".into(),
                 owner_username: "jacka".into(),
+                include: vec![
+                    "worlds_local/Alpha.db".into(),
+                    "worlds_local/Alpha.fwl".into()
+                ],
             })
         );
         assert_eq!(
@@ -4106,9 +4041,8 @@ mod sharing_tests {
     /// whole folder for none, and a refusal the client can show for the rest.
     #[test]
     fn a_share_resolves_its_include_list_from_the_world() {
-        assert!(include_for_share("valheim", None).unwrap().is_empty());
         assert_eq!(
-            include_for_share("valheim", Some("Alpha")).unwrap(),
+            include_for_share("valheim", Some("Alpha"), None).unwrap(),
             vec![
                 "worlds_local/Alpha.db",
                 "worlds_local/Alpha.fwl",
@@ -4118,16 +4052,42 @@ mod sharing_tests {
             ]
         );
         assert!(matches!(
-            include_for_share("stardew-valley", Some("Alpha")),
+            include_for_share("stardew-valley", Some("Alpha"), None),
             Err(ShareError::NoTemplate(_))
         ));
         assert!(matches!(
-            include_for_share("valheim", Some("../Alpha")),
+            include_for_share("valheim", Some("../Alpha"), None),
             Err(ShareError::BadWorld(_))
         ));
         // A folder game with no world named shares whole, like before.
-        assert!(include_for_share("stardew-valley", None)
+        assert!(include_for_share("stardew-valley", None, None)
             .unwrap()
             .is_empty());
+    }
+
+    /// A template game with no world named is refused, with the worlds in the
+    /// save's folder when it is tracked here and none when it is not.
+    #[test]
+    fn a_template_game_with_no_world_is_refused_with_its_worlds() {
+        let dir = tempfile::tempdir().unwrap();
+        let worlds = dir.path().join("worlds_local");
+        std::fs::create_dir_all(&worlds).unwrap();
+        for f in ["Beta.fwl", "Alpha.fwl", "Alpha.db", "Alpha_backup_1.fwl"] {
+            std::fs::write(worlds.join(f), b"").unwrap();
+        }
+
+        let err = include_for_share("valheim", None, Some(dir.path())).unwrap_err();
+        match &err {
+            ShareError::NeedsWorld { worlds } => assert_eq!(worlds, &["Alpha", "Beta"]),
+            other => panic!("unexpected {other:?}"),
+        }
+        let message = err.to_string();
+        assert!(message.contains("Alpha, Beta"), "{message}");
+        assert!(message.contains("pick one"), "{message}");
+
+        match include_for_share("valheim", None, None) {
+            Err(ShareError::NeedsWorld { worlds }) => assert!(worlds.is_empty()),
+            other => panic!("unexpected {other:?}"),
+        }
     }
 }
