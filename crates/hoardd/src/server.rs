@@ -20,8 +20,8 @@ use std::time::Instant;
 use anyhow::{Context, Result};
 use hoard_agent::session::LendError;
 use hoard_core::ipc::{
-    ClientFrame, DaemonStatus, Hello, IpcError, JournalEntry, Payload, Rejected, Reply, Request,
-    ServerFrame, Welcome, PROTOCOL_VERSION,
+    encode_frame, ClientFrame, DaemonStatus, Hello, IpcError, JournalEntry, Payload, Rejected,
+    Reply, Request, ServerFrame, Welcome, PROTOCOL_VERSION,
 };
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::{broadcast, mpsc};
@@ -386,8 +386,12 @@ impl Daemon {
             // The group verbs are plain server calls on the engine's client, and
             // they answer with the server's payload.
             Request::ListGroups => {
-                self.with_client(|c| async move { c.list_groups().await.map(Payload::Groups) })
-                    .await
+                self.with_client(|c| async move {
+                    c.list_groups()
+                        .await
+                        .map(|groups| Payload::Groups { groups })
+                })
+                .await
             }
             Request::CreateGroup { name } => {
                 self.with_client(|c| async move {
@@ -450,9 +454,9 @@ impl Daemon {
             }
             Request::GetLease { save_id } => {
                 self.with_client(|c| async move {
-                    c.get_lease(&save_id)
-                        .await
-                        .map(|l| Payload::Lease(l.map(Box::new)))
+                    c.get_lease(&save_id).await.map(|l| Payload::Lease {
+                        lease: l.map(Box::new),
+                    })
                 })
                 .await
             }
@@ -608,7 +612,9 @@ where
     let writer_task = tokio::spawn(async move {
         while let Some(frame) = out_rx.recv().await {
             if let Err(err) = write_frame(&mut writer, &frame).await {
-                tracing::debug!(error = %format!("{err:#}"), "hoardd: write failed; dropping the client");
+                // Warn, not debug: a writer that dies leaves the reader serving a
+                // client that will never hear back.
+                tracing::warn!(error = %format!("{err:#}"), "hoardd: write failed; dropping the client");
                 return;
             }
         }
@@ -704,10 +710,7 @@ where
             Request::Shutdown => {
                 tracing::info!("hoardd: shutdown requested over IPC");
                 let _ = out
-                    .send(ServerFrame::Reply {
-                        id,
-                        reply: Reply::Ok(Payload::Ack),
-                    })
+                    .send(reply_frame(id, Reply::Ok(Payload::Ack), "shutdown"))
                     .await;
                 daemon.shutdown.notify_one();
                 break;
@@ -728,10 +731,11 @@ where
                     );
                 }
                 let _ = out
-                    .send(ServerFrame::Reply {
+                    .send(reply_frame(
                         id,
-                        reply: Reply::Ok(Payload::Backlog(backlog)),
-                    })
+                        Reply::Ok(Payload::Backlog(backlog)),
+                        "subscribe",
+                    ))
                     .await;
                 if let Some(old) = pusher.replace(tokio::spawn(push_loop(
                     rx,
@@ -745,8 +749,9 @@ where
                 }
             }
             other => {
+                let kind = request_kind(&other);
                 let reply = daemon.dispatch(other).await;
-                if out.send(ServerFrame::Reply { id, reply }).await.is_err() {
+                if out.send(reply_frame(id, reply, &kind)).await.is_err() {
                     break;
                 }
             }
@@ -765,6 +770,50 @@ where
 /// error.
 fn accepts(hello: &Hello) -> bool {
     hello.protocol == PROTOCOL_VERSION
+}
+
+/// The frame answering request `id`, checked before it is queued.
+///
+/// The single writer encodes as it writes, so a reply that cannot be encoded (a
+/// payload serde refuses, a frame over the cap) used to kill the writer while
+/// the read loop kept the connection open, and the client waited out its
+/// timeout. Found here instead, the request gets an `Internal` error and the
+/// connection carries on.
+fn reply_frame(id: u64, reply: Reply, kind: &str) -> ServerFrame {
+    let frame = ServerFrame::Reply { id, reply };
+    match encode_frame(&frame) {
+        Ok(_) => frame,
+        Err(err) => {
+            tracing::warn!(
+                request = kind,
+                error = %err,
+                "hoardd: a reply could not be encoded; answering with an error"
+            );
+            ServerFrame::Reply {
+                id,
+                reply: Reply::Error(IpcError::Internal {
+                    message: format!("the answer to `{kind}` could not be encoded: {err}"),
+                }),
+            }
+        }
+    }
+}
+
+/// A request's wire name (`get_lease`), for the log. Read off the serde tag so
+/// it cannot drift from the contract; nothing else of the request is kept, and
+/// an adopted session's tokens never reach the log.
+fn request_kind(request: &Request) -> String {
+    #[derive(serde::Deserialize)]
+    struct Op {
+        op: String,
+    }
+    encode_frame(request)
+        .ok()
+        .and_then(|bytes| {
+            hoard_core::ipc::decode_frame::<Op>(&bytes[hoard_core::ipc::HEADER_BYTES..]).ok()
+        })
+        .map(|tag| tag.op)
+        .unwrap_or_else(|| "unknown".to_string())
 }
 
 /// Forwards new journal rows to the client. It skips what was already in the
@@ -850,10 +899,11 @@ fn world_refusal(err: &anyhow::Error) -> Option<IpcError> {
 
 #[cfg(test)]
 mod tests {
-    use super::{server_refusal, world_refusal};
+    use super::*;
     use hoard_agent::agent::WorldCommandError;
     use hoard_agent::api::{ApiError, RateLimitKind};
     use hoard_core::ipc::IpcError;
+    use hoard_core::ipc::MAX_FRAME_BYTES;
 
     /// An engine refusal crosses as `Refused` with its code and the save id.
     #[test]
@@ -919,5 +969,47 @@ mod tests {
             }
             other => panic!("unexpected {other:?}"),
         }
+    }
+
+    /// A reply that cannot be encoded is swapped for an `Internal` error on the
+    /// same id, and that error itself encodes: the client hears back instead of
+    /// waiting out its timeout.
+    #[test]
+    fn a_reply_that_cannot_be_encoded_becomes_an_internal_error() {
+        let oversized = Reply::Ok(Payload::Pong {
+            daemon_version: "x".repeat(MAX_FRAME_BYTES + 1),
+            pid: 1,
+        });
+        let frame = reply_frame(9, oversized, "ping");
+        let ServerFrame::Reply {
+            id,
+            reply: Reply::Error(IpcError::Internal { message }),
+        } = &frame
+        else {
+            panic!("not swapped for an error: the reply went out as it was");
+        };
+        assert_eq!(*id, 9);
+        assert!(message.contains("`ping`"), "{message}");
+        encode_frame(&frame).expect("the error must encode");
+
+        // And a reply that encodes goes out untouched.
+        let fine = reply_frame(10, Reply::Ok(Payload::Ack), "ping");
+        assert!(matches!(
+            fine,
+            ServerFrame::Reply {
+                id: 10,
+                reply: Reply::Ok(Payload::Ack)
+            }
+        ));
+    }
+
+    #[test]
+    fn a_request_is_logged_by_its_wire_name() {
+        assert_eq!(
+            request_kind(&Request::GetLease {
+                save_id: "w1".into()
+            }),
+            "get_lease"
+        );
     }
 }
