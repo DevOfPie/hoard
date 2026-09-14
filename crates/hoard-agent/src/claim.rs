@@ -671,26 +671,29 @@ pub(crate) fn on_write(
     }
 }
 
-/// [`on_write`] for a hit at `path`: only a write to the shared world is
-/// evidence of playing it (HRD-D-0019). A character or another world written
-/// during the session claims nothing. A hit that names no file under the
-/// folder is taken as a write, as before, and so is a directory the world can
-/// reach into.
+/// [`on_write`] for a watcher hit on `paths`, the files it saw change
+/// ([`crate::agent::FsHit`]): only a write to the shared world is evidence of
+/// playing it (HRD-D-0019). A character or another world written during the
+/// session claims nothing. A hit with no path, or one that names no file under
+/// the folder, is taken as a write, as before, and so is anything but a file
+/// the world can reach into (a directory, or a path already gone).
 pub(crate) fn on_write_at(
     slot: &mut SaveSlot,
-    path: &Path,
+    paths: &[PathBuf],
     events_tx: &mpsc::Sender<AgentEvent>,
     lease: Option<&LeaseHandle>,
 ) {
-    let rel = path
-        .strip_prefix(&slot.save.local_path)
-        .map(|r| r.to_string_lossy().replace('\\', "/"))
-        .unwrap_or_default();
     let world = slot.save.world();
-    let in_world = rel.is_empty()
-        || hoard_core::kernel::fileclass::included(world, &rel)
-        || (path.is_dir() && hoard_core::kernel::fileclass::reaches_beneath(world, &rel));
-    if in_world {
+    let touches_world = |path: &Path| {
+        let rel = path
+            .strip_prefix(&slot.save.local_path)
+            .map(|r| r.to_string_lossy().replace('\\', "/"))
+            .unwrap_or_default();
+        rel.is_empty()
+            || hoard_core::kernel::fileclass::included(world, &rel)
+            || (!path.is_file() && hoard_core::kernel::fileclass::reaches_beneath(world, &rel))
+    };
+    if paths.is_empty() || paths.iter().any(|p| touches_world(p)) {
         on_write(slot, events_tx, lease);
     }
 }
@@ -2350,30 +2353,49 @@ mod tests {
     }
 
     /// A write to a character during a session on the owner's world is not
-    /// evidence of playing it: no lease is asked for. A write to the world is.
+    /// evidence of playing it: no lease is asked for. A write to the world is,
+    /// and so is a hit that names only the folder, or no path at all. Every hit
+    /// goes in the shape the watcher sends it (`agent::fs_hit`).
     #[tokio::test(start_paused = true)]
     async fn a_write_outside_the_world_claims_nothing() {
+        use notify_debouncer_mini::{DebouncedEvent, DebouncedEventKind};
         let (tx, mut rx) = mpsc::channel(8);
         let (lease, mut seen) = LeaseHandle::probe();
         let tmp = tempfile::tempdir().unwrap();
         let folder = owner_folder(tmp.path());
-        let mut s = slots(vec![owned_world(&folder)]);
-        s.get_mut("w1").unwrap().lease = LeaseObs::Free;
-        on_game_started(&mut s, "w1", Instant::now(), &tx);
-        drain(&mut rx);
+        let hit = |paths: &[PathBuf]| {
+            let events: Vec<DebouncedEvent> = paths
+                .iter()
+                .map(|p| DebouncedEvent {
+                    path: p.clone(),
+                    kind: DebouncedEventKind::Any,
+                })
+                .collect();
+            crate::agent::fs_hit(&folder, None, &events)
+                .expect("a hit under the folder")
+                .paths
+        };
+        let session = |rx: &mut mpsc::Receiver<AgentEvent>| {
+            let mut s = slots(vec![owned_world(&folder)]);
+            s.get_mut("w1").unwrap().lease = LeaseObs::Free;
+            on_game_started(&mut s, "w1", Instant::now(), &tx);
+            drain(rx);
+            s
+        };
+        assert!(crate::agent::fs_hit(&folder, None, &[]).is_none());
+
+        let mut s = session(&mut rx);
         let slot = s.get_mut("w1").unwrap();
+        let character = folder.join("characters_local/me.fch");
+        let beta = folder.join("worlds_local/Beta.db");
         on_write_at(
             slot,
-            &folder.join("characters_local/me.fch"),
+            &hit(std::slice::from_ref(&character)),
             &tx,
             Some(&lease),
         );
-        on_write_at(
-            slot,
-            &folder.join("worlds_local/Beta.db"),
-            &tx,
-            Some(&lease),
-        );
+        on_write_at(slot, &hit(std::slice::from_ref(&beta)), &tx, Some(&lease));
+        on_write_at(slot, &hit(&[character, beta.clone()]), &tx, Some(&lease));
         tokio::task::yield_now().await;
         assert!(
             seen.try_recv().is_err(),
@@ -2382,14 +2404,31 @@ mod tests {
         assert!(!slot.session.as_ref().unwrap().claimed);
         assert!(drain(&mut rx).is_empty());
 
+        // One world file in the batch is enough.
         on_write_at(
             slot,
-            &folder.join("worlds_local/Alpha.db"),
+            &hit(&[beta, folder.join("worlds_local/Alpha.db")]),
             &tx,
             Some(&lease),
         );
         tokio::task::yield_now().await;
         assert_eq!(seen.try_recv().unwrap(), "acquire w1");
+        assert!(slot.session.as_ref().unwrap().claimed);
+
+        // A hit on the folder alone, an event with no path, and a directory
+        // the world reaches into cannot rule the world out: each claims.
+        for paths in [
+            vec![folder.clone()],
+            vec![PathBuf::new()],
+            vec![folder.join("worlds_local")],
+        ] {
+            let mut s = session(&mut rx);
+            let slot = s.get_mut("w1").unwrap();
+            on_write_at(slot, &hit(&paths), &tx, Some(&lease));
+            tokio::task::yield_now().await;
+            assert_eq!(seen.try_recv().unwrap(), "acquire w1", "{paths:?}");
+            assert!(slot.session.as_ref().unwrap().claimed, "{paths:?}");
+        }
     }
 
     /// Behind the head with only the owner's files outside the world pending:

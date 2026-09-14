@@ -1067,6 +1067,13 @@ pub(crate) struct SaveSlot {
     /// subdirectory does not move the folder's own mtime), by the hourly sweep
     /// (`SweepAll`) and by a manual backup (`BackupNow`). Cleared after sampling.
     needs_l1: bool,
+    /// The shared world's fingerprint as last sampled by L1, handed to the reducer
+    /// on the ticks that do not re-hash. The owner's lease exemption reads it
+    /// (HRD-D-0019): without it a push held by the floor, a backoff or a lock
+    /// would hold for the lease on the next tick although the world never moved.
+    /// A watcher hit under the folder drops it ([`mark_fs_hit`]), and so does an
+    /// empty folder or a walk that failed.
+    observed_world_fingerprint: Option<u64>,
     /// The user asked for this copy by hand (`BackupNow`) and it has not gone out
     /// yet. The backup's launch consumes it to label the version deliberate, which
     /// is what protects it from a burst of automatic copies pushing it out of the
@@ -1670,17 +1677,26 @@ fn observe_slot(slot: &mut SaveSlot, cloud: &CloudHeads) -> kernel::Observation 
     slot.last_l0_mtime = folder_mtime;
     let compute_l1 = !slot.save.track_only && !local_empty && (l0_changed || slot.needs_l1);
     slot.needs_l1 = false;
-    let (local_fingerprint, world_fingerprint) = if compute_l1 {
-        observe_local_fingerprint(
+    let local_fingerprint = if compute_l1 {
+        let (whole, world) = observe_local_fingerprint(
             &slot.save.local_path,
             &slot.save.game_slug,
             &slot.save.include,
             slot.save.world(),
         )
-        .unzip()
+        .unzip();
+        slot.observed_world_fingerprint = world;
+        whole
     } else {
-        (None, None)
+        if slot.save.track_only || local_empty {
+            slot.observed_world_fingerprint = None;
+        }
+        None
     };
+    // Unlike the whole walk's, the world's fingerprint stands until a watcher hit
+    // drops it: the lease exemption reads it, and it must not lapse on a tick
+    // that held for something else (HRD-D-0019).
+    let world_fingerprint = slot.observed_world_fingerprint;
     kernel::Observation {
         folder_mtime,
         folder_size: None,
@@ -2216,7 +2232,7 @@ async fn run_agent(
     // Channel used by every fs watcher: debounced events all funnel here
     // and we route them by path. mpsc::unbounded would be fine since the
     // debouncer already throttles, but we cap at 256 to be defensive.
-    let (fs_tx, mut fs_rx) = mpsc::channel::<PathBuf>(256);
+    let (fs_tx, mut fs_rx) = mpsc::channel::<FsHit>(256);
 
     // Backup tasks signal completion (committed / no-op / conflict-settled) so
     // the agent loop can feed it into the reductor as an `OpResult`. Cap matches
@@ -2821,9 +2837,9 @@ async fn run_agent(
             }
 
             // ----- Filesystem debounce hits -----
-            Some(path) = fs_rx.recv() => {
+            Some(hit) = fs_rx.recv() => {
                 // A side copy's own renames are not writes (`claim::hit_is_side_copy`).
-                let save_id = match_save_for_path(&slots, &path).filter(|id| {
+                let save_id = match_save_for_path(&slots, &hit.root).filter(|id| {
                     !slots
                         .get(id)
                         .is_some_and(|s| crate::claim::hit_is_side_copy(s, TokioInstant::now()))
@@ -2850,12 +2866,10 @@ async fn run_agent(
                         // would not see it. The reducer decides; this only brings a
                         // tick forward. The min-interval floor is no longer computed
                         // here: it lives in the reducer (`next_backup_at`).
-                        slot.has_pending = true;
-                        slot.last_fs_event_at = Some(now);
-                        slot.needs_l1 = true;
+                        mark_fs_hit(slot, now);
                         // A write during a session on a shared world is evidence
                         // of who plays it (`claim.rs`).
-                        crate::claim::on_write_at(slot, &path, &events_tx, lease_task.as_ref());
+                        crate::claim::on_write_at(slot, &hit.paths, &events_tx, lease_task.as_ref());
                         // The anti-starvation cap. Every fs event restarts the
                         // debounce, so a game writing every second would never settle
                         // ("it all stayed queued"). This anchors the oldest change
@@ -2885,7 +2899,8 @@ async fn run_agent(
                     }
                     tracing::info!(
                         save_id = %save_id,
-                        path = %path.display(),
+                        path = %hit.root.display(),
+                        changed = hit.paths.len(),
                         delay_ms = delay.as_millis() as u64,
                         "agent: fs event observed; nudging reconcile after debounce"
                     );
@@ -2917,7 +2932,7 @@ async fn run_agent(
                         let dir = slots
                             .get(&save_id)
                             .map(|s| s.save.local_path.clone())
-                            .unwrap_or_else(|| path.clone());
+                            .unwrap_or_else(|| hit.root.clone());
                         corr_store.record(&dir, &games);
                         if let Some(p) = &corr_path {
                             if let Err(e) = corr_store.save(p) {
@@ -3160,7 +3175,7 @@ pub(crate) fn after_pull_landed(slot: &mut SaveSlot, fingerprint: Option<u64>) {
 fn handle_add(
     slots: &mut HashMap<String, SaveSlot>,
     save: WatchedSave,
-    fs_tx: &mpsc::Sender<PathBuf>,
+    fs_tx: &mpsc::Sender<FsHit>,
 ) {
     let save_id = save.save_id.clone();
     let known_version = save.known_version;
@@ -3199,6 +3214,7 @@ fn handle_add(
         recheck_pending_after_pull: false,
         last_l0_mtime: None,
         needs_l1: false,
+        observed_world_fingerprint: None,
         pending_op_result: None,
         pending_upload_landed: None,
         last_restore_error: None,
@@ -4311,7 +4327,7 @@ async fn files_have_equal_bytes(a: &Path, b: &Path) -> Result<bool> {
 /// an inotify error logs and leaves `slot.watcher == None` so the agent
 /// keeps running for the other slots. Re-arming later is fine, since we just
 /// overwrite the field.
-fn arm_watcher(slot: &mut SaveSlot, fs_tx: &mpsc::Sender<PathBuf>) {
+fn arm_watcher(slot: &mut SaveSlot, fs_tx: &mpsc::Sender<FsHit>) {
     let path = slot.save.local_path.clone();
     if !path.is_dir() && !path.is_file() {
         tracing::info!(
@@ -4343,9 +4359,51 @@ fn arm_watcher(slot: &mut SaveSlot, fs_tx: &mpsc::Sender<PathBuf>) {
     }
 }
 
+/// One settled batch from a save's watcher: the save's path, which is what
+/// matches the hit to its slot, and the paths the debouncer saw change under it,
+/// which is what tells a write to the shared world from any other (HRD-D-0019).
+#[derive(Debug)]
+pub(crate) struct FsHit {
+    pub(crate) root: PathBuf,
+    pub(crate) paths: Vec<PathBuf>,
+}
+
+/// Turns a debounced batch into the hit the loop receives, or `None` when
+/// nothing in it concerns the save. An event with no path stands for the save's
+/// own path, which claims as a write to the world.
+pub(crate) fn fs_hit(
+    watch_root: &Path,
+    want_name: Option<&std::ffi::OsStr>,
+    events: &[notify_debouncer_mini::DebouncedEvent],
+) -> Option<FsHit> {
+    // With a single file we watch its folder, so the neighbours' events have to
+    // be discarded: otherwise any other save in the same folder would wake this
+    // one.
+    let mut paths: Vec<PathBuf> = events
+        .iter()
+        .filter(|e| want_name.is_none_or(|name| e.path.file_name() == Some(name)))
+        .map(|e| {
+            if e.path.as_os_str().is_empty() {
+                watch_root.to_path_buf()
+            } else {
+                e.path.clone()
+            }
+        })
+        .collect();
+    if paths.is_empty() {
+        return None;
+    }
+    paths.sort();
+    paths.dedup();
+    Some(FsHit {
+        root: watch_root.to_path_buf(),
+        paths,
+    })
+}
+
 fn build_watcher(
     path: &Path,
-    fs_tx: mpsc::Sender<PathBuf>,
+    fs_tx: mpsc::Sender<FsHit>,
 ) -> Result<Debouncer<notify::RecommendedWatcher>> {
     // A single-file save: the PARENT DIRECTORY is watched and filtered by name.
     // Watching the inode directly is no use with games that save the safe way, writing
@@ -4371,15 +4429,8 @@ fn build_watcher(
         Duration::from_secs(2),
         move |res: DebounceEventResult| {
             if let Ok(events) = res {
-                // With a single file we watch its folder, so the neighbours' events
-                // have to be discarded: otherwise any other save in the same folder
-                // would wake this one.
-                let relevant = match &want_name {
-                    Some(name) => events.iter().any(|e| e.path.file_name() == Some(name)),
-                    None => !events.is_empty(),
-                };
-                if relevant {
-                    let _ = fs_tx.try_send(watch_root.clone());
+                if let Some(hit) = fs_hit(&watch_root, want_name.as_deref(), &events) {
+                    let _ = fs_tx.try_send(hit);
                 }
             }
         },
@@ -4391,6 +4442,16 @@ fn build_watcher(
     };
     debouncer.watcher().watch(&watch_target, mode)?;
     Ok(debouncer)
+}
+
+/// What a watcher hit marks on its slot: pending, the event's time, a fresh L1
+/// on the next tick, and the world's fingerprint dropped, since the write may
+/// have moved it.
+fn mark_fs_hit(slot: &mut SaveSlot, now: OffsetDateTime) {
+    slot.has_pending = true;
+    slot.last_fs_event_at = Some(now);
+    slot.needs_l1 = true;
+    slot.observed_world_fingerprint = None;
 }
 
 /// Find which save a path event belongs to. The fs watcher emits the root
@@ -6335,6 +6396,7 @@ pub(crate) fn test_slot(save: WatchedSave) -> SaveSlot {
         recheck_pending_after_pull: false,
         last_l0_mtime: None,
         needs_l1: false,
+        observed_world_fingerprint: None,
         manual_requested: false,
         pending_op_result: None,
         pending_upload_landed: None,
@@ -7322,7 +7384,7 @@ mod tests {
     async fn an_adopted_shared_world_does_not_veto_its_first_pull() {
         let adopted_dir = tempfile::tempdir().expect("create tempdir");
         let synced_dir = tempfile::tempdir().expect("create tempdir");
-        let (fs_tx, _fs_rx) = mpsc::channel::<PathBuf>(8);
+        let (fs_tx, _fs_rx) = mpsc::channel::<FsHit>(8);
         let mut slots = HashMap::new();
         let mut adopted = shared_world("adopted", adopted_dir.path());
         adopted.known_version = None;
@@ -7761,6 +7823,79 @@ mod tests {
         let mut narrowed = test_slot(owner_save(dir.path()));
         narrowed.save.include = narrowed.save.world().to_vec();
         assert!(!state_from_slot(&narrowed, &AgentConfig::default(), now).owner);
+    }
+
+    /// HRD-D-0019: an owner's character-only change that the floor holds still
+    /// goes up without the lease on a later tick that does not re-hash, since the
+    /// world's fingerprint stands until a watcher hit drops it. A world write in
+    /// between holds for the lease. The floor is the `data_saver` preset's.
+    #[test]
+    fn an_owners_held_push_keeps_the_world_fingerprint_until_a_hit() {
+        use kernel::reconcile::{HOLD_BACKUP_MIN_INTERVAL, HOLD_LEASE_NEEDED};
+        use kernel::{Action, Decision};
+
+        fn tick(slot: &mut SaveSlot, now: OffsetDateTime) -> (kernel::Observation, Vec<Decision>) {
+            let obs = observe_slot(slot, &CloudHeads::new(now));
+            let state = state_from_slot(slot, &AgentConfig::default(), now);
+            let (next, ds) =
+                kernel::reconcile::reconcile(&state, &obs, kernel::World { now, seed: 0 });
+            apply_state_to_slot(slot, next);
+            (obs, ds)
+        }
+
+        // Synced, then a character written while the floor is still closed.
+        fn held(root: &Path, t0: OffsetDateTime) -> SaveSlot {
+            write_file(&root.join("worlds_local/Alpha.db"), b"alpha");
+            write_file(&root.join("characters_local/Me.fch"), b"me");
+            let mut save = owner_save(root);
+            save.policy =
+                crate::presets::SavePolicy::from_preset(Some(crate::presets::PRESET_DATA_SAVER));
+            let mut slot = test_slot(save);
+            slot.lease = kernel::LeaseObs::Free;
+            test_sync_now(&mut slot);
+            slot.last_backup_at = Some(t0 - time::Duration::seconds(60));
+            let (_, ds) = tick(&mut slot, t0);
+            assert!(!ds.contains(&Decision::Act(Action::Backup)), "{ds:?}");
+
+            write_file(&root.join("characters_local/Me.fch"), b"me, levelled up");
+            mark_fs_hit(&mut slot, t0);
+            assert_eq!(slot.observed_world_fingerprint, None);
+            let (obs, ds) = tick(&mut slot, t0 + time::Duration::seconds(1));
+            assert!(obs.local_fingerprint.is_some() && obs.world_fingerprint.is_some());
+            assert_eq!(
+                ds,
+                vec![Decision::Hold {
+                    reason: HOLD_BACKUP_MIN_INTERVAL
+                }],
+                "past the lease, held by the floor"
+            );
+            slot
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let t0 = OffsetDateTime::now_utc();
+        let after_floor = t0 + time::Duration::seconds(600);
+
+        let mut slot = held(root, t0);
+        let world = slot.observed_world_fingerprint;
+        let (obs, ds) = tick(&mut slot, after_floor);
+        assert_eq!(obs.local_fingerprint, None, "this tick does not re-hash");
+        assert_eq!(obs.world_fingerprint, world);
+        assert_eq!(ds, vec![Decision::Act(Action::Backup)]);
+
+        let mut slot = held(root, t0);
+        write_file(&root.join("worlds_local/Alpha.db"), b"alpha, changed");
+        mark_fs_hit(&mut slot, t0 + time::Duration::seconds(2));
+        assert_eq!(slot.observed_world_fingerprint, None);
+        let (obs, ds) = tick(&mut slot, after_floor);
+        assert!(obs.world_fingerprint.is_some());
+        assert_eq!(
+            ds,
+            vec![Decision::Hold {
+                reason: HOLD_LEASE_NEEDED
+            }]
+        );
     }
 
     const LEASE_REQUIRED: &str = r#"{"error":"a shared save is pushed by its host: acquire the lease first","code":"lease_required"}"#;
