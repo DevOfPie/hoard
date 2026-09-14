@@ -253,6 +253,9 @@ pub enum Verdict {
     },
     /// Nothing settled before the deadline.
     Undecided,
+    /// Nothing settled, and the engine says the world is behind the head: the
+    /// acquire was refused as stale and a pull runs first.
+    Behind,
 }
 
 /// Reads the looks of one wait in order. `Mine` settles it at once. `Other`
@@ -302,13 +305,22 @@ async fn wait_for_verdict(client: &mut Client, save_id: &str) -> Verdict {
     let my_fp = this_device();
     let me = this_account();
     let mut wait = Wait::default();
+    let behind = std::cell::Cell::new(false);
     let polls = async {
         loop {
             tokio::time::sleep(POLL_EVERY).await;
             // The engine's word on whose lease it is, when it has one; the
             // server's row for who holds it and whether they pushed.
             let engine = match link::ask(client, Request::Status).await {
-                Ok(Payload::Status(status)) => Hosts::from_status(&status).lease(save_id),
+                Ok(Payload::Status(status)) => {
+                    behind.set(
+                        status
+                            .slots
+                            .iter()
+                            .any(|s| s.save_id == save_id && s.lease_behind),
+                    );
+                    Hosts::from_status(&status).lease(save_id)
+                }
                 _ => None,
             };
             let seen = match lease(client, save_id).await {
@@ -323,9 +335,11 @@ async fn wait_for_verdict(client: &mut Client, save_id: &str) -> Verdict {
             }
         }
     };
-    tokio::time::timeout(VERDICT_WAIT, polls)
-        .await
-        .unwrap_or(Verdict::Undecided)
+    match tokio::time::timeout(VERDICT_WAIT, polls).await {
+        Ok(verdict) => verdict,
+        Err(_) if behind.get() => Verdict::Behind,
+        Err(_) => Verdict::Undecided,
+    }
 }
 
 /// One lease read as a look: a quiet lease is as good as free, and whose it is
@@ -348,6 +362,12 @@ fn outcome_of(save_id: &str, verdict: Verdict, force: bool) -> Result<Outcome> {
     match verdict {
         Verdict::Hosting => Ok(Outcome::Hosting),
         Verdict::Undecided => Ok(Outcome::Pending),
+        Verdict::Behind => Err(output::err(
+            "stale",
+            format!(
+                "{save_id} is behind the latest version; Hoard is pulling it, then claim again"
+            ),
+        )),
         Verdict::Held {
             holder,
             pushed: true,
@@ -601,6 +621,7 @@ mod tests {
             shared: lease.is_some(),
             lease,
             lease_holder: holder.map(String::from),
+            lease_behind: false,
         };
         let mut status: DaemonStatus = serde_json::from_value(serde_json::json!({
             "daemon_version": "0", "protocol": 1, "pid": 1, "epoch": "e",
@@ -827,5 +848,15 @@ mod tests {
             ),
             Seen::Mine
         ));
+    }
+
+    /// A claim that runs out of time while the engine pulls the head answers
+    /// `stale`, not a success-shaped pending.
+    #[test]
+    fn a_world_behind_the_head_answers_stale() {
+        let err = outcome_of("s-1", Verdict::Behind, false).unwrap_err();
+        let c = output::classify(&err);
+        assert_eq!((c.code.as_ref(), c.exit), ("stale", 1));
+        assert!(err.to_string().contains("behind"), "{err}");
     }
 }

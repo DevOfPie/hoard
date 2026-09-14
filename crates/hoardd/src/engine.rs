@@ -429,6 +429,9 @@ impl Engine {
         };
         let Some(mut running) = running else { return };
         tracing::info!(reason, "hoardd: restarting the engine");
+        // The engine first: the releases below, and the live frames saying so,
+        // are answers to this stop, not lost leases.
+        let _ = tokio::time::timeout(STATUS_TIMEOUT, running.handle.stopping()).await;
         // One last presence beat with the old token, which is still good: it leaves
         // this machine greyed out on the other machines' panel instead of going dark
         // without a word.
@@ -457,6 +460,9 @@ impl Engine {
             guard.running.take()
         };
         let Some(mut running) = running else { return };
+        // The engine first: the releases below, and the live frames saying so,
+        // are answers to this stop, not lost leases.
+        let _ = tokio::time::timeout(STATUS_TIMEOUT, running.handle.stopping()).await;
         // One last presence beat while the token is good: it greys this machine out
         // on the other machines' panel straight away.
         running.presence.closing().await;
