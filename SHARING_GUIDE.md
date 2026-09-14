@@ -205,9 +205,12 @@ hoard world release <SAVE_ID>          # give the lease back
 hoard world lease <SAVE_ID>            # who hosts it right now
 ```
 
-The outcome of a claim shows in `hoard sync logs` and `hoard world lease`.
-`hoard saves` carries a *hosted here* / *hosted by <name>* column for shared
-rows while a lease is live.
+A claim on a save that is not a shared world on this machine is refused on the spot.
+What the server makes of an accepted one shows in `hoard sync logs` and
+`hoard world lease`. `hoard saves` and `hoard status` say who hosts each shared
+row as the sync service last heard it: *hosted here*, *hosted by <name>*,
+*nobody* or *unknown*. With the service stopped the column is left out rather
+than guessed.
 
 ## When things go wrong
 
