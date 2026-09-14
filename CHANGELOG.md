@@ -20,8 +20,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   desktop app and the CLI follow.
 - **A shared save names its files.** Sharing a Valheim world sends only that
   world (`worlds_local/<name>` and its backups), never the characters, and every
-  member's backup, restore and fingerprint honour the same list. A world shared
-  with you appears in `hoard saves` with its group, ready to adopt into a folder.
+  member's backup, restore and fingerprint honour the same list, while the
+  owner's own versions keep the whole folder, so sharing a world never stops
+  their characters and other worlds being backed up. A world shared with you
+  appears in `hoard save list` with its group, ready to adopt into a folder.
 - **The CLI shares saves and hosts worlds.** `hoard group` creates a group,
   lists yours, mints an invite token and joins or leaves with one. `hoard share
   <save_id> --group <group>` moves a save into a group and `hoard unshare` takes

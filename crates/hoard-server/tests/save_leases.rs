@@ -321,6 +321,11 @@ struct Shared {
 }
 
 async fn shared() -> Shared {
+    shared_with(&[]).await
+}
+
+/// [`shared`] with an include list on the share.
+async fn shared_with(include: &[&str]) -> Shared {
     let h = harness().await;
     let a = vec![1u8; 30_000];
     let b = vec![2u8; 10_000];
@@ -374,7 +379,7 @@ async fn shared() -> Shared {
         path(),
         Json(ShareSaveRequest {
             group_id: g.id,
-            include: Vec::new(),
+            include: include.iter().map(|s| s.to_string()).collect(),
         }),
     )
     .await
@@ -802,4 +807,74 @@ async fn lease_and_save_frames_reach_the_owner_and_the_other_member() {
         assert!(!leases[2].live && leases[2].pushed_since);
     }
     assert!(drain(&mut eve_rx).is_empty(), "a stranger hears nothing");
+}
+
+// ---- a list-shaped share (HRD-D-0019)
+
+/// The owner's backup of what the list leaves out goes without the lease and is
+/// no lease news: a save frame, no lease frame, and still nobody hosting.
+#[tokio::test]
+async fn an_owner_backup_past_an_unchanged_world_publishes_no_lease_frame() {
+    let s = shared_with(&["world.db"]).await;
+    let mut owner_rx = s.h.state.events.subscribe(s.h.owner.user_id);
+    let mut member_rx = s.h.state.events.subscribe(s.h.member.user_id);
+
+    let snap = s.push_as(&s.h.owner).await.expect("no lease needed");
+    assert_eq!(snap.version_num, 3);
+    for rx in [&mut owner_rx, &mut member_rx] {
+        let frames = drain(rx);
+        assert!(
+            !frames.iter().any(|f| matches!(f, Frame::Lease(_))),
+            "no lease frame"
+        );
+        assert_eq!(
+            frames
+                .iter()
+                .filter(|f| matches!(f, Frame::Save(_)))
+                .count(),
+            1
+        );
+    }
+    assert!(get_lease(&s.h, &s.h.member).await.unwrap().is_none());
+}
+
+/// Acquire accepts a head that moved only outside the list, and is stale again
+/// once a hosted push changed the world.
+#[tokio::test]
+async fn acquire_is_stale_only_when_the_world_moved() {
+    let s = shared_with(&["world.db"]).await;
+    s.push_as(&s.h.owner).await.expect("owner backup, v3");
+
+    let l = acquire(&s.h, &s.h.member, 2)
+        .await
+        .expect("the world is v2's");
+    assert_eq!(l.base_version, 2);
+    let world = vec![6u8; 30_000];
+    let d = vec![4u8; 5_000];
+    let snap = backup_as(&s.h, &s.h.member, &[("world.db", &world)], Some(2))
+        .await
+        .expect("hosted push on top of the owner's");
+    assert_eq!(snap.version_num, 4);
+    assert_eq!(
+        release(&s.h, &s.h.member).await.unwrap(),
+        StatusCode::NO_CONTENT
+    );
+
+    let fwl: String = sqlx::query_scalar(
+        "SELECT sf.sha256 FROM snapshot_files sf JOIN snapshots s ON s.id = sf.snapshot_id
+         WHERE s.save_id = ? AND s.version_num = 4 AND sf.relative_path = 'world.fwl'",
+    )
+    .bind(SAVE)
+    .fetch_one(&s.h.state.pool)
+    .await
+    .unwrap();
+    assert_eq!(fwl, sha_of(&d), "the owner's file came forward");
+
+    for base in [2, 3] {
+        let (code, body) = acquire(&s.h, &s.h.payer, base).await.expect_err("stale");
+        assert_eq!(code, StatusCode::CONFLICT);
+        assert_eq!(body["code"], "stale");
+        assert_eq!(body["head_version"], 4);
+    }
+    acquire(&s.h, &s.h.payer, 4).await.expect("current");
 }

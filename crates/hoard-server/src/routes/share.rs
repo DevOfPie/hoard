@@ -106,6 +106,237 @@ pub fn first_outside_include<'a>(
         .find(|p| !hoard_core::kernel::fileclass::included(include, p))
 }
 
+// ---- pushes into a shared save (HRD-D-0019)
+//
+// The owner's uploads carry the whole folder; a member's carry the include
+// list. The lease guards only the listed files, so the owner pushes without it
+// while the world is unchanged, and a member's push takes the head's other
+// files forward so every version stays a full folder for the owner.
+
+/// `(relative_path, sha256)` pairs of a manifest or a version.
+pub type Rows = HashSet<(String, String)>;
+
+/// The rows of `version` the include list names. Empty for a version that does
+/// not exist (a save with no head yet).
+pub async fn included_rows(
+    conn: &mut SqliteConnection,
+    save_id: &str,
+    version: i64,
+    include: &[String],
+) -> Result<Rows, sqlx::Error> {
+    let rows: Vec<(String, String)> = sqlx::query_as(
+        "SELECT sf.relative_path, sf.sha256
+           FROM snapshot_files sf
+           JOIN snapshots s ON s.id = sf.snapshot_id
+          WHERE s.save_id = ? AND s.version_num = ?",
+    )
+    .bind(save_id)
+    .bind(version)
+    .fetch_all(conn)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .filter(|(path, _)| hoard_core::kernel::fileclass::included(include, path))
+        .collect())
+}
+
+/// The rows of a manifest the include list names.
+pub fn manifest_included(include: &[String], files: &[(&str, &str)]) -> Rows {
+    files
+        .iter()
+        .filter(|(path, _)| hoard_core::kernel::fileclass::included(include, path))
+        .map(|(path, sha)| (path.to_string(), sha.to_string()))
+        .collect()
+}
+
+/// Did the listed files stay the same from `base` to `head`? Only a non-empty
+/// list can say so: an empty one is the whole save, and any newer head moved
+/// it. A base past the head is not an ancestor and never qualifies.
+pub async fn world_unchanged(
+    conn: &mut SqliteConnection,
+    save_id: &str,
+    include: &[String],
+    base: i64,
+    head: i64,
+) -> Result<bool, sqlx::Error> {
+    if include.is_empty() || base > head {
+        return Ok(base == head);
+    }
+    Ok(included_rows(conn, save_id, base, include).await?
+        == included_rows(conn, save_id, head, include).await?)
+}
+
+/// What [`push_gate`] ruled for one push.
+#[derive(Debug, Default)]
+pub struct PushGate {
+    /// The push went through the lease: record it and announce it.
+    pub hosted: bool,
+    /// A member pushing a list-shaped save: the list, to carry the rest.
+    member_include: Vec<String>,
+}
+
+/// A row of the head a member's push does not carry, taken forward as is.
+pub struct CarriedRow {
+    file_id: String,
+    path: String,
+    size_bytes: i64,
+    sha: String,
+    modified_at: Option<i64>,
+}
+
+impl CarriedRow {
+    pub fn size_bytes(&self) -> i64 {
+        self.size_bytes
+    }
+}
+
+/// The one push gate for a save, called inside the write transaction with the
+/// head it read. `files` is the manifest as `(path, sha)`.
+///
+/// A private save is not gated. On a shared one a member must hold the lease
+/// and push only the include list. The owner may push anything; the lease is
+/// needed unless the list is non-empty and the manifest's listed files equal
+/// the head's, which is a push that cannot bury anybody's world.
+pub async fn push_gate(
+    conn: &mut SqliteConnection,
+    ns: &Namespace,
+    access: &SaveAccess,
+    save_id: &str,
+    user_id: &str,
+    head: i64,
+    files: &[(&str, &str)],
+) -> Result<PushGate, ApiError> {
+    if let Namespace::User(_) = ns {
+        return Ok(PushGate::default());
+    }
+    let include = include_for(&mut *conn, save_id)
+        .await
+        .map_err(|e| internal_logged("include lookup", e))?;
+    if access.role == Role::Member {
+        leases::require_host(&mut *conn, save_id, user_id).await?;
+        if let Some(p) = first_outside_include(&include, files.iter().map(|(p, _)| *p)) {
+            return Err(crate::routes::cas::outside_include(p));
+        }
+        return Ok(PushGate {
+            hosted: true,
+            member_include: include,
+        });
+    }
+    if !include.is_empty() {
+        let head_world = included_rows(conn, save_id, head, &include)
+            .await
+            .map_err(|e| internal_logged("reading the head's world", e))?;
+        if manifest_included(&include, files) == head_world {
+            return Ok(PushGate::default());
+        }
+    }
+    leases::require_host(&mut *conn, save_id, user_id).await?;
+    Ok(PushGate {
+        hosted: true,
+        member_include: Vec::new(),
+    })
+}
+
+impl PushGate {
+    /// May a push based on `base` land on `head`? Always when they match. A
+    /// member of a list-shaped save also when the list's files did not change
+    /// in between: whatever else moved is carried forward, not buried.
+    pub async fn base_accepted(
+        &self,
+        conn: &mut SqliteConnection,
+        save_id: &str,
+        base: i64,
+        head: i64,
+    ) -> Result<bool, ApiError> {
+        if base == head {
+            return Ok(true);
+        }
+        world_unchanged(conn, save_id, &self.member_include, base, head)
+            .await
+            .map_err(|e| internal_logged("comparing the world across versions", e))
+    }
+
+    /// The head's rows the list leaves out, for a member's push to take
+    /// forward. Empty for the owner, a private save, or an unfiltered share.
+    pub async fn carried(
+        &self,
+        conn: &mut SqliteConnection,
+        save_id: &str,
+        head: i64,
+    ) -> Result<Vec<CarriedRow>, sqlx::Error> {
+        if self.member_include.is_empty() {
+            return Ok(Vec::new());
+        }
+        let rows: Vec<(String, String, i64, String, Option<i64>)> = sqlx::query_as(
+            "SELECT sf.id, sf.relative_path, sf.size_bytes, sf.sha256, sf.modified_at
+               FROM snapshot_files sf
+               JOIN snapshots s ON s.id = sf.snapshot_id
+              WHERE s.save_id = ? AND s.version_num = ?",
+        )
+        .bind(save_id)
+        .bind(head)
+        .fetch_all(conn)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .filter(|(_, path, ..)| {
+                !hoard_core::kernel::fileclass::included(&self.member_include, path)
+            })
+            .map(|(file_id, path, size_bytes, sha, modified_at)| CarriedRow {
+                file_id,
+                path,
+                size_bytes,
+                sha,
+                modified_at,
+            })
+            .collect())
+    }
+}
+
+/// Write `rows` into `snapshot_id`: the file rows, the chunk list copied from
+/// the source row when it has one, and one more reference on every blob or
+/// chunk. No bytes move and nothing is charged; the head already holds them.
+pub async fn insert_carried(
+    conn: &mut SqliteConnection,
+    ns: &Namespace,
+    snapshot_id: &str,
+    rows: &[CarriedRow],
+) -> Result<(), sqlx::Error> {
+    for r in rows {
+        let file_id = Uuid::new_v4().to_string();
+        sqlx::query(
+            "INSERT INTO snapshot_files (id, snapshot_id, relative_path, size_bytes, sha256, modified_at)
+             VALUES (?,?,?,?,?,?)",
+        )
+        .bind(&file_id)
+        .bind(snapshot_id)
+        .bind(&r.path)
+        .bind(r.size_bytes)
+        .bind(&r.sha)
+        .bind(r.modified_at)
+        .execute(&mut *conn)
+        .await?;
+        let chunks = namespace::chunk_list(&mut *conn, ns, &r.file_id).await?;
+        if chunks.is_empty() {
+            namespace::blob_incref(&mut *conn, ns, &r.sha, r.size_bytes, 1).await?;
+            continue;
+        }
+        for (ordinal, (csha, csize)) in chunks.iter().enumerate() {
+            sqlx::query(
+                "INSERT INTO snapshot_file_chunks (snapshot_file_id, ordinal, chunk_sha256)
+                 VALUES (?,?,?)",
+            )
+            .bind(&file_id)
+            .bind(ordinal as i64)
+            .bind(csha)
+            .execute(&mut *conn)
+            .await?;
+            namespace::chunk_incref(&mut *conn, ns, csha, *csize, 1).await?;
+        }
+    }
+    Ok(())
+}
+
 // ---- POST /v1/saves/:save_id/share
 
 /// The caller must own the save and belong to the group (as its owner or a
@@ -624,4 +855,81 @@ pub async fn take_back_owned(
         ended.extend(take_back(pool, store, actor_id, save_id).await?);
     }
     Ok(ended)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
+    use std::str::FromStr;
+
+    async fn mem_pool() -> SqlitePool {
+        let opts = SqliteConnectOptions::from_str("sqlite::memory:")
+            .unwrap()
+            .pragma("foreign_keys", "ON");
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(opts)
+            .await
+            .unwrap();
+        sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+        pool
+    }
+
+    fn list(patterns: &[&str]) -> Vec<String> {
+        patterns.iter().map(|s| s.to_string()).collect()
+    }
+
+    fn row(path: &str, sha: &str) -> (String, String) {
+        (path.to_string(), sha.to_string())
+    }
+
+    /// A save with no head names nothing; a version's rows outside the list
+    /// are left out, and a manifest is filtered the same way.
+    #[tokio::test]
+    async fn included_rows_keep_only_the_world_and_an_empty_head_is_empty() {
+        let pool = mem_pool().await;
+        for sql in [
+            "INSERT INTO users (id, username, password_hash) VALUES ('u1','user','x')",
+            "INSERT INTO games (slug, display_name) VALUES ('g','G')",
+            "INSERT INTO saves (id, user_id, game_slug, label, latest_version_num) VALUES ('sv','u1','g','default',1)",
+            "INSERT INTO snapshots (id, save_id, version_num, total_size_bytes, file_count) VALUES ('s1','sv',1,3,3)",
+            "INSERT INTO snapshot_files (id, snapshot_id, relative_path, size_bytes, sha256) VALUES ('f1','s1','characters_local/x.fch',1,'c')",
+            "INSERT INTO snapshot_files (id, snapshot_id, relative_path, size_bytes, sha256) VALUES ('f2','s1','worlds_local/Alpha.db',1,'a')",
+            "INSERT INTO snapshot_files (id, snapshot_id, relative_path, size_bytes, sha256) VALUES ('f3','s1','worlds_local/Beta.db',1,'b')",
+        ] {
+            sqlx::query(sql).execute(&pool).await.unwrap();
+        }
+        let include = list(&["worlds_local/Alpha.db", "worlds_local/Alpha_backup_*"]);
+        let mut conn = pool.acquire().await.unwrap();
+
+        assert!(included_rows(&mut conn, "sv", 0, &include)
+            .await
+            .unwrap()
+            .is_empty());
+        let head = included_rows(&mut conn, "sv", 1, &include).await.unwrap();
+        assert_eq!(head, Rows::from([row("worlds_local/Alpha.db", "a")]));
+        assert_eq!(
+            included_rows(&mut conn, "sv", 1, &[]).await.unwrap().len(),
+            3,
+            "an empty list is the whole version"
+        );
+
+        let manifest = manifest_included(
+            &include,
+            &[
+                ("characters_local/x.fch", "c2"),
+                ("worlds_local/Alpha.db", "a"),
+                ("worlds_local/Beta.db", "b2"),
+            ],
+        );
+        assert_eq!(manifest, head, "only the world is compared");
+        assert!(manifest_included(&include, &[("worlds_local/Beta.db", "b")]).is_empty());
+
+        assert!(!world_unchanged(&mut conn, "sv", &include, 0, 1)
+            .await
+            .unwrap());
+        assert!(!world_unchanged(&mut conn, "sv", &[], 0, 1).await.unwrap());
+        assert!(world_unchanged(&mut conn, "sv", &[], 1, 1).await.unwrap());
+    }
 }

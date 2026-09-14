@@ -458,6 +458,9 @@ impl SaveRow {
         let Some(mut save) = self.into_wire() else {
             return Ok(None);
         };
+        if let Some(shared) = save.shared.as_mut() {
+            shared.caller_owns = is_owner;
+        }
         let include = match &save.shared {
             Some(shared) if !is_owner && !shared.include.is_empty() => &shared.include,
             _ => return Ok(Some(save)),
@@ -499,6 +502,8 @@ impl SaveRow {
                     owner_user_id,
                     owner_username: repair_username(&owner),
                     include,
+                    // Set for the caller by `into_visible`.
+                    caller_owns: false,
                 })
             }
             _ => None,

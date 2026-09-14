@@ -236,6 +236,14 @@ fn unique_shas(files: &[CasFile]) -> Vec<(String, i64)> {
     out
 }
 
+/// The manifest as `(path, sha)`, the shape the push gate compares.
+fn manifest_rows(files: &[CasFile]) -> Vec<(&str, &str)> {
+    files
+        .iter()
+        .map(|f| (f.relative_path.as_str(), f.sha256.as_str()))
+        .collect()
+}
+
 /// Checks that apply to both init and commit: a non-empty manifest, within the
 /// file cap, with safe paths.
 fn validate_manifest(files: &[CasFile]) -> Result<(), ApiError> {
@@ -321,22 +329,18 @@ pub async fn init(
         .fetch_one(&mut *tx)
         .await
         .map_err(|e| internal_logged("reading the save's latest version", e))?;
-    // A shared save is pushed by its host alone, the owner included. Before
-    // the superset exception below, which it must not be able to bypass.
-    if let Namespace::Group(_) = ns {
-        crate::routes::leases::require_host(&mut *tx, &save_id, &user_id).await?;
-        // And only the world's own files: the list every member filters with is
-        // enforced here so a row that lost it cannot push the rest of a folder.
-        let include = crate::routes::share::include_for(&mut *tx, &save_id)
-            .await
-            .map_err(|e| internal_logged("include lookup", e))?;
-        if let Some(p) = crate::routes::share::first_outside_include(
-            &include,
-            body.files.iter().map(|f| f.relative_path.as_str()),
-        ) {
-            return Err(outside_include(p));
-        }
-    }
+    // A shared save's lease and include list (`share::push_gate`). Before the
+    // superset exception below, which it must not be able to bypass.
+    let gate = crate::routes::share::push_gate(
+        &mut tx,
+        &ns,
+        &access,
+        &save_id,
+        &user_id,
+        head,
+        &manifest_rows(&body.files),
+    )
+    .await?;
     if let Some(base) = body.base_version {
         // A base that does not match the head is rejected so a push cannot bury
         // a version it never saw. But a manifest that brings that version
@@ -347,7 +351,9 @@ pub async fn init(
         // do it themselves. Reading the head out of a 409 body is from aug-2026,
         // and before that a rejection left them knowing they had diverged but not
         // from what.
-        if base != head && !manifest_covers_head(&mut tx, &save_id, head, &body.files).await? {
+        if !gate.base_accepted(&mut tx, &save_id, base, head).await?
+            && !manifest_covers_head(&mut tx, &save_id, head, &body.files).await?
+        {
             return Err(non_fast_forward(&save_id, head, base));
         }
         if base != head {
@@ -1038,31 +1044,34 @@ pub async fn commit(
     // The init already looked, but minutes can pass between init and commit and
     // another machine may have pushed, or the lease may have moved. These are
     // the checks that count.
-    if let Namespace::Group(_) = ns {
-        if let Err(e) = crate::routes::leases::require_host(&mut *tx, &save_id, &user_id).await {
+    let gate = match crate::routes::share::push_gate(
+        &mut tx,
+        &ns,
+        &access,
+        &save_id,
+        &user_id,
+        head,
+        &manifest_rows(&body.files),
+    )
+    .await
+    {
+        Ok(g) => g,
+        Err(e) => {
             rollback(&placed);
             cleanup_staging();
             return Err(e);
         }
-        let include = match crate::routes::share::include_for(&mut *tx, &save_id).await {
-            Ok(v) => v,
+    };
+    if let Some(base) = body.base_version {
+        let accepted = match gate.base_accepted(&mut tx, &save_id, base, head).await {
+            Ok(a) => a,
             Err(e) => {
                 rollback(&placed);
                 cleanup_staging();
-                return Err(internal_logged("include lookup", e));
+                return Err(e);
             }
         };
-        if let Some(p) = crate::routes::share::first_outside_include(
-            &include,
-            body.files.iter().map(|f| f.relative_path.as_str()),
-        ) {
-            rollback(&placed);
-            cleanup_staging();
-            return Err(outside_include(p));
-        }
-    }
-    if let Some(base) = body.base_version {
-        if base != head {
+        if !accepted {
             rollback(&placed);
             cleanup_staging();
             return Err(non_fast_forward(&save_id, head, base));
@@ -1070,9 +1079,21 @@ pub async fn commit(
     }
     let new_version = head + 1;
     let parent_version: Option<i64> = (head > 0).then_some(head);
-    let file_count = body.files.len() as i64;
 
     let fail = |e: sqlx::Error, step: &'static str| internal_logged(step, e);
+
+    // A member's push names the world only; the head's other files come
+    // forward so the version stays whole for the owner (HRD-D-0019).
+    let carried = gate.carried(&mut tx, &save_id, head).await.map_err(|e| {
+        rollback(&placed);
+        cleanup_staging();
+        fail(e, "reading the head's other files")
+    })?;
+    // What the caller pushed, which is what the response describes; the row
+    // holds the whole version.
+    let pushed_count = body.files.len() as i64;
+    let file_count = pushed_count + carried.len() as i64;
+    let stored_size = total_size + carried.iter().map(|r| r.size_bytes()).sum::<i64>();
 
     sqlx::query(
         "INSERT INTO snapshots (id, save_id, version_num, device_name, notes,
@@ -1084,7 +1105,7 @@ pub async fn commit(
     .bind(new_version)
     .bind(&body.device_name)
     .bind(&body.notes)
-    .bind(total_size)
+    .bind(stored_size)
     .bind(file_count)
     .bind(parent_version)
     .execute(&mut *tx)
@@ -1171,6 +1192,13 @@ pub async fn commit(
                 })?;
         }
     }
+    crate::routes::share::insert_carried(&mut tx, &ns, &snapshot_id, &carried)
+        .await
+        .map_err(|e| {
+            rollback(&placed);
+            cleanup_staging();
+            fail(e, "carrying the head's other files forward")
+        })?;
 
     sqlx::query("UPDATE saves SET latest_version_num=? WHERE id=?")
         .bind(new_version)
@@ -1188,7 +1216,7 @@ pub async fn commit(
         cleanup_staging();
         fail(e, "updating storage accounting")
     })?;
-    if let Namespace::Group(_) = ns {
+    if gate.hosted {
         crate::routes::leases::mark_pushed(&mut *tx, &save_id, &user_id)
             .await
             .map_err(|e| {
@@ -1202,8 +1230,9 @@ pub async fn commit(
         "save_id": save_id,
         "version_num": new_version,
         "files": file_count,
-        "bytes": total_size,
+        "bytes": stored_size,
         "new_bytes": new_bytes,
+        "carried_files": carried.len(),
         "transport": "cas",
     })
     .to_string();
@@ -1270,7 +1299,9 @@ pub async fn commit(
     {
         warn!(error = %e, save_id = %save_id, "save event: recipients not resolved");
     }
-    if let Namespace::Group(_) = ns {
+    // Only a push that went through the lease is the host's news; the owner's
+    // push past an unchanged world leaves the lease as it was.
+    if gate.hosted {
         crate::routes::leases::announce_push(&state, &save_id, &user_id).await;
     }
 
@@ -1295,7 +1326,7 @@ pub async fn commit(
             device_name: body.device_name,
             notes: body.notes,
             total_size_bytes: total_size,
-            file_count,
+            file_count: pushed_count,
             is_pinned: false,
             deleted_at: None,
             created_at: time::OffsetDateTime::now_utc(),

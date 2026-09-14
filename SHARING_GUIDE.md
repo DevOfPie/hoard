@@ -123,6 +123,15 @@ no `game/label` form yet.
 The share is refused while the save is already shared (unshare first to move
 it to another group), and unsharing is refused while somebody holds its lease.
 
+Sharing a world never stops your own backups. On the owner's machine every
+version still carries the whole folder, characters and any other worlds
+included, so restoring an older version or setting up a new machine brings all
+of it back. Members only ever receive the shared world's files and can only
+push those; the server fills the rest of each version in from the owner's last
+upload. The owner needs the hosting lease only to change the shared world
+itself: a change to a character or to another world backs up without it, even
+while a member is hosting.
+
 ## Join and adopt on another machine
 
 Once a world is shared, it appears in every member's *Library* marked *Shared
