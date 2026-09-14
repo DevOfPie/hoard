@@ -60,3 +60,20 @@ pub async fn save_access(
         }
     }))
 }
+
+/// What of the save the caller may read, as an include list: empty for the
+/// whole save. The owner reads everything; a member reads what the share names,
+/// on every version, including the ones uploaded before the share existed.
+pub async fn read_include<'e, E>(
+    ex: E,
+    save_id: &str,
+    access: &SaveAccess,
+) -> Result<Vec<String>, sqlx::Error>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Sqlite>,
+{
+    if access.role == Role::Owner {
+        return Ok(Vec::new());
+    }
+    crate::routes::share::include_for(ex, save_id).await
+}
