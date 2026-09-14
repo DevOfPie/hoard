@@ -519,13 +519,11 @@ impl Daemon {
         }
     }
 
-    /// A 409 keeps its code: the client branches on `held`, `stale`, `pushed`
-    /// and the rest rather than on the sentence. A share refused before the
-    /// server was asked (a world name that is not a stem, a game with no
-    /// template) is the caller's to fix, so it is `Invalid`. Everything else is
-    /// `Internal`.
+    /// A share refused before the server was asked (a world name that is not a
+    /// stem, a game with no template, a template game with no world named) is
+    /// the caller's to fix, so it is `Invalid`. Server refusals keep a code; see
+    /// [`server_refusal`]. Everything else is `Internal`.
     fn api_error(&self, err: anyhow::Error) -> Reply {
-        use hoard_agent::api::ApiError;
         if err
             .downcast_ref::<hoard_agent::library::ShareError>()
             .is_some()
@@ -534,19 +532,8 @@ impl Daemon {
                 message: format!("{err:#}"),
             });
         }
-        let code = match err.downcast_ref::<ApiError>() {
-            Some(ApiError::LeaseHeld(_)) => Some("held"),
-            Some(ApiError::LeaseStale(_)) => Some("stale"),
-            Some(ApiError::LeaseRequired(_)) => Some("lease_required"),
-            Some(ApiError::NotShared) => Some("not_shared"),
-            Some(ApiError::Conflict(_)) => Some("conflict"),
-            _ => None,
-        };
-        if let Some(code) = code {
-            return Reply::Error(IpcError::Conflict {
-                code: code.to_string(),
-                message: format!("{err:#}"),
-            });
+        if let Some(refusal) = server_refusal(&err) {
+            return Reply::Error(refusal);
         }
         tracing::warn!(error = %format!("{err:#}"), "hoardd: a server call failed");
         Reply::Error(IpcError::Internal {
@@ -800,6 +787,99 @@ async fn push_loop(
                     .await;
             }
             Err(broadcast::error::RecvError::Closed) => return,
+        }
+    }
+}
+
+/// A server refusal with its stable code, `None` for anything else. A 409 is
+/// `Conflict` and keeps its own tag (`held`, `stale`...), because the client
+/// branches on it; the other refusals are `Refused`, so a client can tell a
+/// sign-in problem or a missing save from a failure. A throttle's message
+/// already carries its retry-after.
+fn server_refusal(err: &anyhow::Error) -> Option<IpcError> {
+    use hoard_agent::api::ApiError;
+    let api = err.downcast_ref::<ApiError>()?;
+    let message = format!("{err:#}");
+    let conflict = match api {
+        ApiError::LeaseHeld(_) => Some("held"),
+        ApiError::LeaseStale(_) => Some("stale"),
+        ApiError::LeaseRequired(_) => Some("lease_required"),
+        ApiError::NotShared => Some("not_shared"),
+        ApiError::Conflict(_) => Some("conflict"),
+        _ => None,
+    };
+    if let Some(code) = conflict {
+        return Some(IpcError::Conflict {
+            code: code.to_string(),
+            message,
+        });
+    }
+    let code = match api {
+        ApiError::Unauthorized => "unauthorized",
+        ApiError::Forbidden => "forbidden",
+        ApiError::NotFound => "not_found",
+        ApiError::BadRequest(_) => "bad_request",
+        ApiError::RateLimited { .. } => "throttled",
+        ApiError::QuotaExceeded(_) => "quota_full",
+        _ => return None,
+    };
+    Some(IpcError::Refused {
+        code: code.to_string(),
+        message,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::server_refusal;
+    use hoard_agent::api::{ApiError, RateLimitKind};
+    use hoard_core::ipc::IpcError;
+
+    fn code_of(err: ApiError) -> Option<(&'static str, String)> {
+        match server_refusal(&anyhow::Error::new(err).context("sharing")) {
+            Some(IpcError::Refused { code, .. }) => Some(("refused", code)),
+            Some(IpcError::Conflict { code, .. }) => Some(("conflict", code)),
+            Some(other) => panic!("unexpected {other:?}"),
+            None => None,
+        }
+    }
+
+    /// Each server refusal crosses the socket with its code, through context;
+    /// the 409s stay `Conflict`, and what has no code stays out.
+    #[test]
+    fn server_refusals_keep_their_code() {
+        let refused = |c: &str| Some(("refused", c.to_string()));
+        assert_eq!(code_of(ApiError::Unauthorized), refused("unauthorized"));
+        assert_eq!(code_of(ApiError::Forbidden), refused("forbidden"));
+        assert_eq!(code_of(ApiError::NotFound), refused("not_found"));
+        assert_eq!(
+            code_of(ApiError::BadRequest("bad include".into())),
+            refused("bad_request")
+        );
+        assert_eq!(
+            code_of(ApiError::NotShared),
+            Some(("conflict", "not_shared".to_string()))
+        );
+        assert_eq!(
+            code_of(ApiError::Server {
+                status: 500,
+                body: String::new()
+            }),
+            None
+        );
+        assert!(server_refusal(&anyhow::anyhow!("disk full")).is_none());
+
+        let throttled = server_refusal(&anyhow::Error::new(ApiError::RateLimited {
+            kind: RateLimitKind::Paced,
+            retry_after_seconds: 7,
+            body: String::new(),
+        }));
+        match throttled {
+            Some(IpcError::Refused { code, message }) => {
+                assert_eq!(code, "throttled");
+                assert!(message.contains("7s"), "{message}");
+            }
+            other => panic!("unexpected {other:?}"),
         }
     }
 }

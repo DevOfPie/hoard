@@ -2540,12 +2540,39 @@ pub enum ShareError {
     NoTemplate(String),
     #[error(transparent)]
     BadWorld(#[from] crate::worldfiles::BadWorld),
+    /// A game that shares by world, with none named. `worlds` are the ones
+    /// found in the save's folder, empty when it is not tracked here.
+    #[error("{}", needs_world_message(.worlds))]
+    NeedsWorld { worlds: Vec<String> },
+}
+
+fn needs_world_message(worlds: &[String]) -> String {
+    if worlds.is_empty() {
+        "this game shares one world at a time; pick one by name (none found on this machine)"
+            .to_string()
+    } else {
+        format!(
+            "this game shares one world at a time; pick one of: {}",
+            worlds.join(", ")
+        )
+    }
 }
 
 /// The include list a share of a `game_slug` save carries: `world`'s files
-/// from the game's template, or everything when no world is named.
-pub fn include_for_share(game_slug: &str, world: Option<&str>) -> Result<Vec<String>, ShareError> {
+/// from the game's template, or everything when the game has no template. A
+/// template game with no world named is refused with the worlds under
+/// `local_path`, the save's folder when it is tracked here.
+pub fn include_for_share(
+    game_slug: &str,
+    world: Option<&str>,
+    local_path: Option<&std::path::Path>,
+) -> Result<Vec<String>, ShareError> {
     match world {
+        None if crate::worldfiles::has_template(game_slug) => Err(ShareError::NeedsWorld {
+            worlds: local_path
+                .map(|root| crate::worldfiles::worlds(game_slug, root))
+                .unwrap_or_default(),
+        }),
         None => Ok(Vec::new()),
         Some(w) => crate::worldfiles::template(game_slug, w)?
             .ok_or_else(|| ShareError::NoTemplate(game_slug.to_string())),
@@ -2553,7 +2580,8 @@ pub fn include_for_share(game_slug: &str, world: Option<&str>) -> Result<Vec<Str
 }
 
 /// Shares `save_id` into `group_id`, naming `world` when the game shares by
-/// world (see [`crate::worldfiles`]). On success this machine's row takes the
+/// world (see [`crate::worldfiles`]); such a game with no world is refused
+/// with [`ShareError::NeedsWorld`]. On success this machine's row takes the
 /// server's `shared` and `include`, and the [`LiveReseat`] that comes back
 /// puts the owner's next push over the world's files alone. `Noop` when the
 /// save is not tracked here (the server row is still shared) or is paused.
@@ -2563,21 +2591,19 @@ pub async fn share_save(
     group_id: &str,
     world: Option<&str>,
 ) -> Result<(hoard_core::wire::Save, LiveReseat)> {
-    let include = match world {
-        None => Vec::new(),
-        Some(w) => {
-            // The template goes by game, and the row is the cheapest place to
-            // read it; a save not tracked here still has a game on the server.
-            let local_slug = CliState::load_default()
-                .ok()
-                .and_then(|(state, _)| state.saves.get(save_id).map(|st| st.game_slug.clone()));
-            let slug = match local_slug {
-                Some(slug) => slug,
-                None => client.get_save(save_id).await?.game_slug.into_inner(),
-            };
-            include_for_share(&slug, Some(w))?
-        }
+    // The template goes by game, and the row is the cheapest place to read it;
+    // a save not tracked here still has a game on the server, and no folder.
+    let local = CliState::load_default().ok().and_then(|(state, _)| {
+        state
+            .saves
+            .get(save_id)
+            .map(|st| (st.game_slug.clone(), st.local_path.clone()))
+    });
+    let (slug, root) = match local {
+        Some((slug, root)) => (slug, Some(root)),
+        None => (client.get_save(save_id).await?.game_slug.into_inner(), None),
     };
+    let include = include_for_share(&slug, world, root.as_deref())?;
     hoard_core::wire::validate_include(&include).map_err(|m| anyhow::anyhow!(m))?;
     let save = client.share_save(save_id, group_id, &include).await?;
     let reseat = record_sharing(save_id.to_string(), save.shared.clone()).await?;
@@ -4015,9 +4041,8 @@ mod sharing_tests {
     /// whole folder for none, and a refusal the client can show for the rest.
     #[test]
     fn a_share_resolves_its_include_list_from_the_world() {
-        assert!(include_for_share("valheim", None).unwrap().is_empty());
         assert_eq!(
-            include_for_share("valheim", Some("Alpha")).unwrap(),
+            include_for_share("valheim", Some("Alpha"), None).unwrap(),
             vec![
                 "worlds_local/Alpha.db",
                 "worlds_local/Alpha.fwl",
@@ -4027,16 +4052,42 @@ mod sharing_tests {
             ]
         );
         assert!(matches!(
-            include_for_share("stardew-valley", Some("Alpha")),
+            include_for_share("stardew-valley", Some("Alpha"), None),
             Err(ShareError::NoTemplate(_))
         ));
         assert!(matches!(
-            include_for_share("valheim", Some("../Alpha")),
+            include_for_share("valheim", Some("../Alpha"), None),
             Err(ShareError::BadWorld(_))
         ));
         // A folder game with no world named shares whole, like before.
-        assert!(include_for_share("stardew-valley", None)
+        assert!(include_for_share("stardew-valley", None, None)
             .unwrap()
             .is_empty());
+    }
+
+    /// A template game with no world named is refused, with the worlds in the
+    /// save's folder when it is tracked here and none when it is not.
+    #[test]
+    fn a_template_game_with_no_world_is_refused_with_its_worlds() {
+        let dir = tempfile::tempdir().unwrap();
+        let worlds = dir.path().join("worlds_local");
+        std::fs::create_dir_all(&worlds).unwrap();
+        for f in ["Beta.fwl", "Alpha.fwl", "Alpha.db", "Alpha_backup_1.fwl"] {
+            std::fs::write(worlds.join(f), b"").unwrap();
+        }
+
+        let err = include_for_share("valheim", None, Some(dir.path())).unwrap_err();
+        match &err {
+            ShareError::NeedsWorld { worlds } => assert_eq!(worlds, &["Alpha", "Beta"]),
+            other => panic!("unexpected {other:?}"),
+        }
+        let message = err.to_string();
+        assert!(message.contains("Alpha, Beta"), "{message}");
+        assert!(message.contains("pick one"), "{message}");
+
+        match include_for_share("valheim", None, None) {
+            Err(ShareError::NeedsWorld { worlds }) => assert!(worlds.is_empty()),
+            other => panic!("unexpected {other:?}"),
+        }
     }
 }
