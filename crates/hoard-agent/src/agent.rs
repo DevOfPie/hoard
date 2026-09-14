@@ -512,6 +512,17 @@ enum AgentCommand {
         holder: Option<String>,
         verdict: bool,
     },
+    /// The lease task's answer to an acquire refused as stale at
+    /// `base_version`: nobody holds the lease and this machine is behind.
+    /// A verdict, like `SetLease { verdict: true }` with the lease free.
+    LeaseStale {
+        save_id: String,
+        base_version: i64,
+    },
+    /// The service is stopping and the lease task is about to give back every
+    /// lease held here: what the server says next is that, not a loss.
+    /// Answers once every slot is marked.
+    Stopping(oneshot::Sender<()>),
     /// The user takes a role on a shared world. `Host` asks for the lease.
     /// Each world verb answers on `reply`: refused when the save is not a
     /// shared world here, `Ok` once the engine has acted on it.
@@ -711,6 +722,26 @@ impl AgentHandle {
         holder: Option<String>,
     ) -> Result<()> {
         self.send_lease(save_id, lease, holder, true).await
+    }
+
+    /// An acquire refused as stale. See [`AgentCommand::LeaseStale`].
+    pub async fn lease_stale(&self, save_id: String, base_version: i64) -> Result<()> {
+        self.tx
+            .send(AgentCommand::LeaseStale {
+                save_id,
+                base_version,
+            })
+            .await?;
+        Ok(())
+    }
+
+    /// Tell the engine the service is stopping, before the lease task gives
+    /// its leases back. See [`AgentCommand::Stopping`].
+    pub async fn stopping(&self) -> Result<()> {
+        let (tx, rx) = oneshot::channel();
+        self.tx.send(AgentCommand::Stopping(tx)).await?;
+        rx.await?;
+        Ok(())
     }
 
     async fn send_lease(
@@ -1077,6 +1108,10 @@ pub(crate) struct SaveSlot {
     /// verdict landing meanwhile is given back (`claim::on_lease`). Cleared
     /// when the lease reads anything but `Mine`, and by the next acquire.
     pub(crate) release_requested: bool,
+    /// The server refused the acquire as stale at this base: its head is
+    /// ahead of the folder. The head comes down first, and once `known_version`
+    /// moves past it a claim asks again (`claim::catch_up`).
+    pub(crate) stale_base: Option<i64>,
     /// `WorldHostedElsewhere` has gone out for the current hold. Cleared when
     /// the lease stops being somebody else's.
     pub(crate) hosted_elsewhere_notified: bool,
@@ -2552,6 +2587,25 @@ async fn run_agent(
                             );
                         }
                     }
+                    Some(AgentCommand::LeaseStale { save_id, base_version }) => {
+                        if let Some(slot) = slots.get_mut(&save_id) {
+                            crate::claim::on_lease(slot, kernel::LeaseObs::Free, None, true, &events_tx, lease_task.as_ref());
+                            crate::claim::on_stale(slot, base_version);
+                            reconcile_all(
+                                &mut slots, &api, &events_tx, &cmd_tx, &config, &done_tx,
+                                &cloud_heads, lease_task.as_ref(),
+                            );
+                        }
+                    }
+                    Some(AgentCommand::Stopping(reply)) => {
+                        for slot in slots.values_mut() {
+                            crate::claim::on_stopping(slot);
+                        }
+                        // Nothing asks for a lease past this point: an acquire
+                        // would clear the marks, and the task is closing anyway.
+                        lease_task = None;
+                        let _ = reply.send(());
+                    }
                     Some(AgentCommand::ClaimWorld { save_id, role, reply }) => {
                         match shared_world_slot(&mut slots, &save_id) {
                             Ok(slot) => {
@@ -2648,6 +2702,7 @@ async fn run_agent(
                                 process_running: s.is_running,
                                 last_fs_event_at: s.last_fs_event_at,
                                 next_scheduled_backup_at: s.next_scheduled_backup_at,
+                                lease_behind: s.stale_base.is_some(),
                             })
                             .collect();
                         let _ = resp.send(snapshot);
@@ -3007,6 +3062,7 @@ fn handle_add(
         side_copy_landed_at: None,
         lease_requested: false,
         release_requested: false,
+        stale_base: None,
         hosted_elsewhere_notified: false,
         session: None,
     };
@@ -3018,6 +3074,7 @@ fn handle_add(
         return;
     }
     arm_watcher(&mut slot, fs_tx);
+    crate::claim::on_seated(&mut slot);
     // Content already on disk that diverges from what is synced (a fresh add with no
     // set-hash, the emulator case, or offline changes): seed `has_pending` so the
     // reducer takes the baseline. Empty plus restore enabled means the reducer
@@ -6035,6 +6092,7 @@ pub(crate) fn test_slot(save: WatchedSave) -> SaveSlot {
         side_copy_landed_at: None,
         lease_requested: false,
         release_requested: false,
+        stale_base: None,
         hosted_elsewhere_notified: false,
         session: None,
     }
@@ -6944,6 +7002,91 @@ mod tests {
                 asked.iter().any(|a| a == want),
                 "the lease task was not asked to {want}: {asked:?}"
             );
+        }
+
+        let _ = handle.shutdown().await;
+        let _ = tokio::time::timeout(Duration::from_secs(2), task).await;
+    }
+
+    /// A shared world seated with no version (an adopt) marks its folder's
+    /// touch as ours: the fresh folder does not veto the first pull. One with a
+    /// version on this machine keeps the veto.
+    #[tokio::test]
+    async fn an_adopted_shared_world_does_not_veto_its_first_pull() {
+        let adopted_dir = tempfile::tempdir().expect("create tempdir");
+        let synced_dir = tempfile::tempdir().expect("create tempdir");
+        let (fs_tx, _fs_rx) = mpsc::channel::<PathBuf>(8);
+        let mut slots = HashMap::new();
+        let mut adopted = shared_world("adopted", adopted_dir.path());
+        adopted.known_version = None;
+        handle_add(&mut slots, adopted, &fs_tx);
+        handle_add(
+            &mut slots,
+            shared_world("synced", synced_dir.path()),
+            &fs_tx,
+        );
+
+        let now = OffsetDateTime::now_utc();
+        let world = kernel::World { now, seed: 0 };
+        let fresh = kernel::Observation {
+            folder_mtime: Some(now),
+            ..Default::default()
+        };
+        let adopted = state_from_slot(&slots["adopted"], &claim_config(), now);
+        assert_eq!(kernel::session::veto_reason(&adopted, &fresh, &world), None);
+        let synced = state_from_slot(&slots["synced"], &claim_config(), now);
+        assert_eq!(
+            kernel::session::veto_reason(&synced, &fresh, &world),
+            Some("save folder touched recently")
+        );
+    }
+
+    /// The service stops while this machine hosts: the engine is told first,
+    /// so the server's word that the lease is free is the stop's answer. No
+    /// `WorldLeaseLost`, and nothing asks for the lease again.
+    #[tokio::test(start_paused = true)]
+    async fn stopping_the_service_while_hosting_is_not_a_lost_lease() {
+        let tmp = tempfile::tempdir().expect("create tempdir");
+        let api = ApiClient::new("http://127.0.0.1:1", "fake").expect("fake api client");
+        let (events_tx, mut events_rx) = mpsc::channel::<AgentEvent>(64);
+        let (lease, mut seen) = crate::lease::LeaseHandle::probe();
+
+        let (handle, task) = spawn(
+            api,
+            claim_config(),
+            vec![shared_world("world-1", tmp.path())],
+            events_tx,
+        );
+        handle.attach_lease(lease).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        handle
+            .lease_verdict("world-1".into(), kernel::LeaseObs::Mine, Some("me".into()))
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        handle
+            .stopping()
+            .await
+            .expect("the engine answers the stop");
+        handle
+            .set_lease("world-1".into(), kernel::LeaseObs::Free, None)
+            .await
+            .unwrap();
+        handle
+            .claim_world("world-1".into(), WorldRole::Host)
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        while let Ok(evt) = events_rx.try_recv() {
+            assert!(
+                !matches!(evt, AgentEvent::WorldLeaseLost { .. }),
+                "a stop read as a lost lease: {evt:?}"
+            );
+        }
+        while let Ok(asked) = seen.try_recv() {
+            assert_ne!(asked, "acquire world-1", "asked for a lease while stopping");
         }
 
         let _ = handle.shutdown().await;
