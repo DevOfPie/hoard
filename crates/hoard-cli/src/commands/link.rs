@@ -165,11 +165,17 @@ async fn notify(what: &str, request: Request) -> bool {
 /// "restart `hoard sync` to apply it", which is no longer needed, and would not
 /// work either: restarting a client does not restart the engine.
 pub async fn notify_reload() -> &'static str {
-    if notify("ask the service to reload its watch list", Request::Reload).await {
+    if reload().await {
         "the sync service picked it up"
     } else {
         "it applies when the sync service starts"
     }
+}
+
+/// [`notify_reload`] as a flag, for the commands that also answer `--json`:
+/// `true` when a running service re-read the watched set.
+pub async fn reload() -> bool {
+    notify("ask the service to reload its watch list", Request::Reload).await
 }
 
 /// The on-disk session changed (login or logout), so have the service resolve

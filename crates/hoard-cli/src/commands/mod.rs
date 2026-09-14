@@ -1,3 +1,4 @@
+pub mod adopt;
 pub mod agents;
 pub mod auth;
 pub mod backup;

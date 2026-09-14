@@ -87,8 +87,9 @@ exit status grouped by what to do about it:
 | 5 | Storage limit (`quota_exceeded`, `too_large`, `archived`): will fail identically until the user frees space or upgrades |
 | 6 | Network (`network`, `storage_unreachable`): may work later |
 | 1 | `no_service`: the sync service isn't running, and groups, sharing and leases have nobody to ask without it: tell the user to run `hoard sync start` |
-| 1 | A shared save refused (`held`, `stale`, `lease_required`, `not_shared`, `conflict`): see below; retrying unchanged gets the same answer |
-| 1 | `bad_request`: the request itself is wrong (a world name that is not one, an expiry past a year); change it, don't retry |
+| 1 | A shared save refused (`held`, `stale`, `lease_required`, `not_shared`, `pushed`, `conflict`): see below; retrying unchanged gets the same answer |
+| 1 | `already_tracked`: `hoard adopt` on a save this machine already has a folder for; `hoard saves --json` shows where |
+| 1 | `bad_request`: the request itself is wrong (a world name that is not one, an expiry past a year, a folder that is not one); change it, don't retry |
 | 1 | `needs_input`, `needs_choice`: see below |
 | 1 | Anything else |
 
@@ -103,7 +104,9 @@ The shared-save codes name who is in the way. `held`: another member hosts the
 world, so this machine can only view it until they release. `stale`: the save
 moved past this machine's copy; it has to pull before it can host.
 `lease_required`: a push to a shared save without hosting it. `not_shared`: the
-save is not in a group. `conflict`: any other refusal; the message says which.
+save is not in a group. `pushed`: `hoard world force` refused because the
+holder has pushed under their lease; a pushed lease cannot be forced, only
+released by its holder. `conflict`: any other refusal; the message says which.
 Tell the user; taking the lease with `hoard world force` takes it off a person,
 so only on their word.
 
@@ -143,6 +146,27 @@ present and do not expect them otherwise:
 - `hoard world lease <save_id> --json`: `save_id` and `lease`, null when nobody
   holds it, otherwise `holder`, `here` (this machine holds it), `acquired_at`,
   `renewed_at`, `base_version`, `live` and `pushed_since`.
+- `hoard world claim|release|force|dismiss <save_id> --json`: `save_id` and
+  `outcome`, see below.
+- `hoard group create|join --json`: the group, with `id`, `name`, `owner` and
+  `members`. `hoard group invite --json`: `group_id`, `token` and
+  `expires_at`; the token is shown once, so hand it to the user and do not keep
+  it. `hoard group leave --json`: `group_id`.
+- `hoard adopt <save_id> --path <folder> --json`: `save`, the row `hoard saves`
+  now lists, and `watching`, false when the sync service was not running (it
+  picks the save up when it starts).
+
+A save that is on the server but has no folder on this machine (a world shared
+with the user, or their own save from another machine) is not in `hoard saves`,
+and every `hoard world` verb refuses it. `hoard adopt` gives it a folder here.
+The folder is the user's to choose: ask for it, never guess one.
+
+`hoard world claim` and `hoard world force` wait up to 10 seconds for the
+server's answer. `outcome` `hosting` means this machine holds the lease;
+`pending` means no answer came in time, and `hoard world lease` has it later. A
+refusal exits 1 with `held` (someone else hosts; the message names them) or,
+for `force`, `pushed`. `claim --view`, `release` and `dismiss` do not wait:
+their `outcome` is `viewing`, `releasing` or `dismissed`.
 
 ## Safety rules
 

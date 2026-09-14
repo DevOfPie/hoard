@@ -57,13 +57,29 @@ pub struct GroupsOut {
     pub groups: Vec<GroupRow>,
 }
 
+/// A minted invite. The token is shown once: the server keeps only its hash.
+#[derive(Serialize)]
+pub struct InviteOut {
+    pub group_id: String,
+    pub token: String,
+    /// RFC3339.
+    pub expires_at: String,
+}
+
+/// The group a `leave` left.
+#[derive(Serialize)]
+pub struct LeftOut {
+    pub group_id: String,
+}
+
 pub async fn run(cmd: GroupCommand) -> Result<()> {
     let mut client = link::require("group").await?;
     match cmd {
         GroupCommand::Create { name } => {
             let group = group_reply(link::ask(&mut client, Request::CreateGroup { name }).await?)?;
-            println!("created group '{}' ({})", group.name, group.id);
-            Ok(())
+            output::emit(&row(&group), |g| {
+                println!("created group '{}' ({})", g.name, g.id);
+            })
         }
         GroupCommand::List => {
             let groups = list(&mut client).await?;
@@ -98,7 +114,7 @@ pub async fn run(cmd: GroupCommand) -> Result<()> {
             let invite = match link::ask(
                 &mut client,
                 Request::InviteToGroup {
-                    group_id,
+                    group_id: group_id.clone(),
                     expires_in_secs: Some(expires_in_secs),
                 },
             )
@@ -107,21 +123,27 @@ pub async fn run(cmd: GroupCommand) -> Result<()> {
                 Payload::Invite(invite) => invite,
                 other => anyhow::bail!("unexpected answer to an invite request: {other:?}"),
             };
-            let until = invite
-                .expires_at
-                .format(&Rfc3339)
-                .unwrap_or_else(|_| invite.expires_at.to_string());
-            println!(
-                "invite token (shown once, valid until {until}):\n\n  {}\n\n\
-                 Whoever should join runs `hoard group join {}`.",
-                invite.token, invite.token
-            );
-            Ok(())
+            let out = InviteOut {
+                group_id,
+                expires_at: invite
+                    .expires_at
+                    .format(&Rfc3339)
+                    .unwrap_or_else(|_| invite.expires_at.to_string()),
+                token: invite.token,
+            };
+            output::emit(&out, |o| {
+                println!(
+                    "invite token (shown once, valid until {}):\n\n  {}\n\n\
+                     Whoever should join runs `hoard group join {}`.",
+                    o.expires_at, o.token, o.token
+                );
+            })
         }
         GroupCommand::Join { token } => {
             let group = group_reply(link::ask(&mut client, Request::JoinGroup { token }).await?)?;
-            println!("joined group '{}' ({})", group.name, group.id);
-            Ok(())
+            output::emit(&row(&group), |g| {
+                println!("joined group '{}' ({})", g.name, g.id);
+            })
         }
         GroupCommand::Leave { group } => {
             let group_id = resolve(&mut client, &group).await?;
@@ -132,8 +154,9 @@ pub async fn run(cmd: GroupCommand) -> Result<()> {
                 },
             )
             .await?;
-            println!("left group {group_id}");
-            Ok(())
+            output::emit(&LeftOut { group_id }, |o| {
+                println!("left group {}", o.group_id);
+            })
         }
     }
 }

@@ -214,6 +214,7 @@ fn refusal(err: &anyhow::Error) -> Option<Option<String>> {
             Some(c.holder().map(String::from))
         }
         Some(ApiError::Conflict(_))
+        | Some(ApiError::LeasePushed(_))
         | Some(ApiError::NotShared)
         | Some(ApiError::NotFound)
         | Some(ApiError::Forbidden) => Some(None),

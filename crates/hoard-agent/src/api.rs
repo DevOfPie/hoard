@@ -101,6 +101,10 @@ pub enum ApiError {
     /// lives in nobody's group.
     #[error("the save is not shared")]
     NotShared,
+    /// HTTP 409 with `code:"pushed"`: a takeover refused because the holder
+    /// has pushed under the lease. Only an idle lease can be forced.
+    #[error("conflict (409): {0}")]
+    LeasePushed(String),
     #[error("conflict (409): {0}")]
     Conflict(String),
     #[error("bad request (400): {0}")]
@@ -518,9 +522,10 @@ impl ApiError {
 }
 
 /// The 409s with a stable `code` are typed; the rest carry their message. The
-/// lease codes that only ever mean "no" (`not_holder`, `not_held`, `pushed`,
+/// lease codes that only ever mean "no" (`not_holder`, `not_held`,
 /// `already_shared`, `lease_held`) stay in [`ApiError::Conflict`]: none of
-/// their bodies has anything a caller recovers from.
+/// their bodies has anything a caller recovers from. `pushed` is typed only so
+/// its code reaches whoever asked for the takeover.
 fn conflict_from(body: &str) -> ApiError {
     match extract_code(body).as_deref() {
         Some("non_fast_forward") => ApiError::NonFastForward(
@@ -536,6 +541,7 @@ fn conflict_from(body: &str) -> ApiError {
             ApiError::LeaseStale(serde_json::from_str::<LeaseStale>(body).unwrap_or_default())
         }
         Some("not_shared") => ApiError::NotShared,
+        Some("pushed") => ApiError::LeasePushed(extract_message(body)),
         _ => ApiError::Conflict(extract_message(body)),
     }
 }
@@ -2643,13 +2649,12 @@ mod lease_conflict_tests {
             conflict_from(r#"{"error":"the save is not shared","code":"not_shared"}"#),
             ApiError::NotShared
         ));
-        for code in [
-            "not_holder",
-            "not_held",
-            "pushed",
-            "already_shared",
-            "lease_held",
-        ] {
+        // Changed on purpose: `pushed` used to stay in this list.
+        match conflict_from(r#"{"error":"no (pushed)","code":"pushed"}"#) {
+            ApiError::LeasePushed(msg) => assert_eq!(msg, "no (pushed)"),
+            other => panic!("pushed: expected LeasePushed, got {other:?}"),
+        }
+        for code in ["not_holder", "not_held", "already_shared", "lease_held"] {
             let body = format!(r#"{{"error":"no ({code})","code":"{code}"}}"#);
             match conflict_from(&body) {
                 ApiError::Conflict(msg) => assert_eq!(msg, format!("no ({code})")),
