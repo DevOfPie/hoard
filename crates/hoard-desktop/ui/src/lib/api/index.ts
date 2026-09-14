@@ -791,6 +791,8 @@ export type AgentEvent =
       type: "world_lease_lost";
       save_id: string;
       game_slug: string;
+          /** Who holds it now, when the engine knew; absent when nobody does. */
+      holder?: string | null;
     }
   | {
       /** A game with shared worlds started and nothing says which world this

@@ -410,6 +410,10 @@ pub enum AgentEvent {
     WorldLeaseLost {
         save_id: String,
         game_slug: String,
+        /// Who holds it now, when the engine was told; absent when nobody
+        /// does or the answer never named them.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        holder: Option<String>,
     },
     /// A game with shared worlds started and nothing says which world this
     /// machine plays, or how. One per session per game: a re-prompt replaces
