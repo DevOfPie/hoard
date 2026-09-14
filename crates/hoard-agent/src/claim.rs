@@ -102,7 +102,7 @@ fn lease_for_prompt(obs: LeaseObs) -> WorldLease {
 fn shared_of(slots: &HashMap<String, SaveSlot>, game_slug: &str) -> Vec<String> {
     let mut ids: Vec<String> = slots
         .values()
-        .filter(|s| s.save.shared && !s.save.track_only && s.save.game_slug == game_slug)
+        .filter(|s| s.save.shared.is_some() && !s.save.track_only && s.save.game_slug == game_slug)
         .map(|s| s.save.save_id.clone())
         .collect();
     ids.sort();
@@ -201,7 +201,12 @@ fn open_sessions(
         worlds.push(WorldChoice {
             save_id: id.clone(),
             label: slot.save.label.clone(),
-            group_name: slot.save.group_name.clone().unwrap_or_default(),
+            group_name: slot
+                .save
+                .shared
+                .as_ref()
+                .map(|r| r.group_name.clone())
+                .unwrap_or_default(),
             holder: slot.lease_holder.clone(),
             lease: lease_for_prompt(slot.lease),
         });
@@ -345,7 +350,7 @@ pub(crate) fn may_request_lease(slot: &SaveSlot) -> bool {
         .session
         .as_ref()
         .is_some_and(|w| w.live() && !w.claimed);
-    slot.save.shared
+    slot.save.shared.is_some()
         && slot.has_pending
         && slot.role == WorldRole::Host
         && !slot.lease_requested
@@ -393,7 +398,7 @@ pub(crate) fn on_write(
     events_tx: &mpsc::Sender<AgentEvent>,
     lease: Option<&LeaseHandle>,
 ) {
-    if !slot.save.shared {
+    if slot.save.shared.is_none() {
         return;
     }
     let Some(session) = slot.session.as_mut() else {
@@ -780,8 +785,13 @@ mod tests {
             known_version: Some(3),
             set_hash: None,
             track_only: false,
-            shared: true,
-            group_name: Some("friends".into()),
+            shared: Some(crate::state::SharedRef {
+                group_id: "g1".into(),
+                group_name: "friends".into(),
+                owner_user_id: "u-owner".into(),
+                owner_username: "owner".into(),
+                include: Vec::new(),
+            }),
             include: Vec::new(),
         }
     }
@@ -846,7 +856,7 @@ mod tests {
     async fn a_game_without_shared_worlds_gets_no_prompt() {
         let (tx, mut rx) = mpsc::channel(8);
         let mut plain = world("p1", "factorio");
-        plain.shared = false;
+        plain.shared = None;
         let mut s = slots(vec![plain]);
         on_game_started(&mut s, "p1", Instant::now(), &tx);
         assert!(drain(&mut rx).is_empty());

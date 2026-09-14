@@ -91,18 +91,19 @@ pub async fn apply(
 
     let version = resolve_version(&client, &save_id, version).await?;
 
+    // This machine's row, when it has one: the destination without `--to`, and
+    // the game and include list the gate below is built from. A state that does
+    // not load only matters when the row is the only place the destination is.
+    let row = match CliState::load_default() {
+        Ok((state, _)) => state.saves.get(&save_id).cloned(),
+        Err(e) if to.is_none() => return Err(e),
+        Err(_) => None,
+    };
     let dest = match to {
         Some(p) => p,
-        None => {
-            let (state, _) = CliState::load_default()?;
-            state
-                .saves
-                .get(&save_id)
-                .map(|s| s.local_path.clone())
-                .ok_or_else(|| {
-                    anyhow!("no remembered local path for save {save_id}; pass --to <PATH>")
-                })?
-        }
+        None => row.as_ref().map(|s| s.local_path.clone()).ok_or_else(|| {
+            anyhow!("no remembered local path for save {save_id}; pass --to <PATH>")
+        })?,
     };
 
     // `--remember` makes `dest` this save's folder here, through the same door as
@@ -122,27 +123,19 @@ pub async fn apply(
     // What is allowed to be written. The manifest's patterns can only be
     // consulted when we know which game the folder belongs to; a bare `--to` over
     // a save that is not in the local state gets no shields and the kernel
-    // decides on its own.
-    let row = CliState::load_default()
-        .ok()
-        .and_then(|(st, _)| st.saves.get(&save_id).cloned());
-    let shields = {
-        // A save new to this machine has no row until the restore is done, so with
-        // `--remember` its game comes from the plan.
-        let slug = match &home {
-            Some(home) => Some(home.game_slug.clone()),
-            None => row.as_ref().map(|s| s.game_slug.clone()),
-        };
-        slug.map(|s| hoard_agent::savefilter::shields_for_slug(&s))
-            .unwrap_or_default()
-    };
-    let gate = hoard_core::kernel::fileclass::RestoreGate {
-        shields,
-        // A shared save writes only its world's files, the same list its backup
-        // walks.
-        include: row.map(|s| s.include).unwrap_or_default(),
-        allow_device_local: allow_ini,
-    };
+    // decides on its own. A save new to this machine has no row until the
+    // restore is done, so with `--remember` its game comes from the plan; a
+    // shared save writes only its world's files, the list its backup walks.
+    let slug = home
+        .as_ref()
+        .map(|h| h.game_slug.as_str())
+        .or(row.as_ref().map(|s| s.game_slug.as_str()))
+        .unwrap_or_default();
+    let include = row
+        .as_ref()
+        .map(|s| s.include.as_slice())
+        .unwrap_or_default();
+    let gate = hoard_agent::savefilter::gate_for_save(slug, include, allow_ini);
 
     // What is going to happen to the folder. Nothing is downloaded: it crosses
     // the version's manifest with what is on disk. Always shown, because

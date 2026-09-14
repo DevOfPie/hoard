@@ -685,14 +685,19 @@ pub fn walk_source(root: &Path, scope: Scope<'_>) -> Result<Vec<UploadFile>> {
                 tracing::warn!(path = %path.display(), "skipping entry with unreadable type");
                 continue;
             };
+            let rel = path
+                .strip_prefix(root)
+                .map_err(|e| anyhow!("strip_prefix: {e}"))?
+                .to_string_lossy()
+                .replace('\\', "/");
             if ft.is_dir() {
-                stack.push(path);
+                // A shared save's list names its files by path: a folder no
+                // pattern can reach is not read at all, so the fingerprint of a
+                // ten-world folder costs one world's worth of listing.
+                if fileclass::reaches_beneath(scope.include, &rel) {
+                    stack.push(path);
+                }
             } else if ft.is_file() {
-                let rel = path
-                    .strip_prefix(root)
-                    .map_err(|e| anyhow!("strip_prefix: {e}"))?
-                    .to_string_lossy()
-                    .replace('\\', "/");
                 // What is not save data does not go into the snapshot.
                 if !fileclass::classify(&rel, scope).is_backed_up() {
                     tracing::debug!(path = %rel, "skipping non-save file");
@@ -2135,31 +2140,26 @@ pub async fn remember_save(
         // a user setting. This one decides whether their config gets written on
         // restore, so losing it here would be losing it silently.
         let prev_allow_device_local = state.saves.get(save_id).and_then(|s| s.allow_device_local);
-        state.saves.insert(
-            save_id.to_string(),
-            SaveState {
-                local_path: local_path.to_path_buf(),
-                game_slug: save.game_slug.into_inner(),
-                label: save.label,
-                last_backup_at: Some(OffsetDateTime::now_utc()),
-                last_version_num: Some(last_version_num),
-                paused: was_paused,
-                preset: prev_preset,
-                set_hash: prev_hash,
-                processes: prev_processes,
-                shared_processes: prev_shared,
-                allow_device_local: prev_allow_device_local,
-                // The server row says whether the save is shared and of what it
-                // consists; dropping that here would send the next push over the
-                // whole folder.
-                shared: save.shared.as_ref().map(crate::library::shared_ref_from),
-                include: save
-                    .shared
-                    .as_ref()
-                    .map(|s| s.include.clone())
-                    .unwrap_or_default(),
-            },
-        );
+        let mut row = SaveState {
+            local_path: local_path.to_path_buf(),
+            game_slug: save.game_slug.into_inner(),
+            label: save.label,
+            last_backup_at: Some(OffsetDateTime::now_utc()),
+            last_version_num: Some(last_version_num),
+            paused: was_paused,
+            preset: prev_preset,
+            set_hash: prev_hash,
+            processes: prev_processes,
+            shared_processes: prev_shared,
+            allow_device_local: prev_allow_device_local,
+            shared: None,
+            include: Vec::new(),
+        };
+        // The server row says whether the save is shared and of what it
+        // consists; dropping that here would send the next push over the
+        // whole folder.
+        row.set_shared(save.shared.as_ref());
+        state.saves.insert(save_id.to_string(), row);
     } else if let Some(existing) = state.saves.get(save_id).cloned() {
         state.saves.insert(
             save_id.to_string(),
@@ -2858,6 +2858,80 @@ mod tests {
         );
         // And without the list the whole folder is back.
         assert_eq!(walk_source(root, Scope::default()).unwrap().len(), 7);
+    }
+
+    /// The walk never enters a folder the include list cannot name. Read or
+    /// not is observed the way the module already observes it: the folder to
+    /// stay out of is unreadable, and reading it is what the warning says.
+    #[test]
+    fn the_walk_does_not_enter_a_folder_the_include_list_cannot_reach() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::sync::{Arc, Mutex};
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let worlds = root.join("worlds_local");
+        let chars = root.join("characters_local");
+        std::fs::create_dir_all(&worlds).unwrap();
+        std::fs::create_dir_all(chars.join("deep")).unwrap();
+        std::fs::write(worlds.join("Alpha.db"), "alpha").unwrap();
+        std::fs::write(worlds.join("Beta.db"), "beta").unwrap();
+        std::fs::write(chars.join("deep").join("Alpha.db"), "not a world").unwrap();
+        std::fs::set_permissions(&chars, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+        // Every warning the walk raises, so the test can say which folders it read.
+        let log: Arc<Mutex<Vec<u8>>> = Arc::default();
+        let walk = |include: &[String]| {
+            log.lock().unwrap().clear();
+            let sink = log.clone();
+            let subscriber = tracing_subscriber::fmt()
+                .with_max_level(tracing::Level::WARN)
+                .with_writer(move || LockedLog(sink.clone()))
+                .finish();
+            let files = tracing::subscriber::with_default(subscriber, || {
+                walk_source(
+                    root,
+                    Scope {
+                        shields: &[],
+                        include,
+                    },
+                )
+                .unwrap()
+            });
+            let names: Vec<String> = files.into_iter().map(|f| f.relative_path).collect();
+            let warned = String::from_utf8(log.lock().unwrap().clone())
+                .unwrap()
+                .contains("skipping unreadable directory");
+            (names, warned)
+        };
+
+        // Nothing under `characters_local` can match: it is not read.
+        let (names, warned) = walk(&["worlds_local/*".to_string()]);
+        assert_eq!(names, ["worlds_local/Alpha.db", "worlds_local/Beta.db"]);
+        assert!(!warned, "the walk read a folder the list cannot reach");
+        // The same folder without a list is read, and the read fails aloud: the
+        // observation above is of the walk, not of a silent subscriber.
+        let (names, warned) = walk(&[]);
+        assert_eq!(names, ["worlds_local/Alpha.db", "worlds_local/Beta.db"]);
+        assert!(warned);
+        // Pruning is by prefix, not by name: a pattern that names something
+        // beneath it opens the folder.
+        let (_, warned) = walk(&["characters_local/deep/*".to_string()]);
+        assert!(warned);
+        std::fs::set_permissions(&chars, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    /// A `MakeWriter` target for the test above: the subscriber's output in memory.
+    struct LockedLog(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for LockedLog {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
     }
 
     /// A single-file save uploads even when its name looks like config: the user
