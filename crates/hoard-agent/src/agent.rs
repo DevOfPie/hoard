@@ -2619,6 +2619,10 @@ async fn run_agent(
                         match shared_world_slot(&mut slots, &save_id) {
                             Ok(slot) => {
                                 slot.role = WorldRole::Host;
+                                // Like `ClaimWorld`: taken outside a session, it
+                                // is the next one's, and not a push's lease to
+                                // give back once idle.
+                                slot.role_pinned = slot.session.is_none();
                                 crate::claim::on_claim(slot);
                                 if let Some(lease) = lease_task.as_ref() {
                                     // The task runs them in order: the takeover,

@@ -544,6 +544,7 @@ pub(crate) fn on_reconciled(
     lease: Option<&LeaseHandle>,
 ) -> Followup {
     let Some(session) = slot.session.as_mut() else {
+        maybe_release_after_push(slot, lease);
         return Followup::Nothing;
     };
     if session.live() {
@@ -662,6 +663,29 @@ pub(crate) fn maybe_auto_host(
     session.auto_host_deadline = None;
     acquire_auto(slot, events_tx, lease, "no answer to the prompt");
     true
+}
+
+/// With no session, a pending push asks for the lease (`may_request_lease`):
+/// edits made between sessions, or a final flush a service stop cut short,
+/// are the owner's and must go up rather than wait for the next launch. Once
+/// that push lands with nothing pending or in flight, the lease goes back, or
+/// the world stays hosted here with no game running. A role the user pinned
+/// for the next launch (`ClaimWorld` or `ForceWorld` outside a session) keeps
+/// it, and so does a game already running whose session has not opened yet.
+fn maybe_release_after_push(slot: &mut SaveSlot, lease: Option<&LeaseHandle>) {
+    if slot.session.is_some()
+        || slot.lease != LeaseObs::Mine
+        || slot.role_pinned
+        || slot.is_running
+        || slot.has_pending
+        || slot.in_flight.is_some()
+        || slot.lease_requested
+        || slot.release_requested
+    {
+        return;
+    }
+    tracing::info!(save_id = %slot.save.save_id, "agent: pushed with no session running; releasing the hosting lease");
+    give_back(slot, lease, true);
 }
 
 /// After GameStopped on a world this machine hosts: give the lease back once
@@ -1825,6 +1849,83 @@ mod tests {
         assert_eq!(drain(&mut rx).len(), 1, "the next launch asks");
         let session = s["w1"].session.as_ref().unwrap();
         assert!(session.prompted && !session.claimed);
+    }
+
+    /// After a service restart nothing runs and nothing was claimed, and the
+    /// last session's writes are still pending: the push takes the lease, goes
+    /// up, and the lease is given back once it lands, as asked for, not lost. A
+    /// role pinned before launch keeps its lease through the same pass.
+    #[tokio::test(start_paused = true)]
+    async fn a_push_with_no_session_gives_the_lease_back_once_it_lands() {
+        let (tx, mut rx) = mpsc::channel(8);
+        let (lease, mut seen) = LeaseHandle::probe();
+        let now = Instant::now();
+        let mut s = slots(vec![world("w1", "valheim")]);
+        let slot = s.get_mut("w1").unwrap();
+        assert_eq!(slot.lease, LeaseObs::Unknown);
+        assert!(slot.session.is_none() && !slot.role_pinned);
+        slot.has_pending = true;
+
+        // The reducer holds for the lease; the shell asks (`request_lease`).
+        assert!(may_request_lease(slot));
+        request_acquire(slot, &lease);
+        on_lease(slot, LeaseObs::Free, None, false, &tx, Some(&lease));
+        assert_eq!(
+            on_reconciled(slot, now, &tx, Some(&lease)),
+            Followup::Nothing
+        );
+        on_lease(
+            slot,
+            LeaseObs::Mine,
+            Some("me".into()),
+            true,
+            &tx,
+            Some(&lease),
+        );
+        assert_eq!(slot.lease, LeaseObs::Mine);
+        // Held while the push is still to go, and while it streams.
+        on_reconciled(slot, now, &tx, Some(&lease));
+        slot.has_pending = false;
+        slot.in_flight = Some(kernel::Op::Backup);
+        on_reconciled(slot, now, &tx, Some(&lease));
+        assert!(!slot.release_requested, "released under the push");
+
+        // The push landed: nothing pending, nothing in flight.
+        slot.in_flight = None;
+        on_reconciled(slot, now, &tx, Some(&lease));
+        assert!(slot.release_requested);
+        // Asked once, not every tick until the answer.
+        on_reconciled(slot, now, &tx, Some(&lease));
+        on_lease(slot, LeaseObs::Free, None, false, &tx, Some(&lease));
+        assert_eq!(slot.lease, LeaseObs::Free);
+        assert!(!slot.release_requested);
+        assert!(
+            drain(&mut rx).is_empty(),
+            "the release was told as a lost lease"
+        );
+        tokio::task::yield_now().await;
+        let mut lines = Vec::new();
+        while let Ok(l) = seen.try_recv() {
+            lines.push(l);
+        }
+        assert_eq!(lines, ["acquire w1", "release w1"]);
+
+        // A role pinned for the next launch is not a push's lease.
+        on_claim_world(slot, WorldRole::Host, &tx, Some(&lease));
+        assert!(slot.role_pinned);
+        on_lease(
+            slot,
+            LeaseObs::Mine,
+            Some("me".into()),
+            true,
+            &tx,
+            Some(&lease),
+        );
+        on_reconciled(slot, now, &tx, Some(&lease));
+        assert!(!slot.release_requested, "gave back a pinned claim");
+        tokio::task::yield_now().await;
+        assert_eq!(seen.try_recv().unwrap(), "acquire w1");
+        assert!(seen.try_recv().is_err());
     }
 
     #[tokio::test]
