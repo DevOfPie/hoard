@@ -28,17 +28,15 @@ use hoard_core::kernel::fileclass::{is_useful_shield, RestoreGate};
 use crate::agent::WatchedSave;
 use crate::state::{SaveState, SharedRef};
 
-/// The include list an explicit restore narrows to, for the account `me`: a
-/// shared save's list when `me` is a member, nothing when `me` owns it or it is
-/// not shared. The owner's own history holds the whole folder (files from
-/// before the share, other worlds), and restoring it is not the share's to
-/// narrow. An account that cannot be known here reads as a member, the narrow
-/// side. Pulls the engine drives keep [`SaveState::gate`].
-pub fn restore_include<'a>(shared: Option<&'a SharedRef>, me: Option<&str>) -> &'a [String] {
-    match shared {
-        Some(s) if me != Some(s.owner_user_id.as_str()) => &s.include,
-        _ => &[],
-    }
+/// The include list an explicit restore narrows to: a shared save's list for a
+/// member, nothing for its owner or a save that is not shared. The owner's own
+/// history holds the whole folder (files from before the share, other worlds),
+/// and restoring it is not the share's to narrow. Whose save it is is the
+/// server's word ([`SharedRef::caller_owns`]), not the account this machine
+/// cached, which a login made with no service running leaves blank. Pulls the
+/// engine drives keep [`SaveState::gate`].
+pub fn restore_include(shared: Option<&SharedRef>) -> &[String] {
+    shared.map_or(&[], SharedRef::walk_include)
 }
 
 /// The filename patterns the manifest declares as save data for `slug`, in
@@ -140,7 +138,7 @@ mod tests {
 
     #[test]
     fn a_restore_narrows_to_the_share_only_for_a_member() {
-        let shared = SharedRef {
+        let member = SharedRef {
             group_id: "g1".into(),
             group_name: "friends".into(),
             owner_user_id: "u1".into(),
@@ -148,21 +146,20 @@ mod tests {
             include: vec!["worlds/One.wld".into()],
             caller_owns: false,
         };
-        // The owner restores the whole of their own history.
-        assert!(restore_include(Some(&shared), Some("u1")).is_empty());
+        let owner = SharedRef {
+            caller_owns: true,
+            ..member.clone()
+        };
+        // The owner restores the whole of their own history, with the share's
+        // list still on the row as its world.
+        assert!(restore_include(Some(&owner)).is_empty());
         // A member restores the share's files.
         assert_eq!(
-            restore_include(Some(&shared), Some("u2")),
-            ["worlds/One.wld".to_string()]
-        );
-        // With no account known the restore stays narrowed.
-        assert_eq!(
-            restore_include(Some(&shared), None),
+            restore_include(Some(&member)),
             ["worlds/One.wld".to_string()]
         );
         // An unshared save has no list for anybody.
-        assert!(restore_include(None, Some("u1")).is_empty());
-        assert!(restore_include(None, None).is_empty());
+        assert!(restore_include(None).is_empty());
     }
 
     #[test]

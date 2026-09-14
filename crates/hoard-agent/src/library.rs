@@ -1541,15 +1541,30 @@ pub async fn plan_home_for_restore(
     }
 
     let (game_slug, label, shared) = server_name_of(client, save_id).await?;
+    reject_degenerate_slug(&game_slug)?;
+    restore_twin(&state, save_id, &game_slug, &label, local_path)?;
+    Ok(home_for_new_save(
+        save_id, local_path, game_slug, label, shared,
+    ))
+}
+
+/// The plan for a save this machine does not track yet, from the server's row.
+/// `shared` is that row's share, `caller_owns` and all, so the restore decides
+/// whose save it is without the account this machine cached.
+fn home_for_new_save(
+    save_id: &str,
+    local_path: &Path,
+    game_slug: String,
+    label: String,
+    shared: Option<crate::state::SharedRef>,
+) -> HomeForRestore {
     // The walks' list, as `set_shared` mirrors it: the owner's is the whole
     // folder (HRD-D-0019).
     let include = shared
         .as_ref()
         .map(|s| s.walk_include().to_vec())
         .unwrap_or_default();
-    reject_degenerate_slug(&game_slug)?;
-    restore_twin(&state, save_id, &game_slug, &label, local_path)?;
-    Ok(HomeForRestore {
+    HomeForRestore {
         save_id: save_id.to_string(),
         local_path: local_path.to_path_buf(),
         adopt: Some(AdoptArgs {
@@ -1562,7 +1577,7 @@ pub async fn plan_home_for_restore(
         label,
         include,
         shared,
-    })
+    }
 }
 
 impl HomeForRestore {
@@ -3983,8 +3998,8 @@ mod slug_gate_tests {
 #[cfg(test)]
 mod sharing_tests {
     use super::{
-        include_for_share, sync_shared_from_server, tracked_from_server_row, world_files,
-        ShareError,
+        home_for_new_save, include_for_share, sync_shared_from_server, tracked_from_server_row,
+        world_files, ShareError,
     };
     use crate::state::{CliState, SaveState, SharedRef};
     use hoard_core::wire::{Save, SharedInfo};
@@ -4067,6 +4082,44 @@ mod sharing_tests {
         assert!(!mine.orphan);
         assert_eq!(mine.local_version_num, Some(3));
         assert!(mine.shared.is_some());
+    }
+
+    /// A restore planned from the server's row for a save new to this machine
+    /// knows whose save it is from that row alone: no account cached here goes
+    /// in, so an owner whose session file lost its user id still restores the
+    /// whole save, and a member still gets the share's list.
+    #[test]
+    fn a_restore_planned_from_the_server_row_follows_its_owner_mark() {
+        let dest = PathBuf::from("/home/u/.config/unity3d/IronGate/Valheim");
+        let plan = |info: SharedInfo| {
+            let row = server_row(Some(info));
+            home_for_new_save(
+                ID,
+                &dest,
+                row.game_slug.into_inner(),
+                row.label,
+                row.shared.as_ref().map(SharedRef::from),
+            )
+        };
+
+        let owned = plan(SharedInfo {
+            caller_owns: true,
+            ..shared_info(&["worlds_local/Alpha.db"])
+        });
+        assert!(owned.shared.as_ref().is_some_and(|s| s.caller_owns));
+        assert!(owned.include.is_empty(), "{:?}", owned.include);
+        assert!(crate::savefilter::restore_include(owned.shared.as_ref()).is_empty());
+
+        let member = plan(shared_info(&["worlds_local/Alpha.db"]));
+        assert_eq!(member.include, vec!["worlds_local/Alpha.db"]);
+        assert_eq!(
+            crate::savefilter::restore_include(member.shared.as_ref()),
+            ["worlds_local/Alpha.db".to_string()]
+        );
+
+        let row = server_row(None);
+        let unshared = home_for_new_save(ID, &dest, row.game_slug.into_inner(), row.label, None);
+        assert!(crate::savefilter::restore_include(unshared.shared.as_ref()).is_empty());
     }
 
     /// The server's share reaches the local row, and so does its going away.

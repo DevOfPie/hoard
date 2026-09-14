@@ -109,22 +109,19 @@ pub async fn list_save_snapshots(
 /// destination. See [`hoard_agent::preview`].
 ///
 /// The restore gate for `save_id`: the manifest's shield, the share's include
-/// list when `me` is a member of it, plus the user's "yes" to writing their config.
+/// list when this account is a member of it, plus the user's "yes" to writing
+/// their config.
 ///
 /// The preview and the restore compute it the same way, so the dialog does not
 /// promise one thing and the button do another.
-fn restore_gate(
-    save_id: &str,
-    allow_config: bool,
-    me: Option<&str>,
-) -> hoard_core::kernel::fileclass::RestoreGate {
+fn restore_gate(save_id: &str, allow_config: bool) -> hoard_core::kernel::fileclass::RestoreGate {
     CliState::load_default()
         .ok()
         .and_then(|(st, _)| {
             st.saves.get(save_id).map(|s| {
                 hoard_agent::savefilter::gate_for_save(
                     &s.game_slug,
-                    hoard_agent::savefilter::restore_include(s.shared.as_ref(), me),
+                    hoard_agent::savefilter::restore_include(s.shared.as_ref()),
                     allow_config,
                 )
             })
@@ -134,16 +131,6 @@ fn restore_gate(
             allow_device_local: allow_config,
             ..Default::default()
         })
-}
-
-/// This account's id as the app cached it from `whoami`, with no server call.
-/// `None` when it is not known, which a restore reads as a member.
-fn this_account(state: &State<'_, AppState>) -> Option<String> {
-    state
-        .user
-        .lock()
-        .ok()
-        .and_then(|u| u.as_ref().map(|u| u.user_id.clone()))
 }
 
 #[tauri::command]
@@ -170,13 +157,12 @@ pub async fn preview_restore(
                 .ok_or_else(|| "NEEDS_DESTINATION".to_string())?
         }
     };
-    let me = this_account(&state);
     hoard_agent::preview::restore_preview(
         &client,
         &save_id,
         version,
         &dest,
-        &restore_gate(&save_id, allow_config, me.as_deref()),
+        &restore_gate(&save_id, allow_config),
     )
     .await
     .map_err(pretty_error)
@@ -448,7 +434,6 @@ pub async fn restore_snapshot(
         ),
         (None, None) => Default::default(),
     };
-    let me = this_account(&state);
 
     // 1) Optional pre-restore backup. Done synchronously so the user can be
     //    sure the safety net exists before we start overwriting files.
@@ -524,7 +509,7 @@ pub async fn restore_snapshot(
             // restore walks the share's list, the owner's the whole folder.
             gate: hoard_agent::savefilter::gate_for_save(
                 &game_slug,
-                hoard_agent::savefilter::restore_include(shared.as_ref(), me.as_deref()),
+                hoard_agent::savefilter::restore_include(shared.as_ref()),
                 allow_config,
             ),
         },

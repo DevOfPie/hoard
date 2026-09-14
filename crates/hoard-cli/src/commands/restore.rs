@@ -127,16 +127,17 @@ pub async fn apply(
     // restore is done, so with `--remember` its game comes from the plan. A
     // member's restore of a shared save writes only its world's files, the list
     // its backup walks; the owner's restores the whole of their own history.
+    // The share says which, and for a save new here it is the server row's.
     let slug = home
         .as_ref()
         .map(|h| h.game_slug.as_str())
         .or(row.as_ref().map(|s| s.game_slug.as_str()))
         .unwrap_or_default();
-    let me = super::world::this_account();
-    let include = row
+    let shared = home
         .as_ref()
-        .map(|s| hoard_agent::savefilter::restore_include(s.shared.as_ref(), me.as_deref()))
-        .unwrap_or_default();
+        .and_then(|h| h.shared.as_ref())
+        .or(row.as_ref().and_then(|s| s.shared.as_ref()));
+    let include = hoard_agent::savefilter::restore_include(shared);
     let gate = hoard_agent::savefilter::gate_for_save(slug, include, allow_ini);
 
     // What is going to happen to the folder. Nothing is downloaded: it crosses
