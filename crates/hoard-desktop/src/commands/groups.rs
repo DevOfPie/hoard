@@ -207,7 +207,7 @@ pub async fn get_lease(save_id: String, state: State<'_, AppState>) -> Result<Le
     )
     .await?
     {
-        Payload::Lease(lease) => {
+        Payload::Lease { lease } => {
             let lease = lease.map(|l| *l);
             // The engine decides by account once it knows who holds the lease;
             // while its slot reads unknown or free, or it has none, the
