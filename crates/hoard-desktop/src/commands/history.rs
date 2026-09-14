@@ -114,19 +114,14 @@ pub async fn list_save_snapshots(
 /// The preview and the restore compute it the same way, so the dialog does not
 /// promise one thing and the button do another.
 fn restore_gate(save_id: &str, allow_config: bool) -> hoard_core::kernel::fileclass::RestoreGate {
-    let row = CliState::load_default()
+    CliState::load_default()
         .ok()
-        .and_then(|(st, _)| st.saves.get(save_id).cloned());
-    let shields = row
-        .as_ref()
-        .map(|s| hoard_agent::savefilter::shields_for_slug(&s.game_slug))
-        .unwrap_or_default();
-    hoard_core::kernel::fileclass::RestoreGate {
-        shields,
-        // A shared save writes only its world's files, the list its backup walks.
-        include: row.map(|s| s.include).unwrap_or_default(),
-        allow_device_local: allow_config,
-    }
+        .and_then(|(st, _)| st.saves.get(save_id).map(|s| s.gate(allow_config)))
+        // No row, no game: the kernel decides by name alone.
+        .unwrap_or_else(|| hoard_core::kernel::fileclass::RestoreGate {
+            allow_device_local: allow_config,
+            ..Default::default()
+        })
 }
 
 #[tauri::command]
@@ -411,25 +406,18 @@ pub async fn restore_snapshot(
             .ok_or_else(|| "NEEDS_DESTINATION".to_string())?
     };
 
-    // Slug/label for the cloud upload init (ignored by self-hosted). A save new to
-    // this machine has no row yet, so they come from the plan.
-    let (game_slug, label) = match &home {
-        Some(home) => (home.game_slug.clone(), home.label.clone()),
-        None => cli_state
-            .saves
-            .get(&save_id)
-            .map(|s| (s.game_slug.clone(), s.label.clone()))
-            .unwrap_or_default(),
-    };
-    // The safety copy walks what the save consists of, like every other backup.
-    // A save new to this machine has no row: the plan carries the server's list.
-    let include = match &home {
-        Some(home) => home.include.clone(),
-        None => cli_state
-            .saves
-            .get(&save_id)
-            .map(|s| s.include.clone())
-            .unwrap_or_default(),
+    // Slug/label for the cloud upload init (ignored by self-hosted), and the
+    // include list the safety copy and the restore gate walk, like every other
+    // backup. A save new to this machine has no row yet: the plan carries the
+    // server's answer.
+    let (game_slug, label, include) = match (&home, cli_state.saves.get(&save_id)) {
+        (Some(home), _) => (
+            home.game_slug.clone(),
+            home.label.clone(),
+            home.include.clone(),
+        ),
+        (None, Some(s)) => (s.game_slug.clone(), s.label.clone(), s.include.clone()),
+        (None, None) => Default::default(),
     };
 
     // 1) Optional pre-restore backup. Done synchronously so the user can be
@@ -501,18 +489,10 @@ pub async fn restore_snapshot(
             // dedup against is the destination itself: anything already there
             // with the right bytes is copied (or left) instead of re-downloaded.
             reuse_from: Some(local_path.clone()),
-            // The shields go by game, and `restore_gate` reads the game from the
-            // row, which a save new to this machine does not have yet.
-            gate: match &home {
-                // New to this machine: the server's list came with the plan, so
-                // the gate and the safety copy above walk the same files.
-                Some(home) => hoard_core::kernel::fileclass::RestoreGate {
-                    shields: hoard_agent::savefilter::shields_for_slug(&home.game_slug),
-                    include: home.include.clone(),
-                    allow_device_local: allow_config,
-                },
-                None => restore_gate(&save_id, allow_config),
-            },
+            // The same game and list as the safety copy above, so the gate and
+            // the copy walk the same files; the preview's gate reads them from
+            // the row, which this may have just given the save.
+            gate: hoard_agent::savefilter::gate_for_save(&game_slug, &include, allow_config),
         },
         move |downloaded, total| {
             let _ = app_for_dl.emit(

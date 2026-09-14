@@ -726,6 +726,14 @@ pub enum IpcError {
     /// change what they asked for.
     #[error("{message}")]
     Invalid { message: String },
+    /// The server refused for a reason other than a 409: `code` is one of
+    /// `unauthorized`, `forbidden`, `not_found`, `bad_request`, `throttled`,
+    /// `quota_full`, for a client that sorts refusals into its own groups;
+    /// `message` is what the user reads. The engine refuses a world verb the
+    /// same way: `not_watched` for a save it does not track, `not_shared` for
+    /// one that is not shared with a group.
+    #[error("{message}")]
+    Refused { code: String, message: String },
     #[error("the Hoard service couldn't do it: {message}")]
     Internal { message: String },
 }
@@ -1454,5 +1462,26 @@ mod tests {
         assert!(matches!(back, IpcError::CloudSessionExpired { .. }));
         // It reaches the user readable (toast, stdout), not as `{:?}`.
         assert!(back.to_string().contains("revoked"));
+    }
+
+    /// A server refusal keeps its code on the wire; the shape is contract.
+    #[test]
+    fn a_server_refusal_keeps_its_code() {
+        let err = IpcError::Refused {
+            code: "not_found".into(),
+            message: "not found (404)".into(),
+        };
+        let json = serde_json::to_value(&err).unwrap();
+        assert_eq!(
+            json,
+            serde_json::json!({
+                "error": "refused",
+                "code": "not_found",
+                "message": "not found (404)",
+            })
+        );
+        let back: IpcError = serde_json::from_value(json).unwrap();
+        assert!(matches!(back, IpcError::Refused { ref code, .. } if code == "not_found"));
+        assert_eq!(back.to_string(), "not found (404)");
     }
 }

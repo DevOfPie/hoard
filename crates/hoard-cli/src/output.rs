@@ -15,6 +15,7 @@
 use anyhow::Result;
 use hoard_agent::api::ApiError;
 use serde::Serialize;
+use std::borrow::Cow;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 /// Set once from `main` after parsing the global `--json` flag.
@@ -118,8 +119,8 @@ pub fn require_token(cfg: &hoard_agent::config::CliConfig) -> Result<String> {
 /// A failure, sorted into something a caller can act on.
 pub struct Classified {
     /// Stable vocabulary. New codes may appear; existing ones don't change
-    /// meaning.
-    pub code: &'static str,
+    /// meaning. Owned only when the service relays a server tag.
+    pub code: Cow<'static, str>,
     /// Grouped so a shell script can branch without parsing JSON. Codes within a
     /// group share a reaction, which is the whole point of the grouping:
     /// 2 sign in, 3 it isn't there, 4 wait, 5 free space or upgrade,
@@ -132,7 +133,7 @@ pub struct Classified {
 /// Sort an error into a code, an exit status and (for 429) a wait.
 pub fn classify(e: &anyhow::Error) -> Classified {
     let plain = |code: &'static str, exit: i32| Classified {
-        code,
+        code: Cow::Borrowed(code),
         exit,
         retry_after_seconds: None,
     };
@@ -146,13 +147,40 @@ pub fn classify(e: &anyhow::Error) -> Classified {
         return plain(c.code, exit);
     }
 
-    // Refusals relayed by the service keep the server's grouping: a 409 is
-    // `conflict` whether it came over HTTP or the socket, and a request the
-    // user has to change is `bad_request`. Every other service failure stays
-    // generic; its message already says what happened.
+    // Refusals relayed by the service keep the server's tag: a 409 arrives
+    // with the code the daemon names (`held`, `stale`, `lease_required`,
+    // `not_shared`, `conflict`), still exit 1, and a request the user has to
+    // change is `bad_request`. Any other refusal is relayed with its code and
+    // grouped as the HTTP road groups the same answer. A service with no
+    // session to act with is the sign-in group. Every other service failure
+    // stays generic; its message already says what happened.
     match e.downcast_ref::<hoard_core::ipc::IpcError>() {
-        Some(hoard_core::ipc::IpcError::Conflict { .. }) => return plain("conflict", 1),
+        Some(hoard_core::ipc::IpcError::Conflict { code, .. }) => {
+            // An untagged 409 is still a conflict, never an empty code.
+            let code = if code.is_empty() {
+                Cow::Borrowed("conflict")
+            } else {
+                Cow::Owned(code.clone())
+            };
+            return Classified {
+                code,
+                exit: 1,
+                retry_after_seconds: None,
+            };
+        }
+        Some(hoard_core::ipc::IpcError::Refused { code, .. }) => {
+            return Classified {
+                code: Cow::Owned(code.clone()),
+                exit: refused_exit(code),
+                retry_after_seconds: None,
+            };
+        }
         Some(hoard_core::ipc::IpcError::Invalid { .. }) => return plain("bad_request", 1),
+        Some(
+            hoard_core::ipc::IpcError::EngineDown { .. }
+            | hoard_core::ipc::IpcError::NoServerSession { .. }
+            | hoard_core::ipc::IpcError::CloudSessionExpired { .. },
+        ) => return plain("no_session", 2),
         _ => {}
     }
 
@@ -170,7 +198,7 @@ pub fn classify(e: &anyhow::Error) -> Classified {
             retry_after_seconds,
             ..
         }) => Classified {
-            code: "rate_limited",
+            code: Cow::Borrowed("rate_limited"),
             exit: 4,
             retry_after_seconds: Some(*retry_after_seconds),
         },
@@ -190,6 +218,31 @@ pub fn classify(e: &anyhow::Error) -> Classified {
     }
 }
 
+/// The exit group of a refusal the service relays, by its code: the same group
+/// the matching `ApiError` gets. A throttle's wait is in its message only.
+fn refused_exit(code: &str) -> i32 {
+    match code {
+        "unauthorized" | "forbidden" => 2,
+        "not_found" | "not_watched" => 3,
+        "throttled" => 4,
+        "quota_full" => 5,
+        // `bad_request`, `not_shared`, `needs_input` and whatever a newer
+        // service sends.
+        _ => 1,
+    }
+}
+
+/// `s` cut to `max` characters for a table cell, the last one an ellipsis when
+/// anything was dropped. Tables only: JSON never truncates.
+pub fn truncate(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        s.to_string()
+    } else {
+        let cut: String = s.chars().take(max.saturating_sub(1)).collect();
+        format!("{cut}…")
+    }
+}
+
 /// Print the failure envelope (`--json`) or the plain `error: …` line.
 /// Returns the exit code `main` should use.
 pub fn emit_error(e: &anyhow::Error) -> i32 {
@@ -198,7 +251,7 @@ pub fn emit_error(e: &anyhow::Error) -> i32 {
         let env = Err_ {
             ok: false,
             error: ErrBody {
-                code: c.code,
+                code: &c.code,
                 message: format!("{e:#}"),
                 retry_after_seconds: c.retry_after_seconds,
             },
@@ -248,24 +301,87 @@ mod tests {
         assert_eq!(c.exit, 1);
     }
 
-    /// A 409 the service relays keeps the `conflict` code the HTTP one has, so
-    /// a script branches the same way whichever road the refusal took; and it
-    /// prints as the server's one line, not as the variant.
+    /// A 409 the service relays keeps the daemon's own tag, so a script can
+    /// tell `held` from `stale` without parsing the sentence; exit 1 as any
+    /// conflict. It prints as the server's one line, not as the variant.
+    /// Changed on purpose: this used to flatten every tag to `conflict`.
     #[test]
-    fn a_relayed_conflict_is_a_conflict() {
+    fn a_relayed_conflict_keeps_its_code() {
         use hoard_core::ipc::IpcError;
         let e = anyhow::Error::new(IpcError::Conflict {
             code: "held".into(),
             message: "another member is hosting this save".into(),
         });
-        assert_eq!(classify(&e).code, "conflict");
+        assert_eq!(classify(&e).code, "held");
         assert_eq!(classify(&e).exit, 1);
+        for code in ["stale", "lease_required", "not_shared", "conflict"] {
+            let e = anyhow::Error::new(IpcError::Conflict {
+                code: code.into(),
+                message: "no".into(),
+            });
+            assert_eq!(classify(&e).code, code);
+            assert_eq!(classify(&e).exit, 1);
+        }
         assert_eq!(format!("{e:#}"), "another member is hosting this save");
+        let e = anyhow::Error::new(IpcError::Conflict {
+            code: String::new(),
+            message: "no".into(),
+        });
+        assert_eq!(classify(&e).code, "conflict");
         let e = anyhow::Error::new(IpcError::Invalid {
             message: "`a/b` is not a world name".into(),
         });
         assert_eq!(classify(&e).code, "bad_request");
         assert_eq!(format!("{e:#}"), "`a/b` is not a world name");
+    }
+
+    /// Every code the service relays lands in the group its HTTP twin does,
+    /// keeps its own name, and prints as the service's message.
+    #[test]
+    fn relayed_refusals_keep_their_code_and_group() {
+        use hoard_core::ipc::IpcError;
+        for (code, exit) in [
+            ("unauthorized", 2),
+            ("forbidden", 2),
+            ("not_found", 3),
+            ("not_watched", 3),
+            ("throttled", 4),
+            ("quota_full", 5),
+            ("bad_request", 1),
+            ("not_shared", 1),
+            ("needs_input", 1),
+            ("something_newer", 1),
+        ] {
+            let e = anyhow::Error::new(IpcError::Refused {
+                code: code.into(),
+                message: format!("refused: {code}"),
+            });
+            let c = classify(&e);
+            assert_eq!((c.code.as_ref(), c.exit), (code, exit), "{code}");
+            assert_eq!(c.retry_after_seconds, None);
+            assert_eq!(format!("{e:#}"), format!("refused: {code}"));
+        }
+        for e in [
+            IpcError::EngineDown {
+                reason: "no session".into(),
+            },
+            IpcError::NoServerSession {
+                reason: "none".into(),
+            },
+            IpcError::CloudSessionExpired {
+                reason: "revoked".into(),
+            },
+        ] {
+            let c = classify(&anyhow::Error::new(e));
+            assert_eq!((c.code.as_ref(), c.exit), ("no_session", 2));
+        }
+    }
+
+    #[test]
+    fn truncate_marks_what_it_cut() {
+        assert_eq!(truncate("raid", 4), "raid");
+        assert_eq!(truncate("friends", 4), "fri…");
+        assert_eq!(truncate("días", 3), "dí…");
     }
 
     /// Context added with `.context(…)` must not hide the typed cause.

@@ -124,6 +124,12 @@ export const prompts = writable<WorldPrompt[]>([]);
  *  panel whenever `prompts` has rows. */
 export const claimModalOpen = writable(false);
 
+// The dialog follows the prompts: once none is left, however it was answered
+// (either window, the clock, the game stopping), it is closed.
+prompts.subscribe((list) => {
+  if (list.length === 0) claimModalOpen.set(false);
+});
+
 /** Prompts answered from this window, by game, with the `raised_at` they
  *  had. A snapshot read between the answer and the engine's next status still
  *  lists the question; without this the panel would flash back for a poll. A
@@ -179,30 +185,26 @@ async function mainWindowFocused(): Promise<boolean> {
 async function onClaimWanted(ev: AgentEvent): Promise<void> {
   if (ev.type !== "world_claim_wanted" || isReplaying()) return;
   // The status carries the clock the event does not; the relay re-reads it
-  // before emitting this event, so the snapshot is current. Should the read
-  // fail, the event's worlds are drawn without a countdown.
-  let list: WorldPrompt[] = [];
+  // before emitting this event, so the snapshot is current. The status is
+  // the only source: a game it does not list (already answered, or its world
+  // held here) is not asked about.
+  let list: WorldPrompt[];
   try {
     list = (await api.agentSnapshot()).prompts;
-  } catch {
-    /* drawn from the event below */
+  } catch (e) {
+    console.debug("claim prompt: status read failed, nothing raised:", e);
+    return;
   }
   if (!list.some((p) => p.game_slug === ev.game_slug)) {
-    list = [
-      ...list,
-      {
-        game_slug: ev.game_slug,
-        worlds: ev.worlds,
-        auto_host_at: null,
-        raised_at: new Date().toISOString(),
-      },
-    ];
+    console.debug(`claim prompt: status has no prompt for ${ev.game_slug}, nothing raised`);
+    return;
   }
   answered.delete(ev.game_slug);
   adoptPrompts(list);
   if (await mainWindowFocused()) {
     claimModalOpen.set(true);
   } else {
+    claimModalOpen.set(false);
     await api.overlayShow().catch((e) => console.warn("couldn't raise the HUD for the claim prompt:", e));
   }
 }
@@ -227,12 +229,13 @@ async function noticeWorldEvent(ev: AgentEvent): Promise<void> {
   switch (ev.type) {
     case "world_hosted_elsewhere": {
       const world = prettifySlug(ev.game_slug);
-      pushNotification({
-        id: hostedElsewhereId(ev.save_id),
-        title: tr("claim.notice_hosted_elsewhere_title", { holder: ev.holder, world }),
-        body: tr("claim.notice_hosted_elsewhere_body"),
-        priority: "normal",
-      });
+      // A later hold on the same save refreshes the row (holder, text); its
+      // side-copy button stays.
+      const id = hostedElsewhereId(ev.save_id);
+      const title = tr("claim.notice_hosted_elsewhere_title", { holder: ev.holder, world });
+      const body = tr("claim.notice_hosted_elsewhere_body");
+      pushNotification({ id, title, body, priority: "normal" });
+      updateNotification(id, { title, body });
       if (await mainWindowFocused()) {
         toastInfo(tr("claim.toast_hosted_elsewhere", { holder: ev.holder, world }));
       }

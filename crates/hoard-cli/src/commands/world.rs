@@ -1,13 +1,19 @@
-//! `hoard world`: who hosts a shared world. The verbs are engine commands the
-//! service acknowledges at once; what came of them arrives as events, which
-//! `hoard sync logs` shows and `hoard world lease` reads back from the server.
+//! `hoard world`: who hosts a shared world. The verbs are engine commands: the
+//! service refuses one for a save that is not a shared world here, and
+//! otherwise answers once the engine has taken it. What the server makes of the
+//! lease arrives as events, which `hoard sync logs` shows and `hoard world
+//! lease` reads back from the server.
+//! The tables (`hoard saves`, `hoard status`) read who hosts from the engine
+//! instead, see [`Hosts`].
+
+use std::collections::HashMap;
 
 use anyhow::Result;
 use clap::Subcommand;
 use serde::Serialize;
 use time::format_description::well_known::Rfc3339;
 
-use hoard_core::ipc::{Payload, Request, WorldRole};
+use hoard_core::ipc::{DaemonStatus, Payload, Request, WorldLease, WorldRole};
 use hoard_core::wire::Lease;
 use hoardd::client::Client;
 
@@ -17,14 +23,13 @@ use crate::output;
 #[derive(Subcommand)]
 pub enum WorldCommand {
     /// Take a role on a shared world: host it (acquire the lease, your changes
-    /// upload) or only view it (pull, never push)
+    /// upload), which is the default, or only view it with `--view` (pull,
+    /// never push)
     Claim {
         /// Save id (UUID), see `hoard saves`
         save_id: String,
-        /// Host the world: the default
-        #[arg(long, conflicts_with = "view")]
-        host: bool,
-        /// View the world only: your writes to it stay on this machine
+        /// View the world instead of hosting it: your writes to it stay on this
+        /// machine
         #[arg(long)]
         view: bool,
     },
@@ -57,20 +62,31 @@ pub enum WorldCommand {
 pub struct LeaseOut {
     pub save_id: String,
     /// Null when nobody holds the lease.
-    pub holder: Option<String>,
-    /// The lease is held by this machine.
+    pub lease: Option<LeaseDetail>,
+}
+
+/// A held lease.
+#[derive(Serialize)]
+pub struct LeaseDetail {
+    pub holder: String,
+    /// The lease is held here: the engine's verdict when it watches the save,
+    /// otherwise this machine's fingerprint against the one on the lease.
     pub here: bool,
-    pub acquired_at: Option<String>,
-    pub renewed_at: Option<String>,
-    pub base_version: Option<i64>,
+    /// RFC3339.
+    pub acquired_at: String,
+    /// RFC3339: the last heartbeat.
+    pub renewed_at: String,
+    pub base_version: i64,
+    /// Heartbeats are arriving; a quiet lease is free to take.
     pub live: bool,
+    /// The holder has pushed under it, so it can no longer be forced.
     pub pushed_since: bool,
 }
 
 pub async fn run(cmd: WorldCommand) -> Result<()> {
     let mut client = link::require("world").await?;
     match cmd {
-        WorldCommand::Claim { save_id, view, .. } => {
+        WorldCommand::Claim { save_id, view } => {
             let role = if view {
                 WorldRole::View
             } else {
@@ -126,31 +142,30 @@ pub async fn run(cmd: WorldCommand) -> Result<()> {
         }
         WorldCommand::Lease { save_id } => {
             let lease = lease(&mut client, &save_id).await?;
-            let my_fp = this_device();
+            // Asked on the same connection; a service that cannot say leaves
+            // `here` to the fingerprint.
+            let engine = match link::ask(&mut client, Request::Status).await {
+                Ok(Payload::Status(status)) => Hosts::from_status(&status).lease(&save_id),
+                _ => None,
+            };
             let out = LeaseOut {
                 save_id: save_id.clone(),
-                holder: lease.as_ref().map(|l| l.holder_username.to_string()),
-                here: lease.as_ref().is_some_and(|l| held_here(l, &my_fp)),
-                acquired_at: lease.as_ref().map(|l| rfc3339(l.acquired_at)),
-                renewed_at: lease.as_ref().map(|l| rfc3339(l.renewed_at)),
-                base_version: lease.as_ref().map(|l| l.base_version),
-                live: lease.as_ref().is_some_and(|l| l.live),
-                pushed_since: lease.as_ref().is_some_and(|l| l.pushed_since),
+                lease: lease.as_ref().map(|l| detail(l, engine, &this_device())),
             };
             output::emit(&out, |o| {
-                let Some(holder) = &o.holder else {
+                let Some(l) = &o.lease else {
                     println!("{}: nobody is hosting", o.save_id);
                     return;
                 };
                 println!(
                     "holder:  {}{}\nsince:   {}\nrenewed: {}\nbase:    v{}\nlive:    {}\npushed:  {}",
-                    holder,
-                    if o.here { " (this machine)" } else { "" },
-                    o.acquired_at.as_deref().unwrap_or("—"),
-                    o.renewed_at.as_deref().unwrap_or("—"),
-                    o.base_version.unwrap_or(0),
-                    yes_no(o.live),
-                    yes_no(o.pushed_since),
+                    l.holder,
+                    if l.here { " (this machine)" } else { "" },
+                    l.acquired_at,
+                    l.renewed_at,
+                    l.base_version,
+                    yes_no(l.live),
+                    yes_no(l.pushed_since),
                 );
             })
         }
@@ -172,39 +187,88 @@ pub async fn lease(client: &mut Client, save_id: &str) -> Result<Option<Lease>> 
     }
 }
 
-/// "hosted here" or "hosted by alice" for a live lease; `None` when nobody is
-/// hosting, the lease has gone quiet, or the service could not say. For the
-/// tables: a column that is blank rather than wrong when the answer is not
-/// there.
-pub async fn hosted(client: &mut Client, save_id: &str, my_fp: &str) -> Option<String> {
-    match lease(client, save_id).await {
-        Ok(lease) => lease.as_ref().and_then(|l| hosted_label(l, my_fp)),
-        Err(err) => {
-            tracing::debug!(error = %format!("{err:#}"), "cli: couldn't read the lease on {save_id}");
-            None
+/// Who hosts each shared save, as the engine last heard it: every slot's lease
+/// from one status read, so a table costs one local call and no server call.
+pub struct Hosts {
+    slots: HashMap<String, (Option<WorldLease>, Option<String>)>,
+}
+
+/// A table's host cell and the lease behind it.
+#[derive(Debug, PartialEq)]
+pub struct Host {
+    /// "hosted here", "hosted by <name>", "nobody" or "unknown".
+    pub cell: String,
+    /// "mine", "other", "free" or "unknown", for a script to branch on.
+    pub lease: &'static str,
+}
+
+impl Hosts {
+    /// `None` with no service answering: no column rather than a wrong one.
+    pub async fn read() -> Option<Hosts> {
+        link::status().await.map(|s| Hosts::from_status(&s))
+    }
+
+    pub fn from_status(status: &DaemonStatus) -> Hosts {
+        Hosts {
+            slots: status
+                .slots
+                .iter()
+                .map(|s| (s.save_id.clone(), (s.lease, s.lease_holder.clone())))
+                .collect(),
         }
     }
+
+    /// The engine's lease on `save_id`, `None` when it has no shared slot for it.
+    pub fn lease(&self, save_id: &str) -> Option<WorldLease> {
+        self.slots.get(save_id).and_then(|(lease, _)| *lease)
+    }
+
+    /// The host of a shared save. One the engine has no slot for is unknown.
+    pub fn of(&self, save_id: &str) -> Host {
+        let holder = self.slots.get(save_id).and_then(|(_, h)| h.as_deref());
+        host(self.lease(save_id).unwrap_or(WorldLease::Unknown), holder)
+    }
+}
+
+fn host(lease: WorldLease, holder: Option<&str>) -> Host {
+    let (cell, tag) = match lease {
+        WorldLease::Mine => ("hosted here".to_string(), "mine"),
+        WorldLease::Other => (
+            holder
+                .map(|h| format!("hosted by {h}"))
+                .unwrap_or_else(|| "hosted elsewhere".to_string()),
+            "other",
+        ),
+        WorldLease::Free => ("nobody".to_string(), "free"),
+        WorldLease::Unknown => ("unknown".to_string(), "unknown"),
+    };
+    Host { cell, lease: tag }
 }
 
 /// This machine's fingerprint, the one the service stamps on a lease it takes.
-pub fn this_device() -> String {
+fn this_device() -> String {
     hoard_agent::logship::device_identity().fingerprint
 }
 
-fn held_here(lease: &Lease, my_fp: &str) -> bool {
-    lease.holder_device_fp.as_deref() == Some(my_fp)
+/// Whether the lease is held here. The engine decides by account when it has a
+/// slot for the save; only without one does the fingerprint on the lease say.
+fn held_here(lease: &Lease, engine: Option<WorldLease>, my_fp: &str) -> bool {
+    match engine {
+        Some(verdict) => verdict == WorldLease::Mine,
+        None => lease.holder_device_fp.as_deref() == Some(my_fp),
+    }
 }
 
-/// The label a table shows for a lease: only a live one names a holder.
-pub fn hosted_label(lease: &Lease, my_fp: &str) -> Option<String> {
-    if !lease.live {
-        return None;
+fn detail(lease: &Lease, engine: Option<WorldLease>, my_fp: &str) -> LeaseDetail {
+    LeaseDetail {
+        holder: lease.holder_username.to_string(),
+        here: held_here(lease, engine, my_fp),
+        acquired_at: rfc3339(lease.acquired_at),
+        renewed_at: rfc3339(lease.renewed_at),
+        base_version: lease.base_version,
+        live: lease.live,
+        pushed_since: lease.pushed_since,
     }
-    Some(if held_here(lease, my_fp) {
-        "hosted here".to_string()
-    } else {
-        format!("hosted by {}", lease.holder_username)
-    })
 }
 
 fn rfc3339(t: time::OffsetDateTime) -> String {
@@ -242,26 +306,102 @@ mod tests {
     #[test]
     fn a_live_lease_on_this_machine_is_hosted_here() {
         assert_eq!(
-            hosted_label(&lease(Some("fp-me"), true), "fp-me").as_deref(),
-            Some("hosted here")
+            host(WorldLease::Mine, None),
+            Host {
+                cell: "hosted here".into(),
+                lease: "mine"
+            }
         );
+        // The engine's verdict wins over the fingerprint, both ways.
+        let l = lease(Some("fp-them"), true);
+        assert!(held_here(&l, Some(WorldLease::Mine), "fp-me"));
+        let l = lease(Some("fp-me"), true);
+        assert!(!held_here(&l, Some(WorldLease::Other), "fp-me"));
+        // With no slot the fingerprint decides.
+        assert!(held_here(&l, None, "fp-me"));
     }
 
     #[test]
     fn a_live_lease_elsewhere_names_the_holder() {
         assert_eq!(
-            hosted_label(&lease(Some("fp-them"), true), "fp-me").as_deref(),
-            Some("hosted by alice")
+            host(WorldLease::Other, Some("alice")).cell,
+            "hosted by alice"
         );
-        // A server that kept no fingerprint still names the holder.
+        assert_eq!(host(WorldLease::Other, None).cell, "hosted elsewhere");
+        assert_eq!(host(WorldLease::Other, None).lease, "other");
+        // A server that kept no fingerprint is not held here.
+        assert!(!held_here(&lease(None, true), None, "fp-me"));
+    }
+
+    /// Every shared save gets a cell: a slot the engine has no lease for, or
+    /// no slot at all, is unknown rather than blank.
+    #[test]
+    fn hosts_read_every_slot_from_one_status() {
+        use hoard_core::ipc::AgentSlotStatus;
+        let slot = |id: &str, lease: Option<WorldLease>, holder: Option<&str>| AgentSlotStatus {
+            save_id: id.into(),
+            display_name: id.into(),
+            path: "/saves".into(),
+            watcher_armed: true,
+            process_running: false,
+            last_fs_event_at: None,
+            next_scheduled_backup_at: None,
+            shared: lease.is_some(),
+            lease,
+            lease_holder: holder.map(String::from),
+        };
+        let mut status: DaemonStatus = serde_json::from_value(serde_json::json!({
+            "daemon_version": "0", "protocol": 1, "pid": 1, "epoch": "e",
+            "uptime_secs": 0, "cursor": 0, "engine": {"running": true}, "slots": []
+        }))
+        .unwrap();
+        status.slots = vec![
+            slot("s1", Some(WorldLease::Mine), None),
+            slot("s2", Some(WorldLease::Other), Some("bob")),
+            slot("s3", Some(WorldLease::Free), None),
+            slot("s4", None, None),
+        ];
+        let hosts = Hosts::from_status(&status);
+        assert_eq!(hosts.of("s1").cell, "hosted here");
+        assert_eq!(hosts.of("s2").cell, "hosted by bob");
+        assert_eq!(hosts.of("s3"), host(WorldLease::Free, None));
+        assert_eq!(hosts.of("s4").lease, "unknown");
+        assert_eq!(hosts.of("gone").cell, "unknown");
+        assert_eq!(hosts.lease("s4"), None);
+        assert_eq!(hosts.lease("s2"), Some(WorldLease::Other));
+    }
+
+    /// No lease is one `null`, not a row of `false`s that reads as a lease.
+    #[test]
+    fn no_lease_is_null_and_a_lease_is_whole() {
+        let none = LeaseOut {
+            save_id: "s1".into(),
+            lease: None,
+        };
         assert_eq!(
-            hosted_label(&lease(None, true), "fp-me").as_deref(),
-            Some("hosted by alice")
+            serde_json::to_value(&none).unwrap(),
+            serde_json::json!({"save_id": "s1", "lease": null})
         );
+        let some = LeaseOut {
+            save_id: "s1".into(),
+            lease: Some(detail(&lease(Some("fp-me"), true), None, "fp-me")),
+        };
+        let v = serde_json::to_value(&some).unwrap();
+        assert_eq!(v["lease"]["holder"], "alice");
+        assert_eq!(v["lease"]["here"], true);
+        assert_eq!(v["lease"]["base_version"], 4);
+        assert_eq!(v["lease"]["acquired_at"], "1970-01-01T00:00:00Z");
     }
 
     #[test]
     fn a_quiet_lease_shows_nothing() {
-        assert_eq!(hosted_label(&lease(Some("fp-me"), false), "fp-me"), None);
+        // The engine calls a lease nobody renews free; the cell says so.
+        assert_eq!(
+            host(WorldLease::Free, Some("alice")),
+            Host {
+                cell: "nobody".into(),
+                lease: "free"
+            }
+        );
     }
 }

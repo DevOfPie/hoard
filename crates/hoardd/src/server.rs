@@ -368,7 +368,8 @@ impl Daemon {
                 self.with_engine(|h| async move { h.set_global_sync(enabled).await })
                     .await
             }
-            // The world verbs are engine commands: the outcome arrives as events.
+            // The world verbs are engine commands: the outcome arrives as events,
+            // and a save that is not a shared world here is refused up front.
             Request::ClaimWorld { save_id, role } => {
                 self.with_engine(|h| async move { h.claim_world(save_id, role).await })
                     .await
@@ -467,39 +468,22 @@ impl Daemon {
                 group_id,
                 world,
             } => {
-                let Some(client) = self.engine.client() else {
-                    return Reply::Error(IpcError::EngineDown {
-                        reason: self.engine.down_reason(),
-                    });
-                };
-                match hoard_agent::library::share_save(
-                    &client,
-                    &save_id,
-                    &group_id,
-                    world.as_deref(),
-                )
+                self.with_client(|c| async move {
+                    let (save, reseat) =
+                        hoard_agent::library::share_save(&c, &save_id, &group_id, world.as_deref())
+                            .await?;
+                    engine::apply_reseat(&self.engine, reseat).await;
+                    Ok(Payload::Save(Box::new(save)))
+                })
                 .await
-                {
-                    Ok((save, watched)) => {
-                        self.reseat(watched).await;
-                        Reply::Ok(Payload::Save(Box::new(save)))
-                    }
-                    Err(err) => self.share_error(err),
-                }
             }
             Request::UnshareSave { save_id } => {
-                let Some(client) = self.engine.client() else {
-                    return Reply::Error(IpcError::EngineDown {
-                        reason: self.engine.down_reason(),
-                    });
-                };
-                match hoard_agent::library::unshare_save(&client, &save_id).await {
-                    Ok(watched) => {
-                        self.reseat(watched).await;
-                        Reply::Ok(Payload::Ack)
-                    }
-                    Err(err) => self.share_error(err),
-                }
+                self.with_client(|c| async move {
+                    let reseat = hoard_agent::library::unshare_save(&c, &save_id).await?;
+                    engine::apply_reseat(&self.engine, reseat).await;
+                    Ok(Payload::Ack)
+                })
+                .await
             }
             Request::GetLease { save_id } => {
                 self.with_client(|c| async move {
@@ -577,48 +561,12 @@ impl Daemon {
         }
     }
 
-    /// The slot picks up its rewritten row. The share already happened on the
-    /// server, so a slot that cannot be re-seated is logged, not reported: the
-    /// next `Reload` or restart seats it from the row.
-    async fn reseat(&self, watched: Option<hoard_agent::agent::WatchedSave>) {
-        let Some(watched) = watched else { return };
-        if let Err(err) = engine::reseat(&self.engine, watched).await {
-            tracing::warn!(error = %format!("{err:#}"), "hoardd: couldn't re-seat the shared save");
-        }
-    }
-
-    /// A share refused before the server was asked (a world name that is not a
-    /// stem, a game with no template) is the caller's to fix, so it is
-    /// `Invalid`; the rest is the server's answer.
-    fn share_error(&self, err: anyhow::Error) -> Reply {
-        if err
-            .downcast_ref::<hoard_agent::library::ShareError>()
-            .is_some()
-        {
-            return Reply::Error(IpcError::Invalid {
-                message: format!("{err:#}"),
-            });
-        }
-        self.api_error(err)
-    }
-
-    /// A 409 keeps its code: the client branches on `held`, `stale`, `pushed`
-    /// and the rest rather than on the sentence. Everything else is `Internal`.
+    /// A share refused before the server was asked is the caller's to fix; see
+    /// [`share_refusal`]. Server refusals keep a code; see [`server_refusal`].
+    /// Everything else is `Internal`.
     fn api_error(&self, err: anyhow::Error) -> Reply {
-        use hoard_agent::api::ApiError;
-        let code = match err.downcast_ref::<ApiError>() {
-            Some(ApiError::LeaseHeld(_)) => Some("held"),
-            Some(ApiError::LeaseStale(_)) => Some("stale"),
-            Some(ApiError::LeaseRequired(_)) => Some("lease_required"),
-            Some(ApiError::NotShared) => Some("not_shared"),
-            Some(ApiError::Conflict(_)) => Some("conflict"),
-            _ => None,
-        };
-        if let Some(code) = code {
-            return Reply::Error(IpcError::Conflict {
-                code: code.to_string(),
-                message: format!("{err:#}"),
-            });
+        if let Some(refusal) = share_refusal(&err).or_else(|| server_refusal(&err)) {
+            return Reply::Error(refusal);
         }
         tracing::warn!(error = %format!("{err:#}"), "hoardd: a server call failed");
         Reply::Error(IpcError::Internal {
@@ -629,7 +577,11 @@ impl Daemon {
     /// A command that does not reach the engine almost always means the engine is
     /// gone (a closed channel), so it is reported as `EngineDown` with whatever reason
     /// the keeper recorded, not as an opaque `Internal`.
+    /// An engine that answered with a refusal is up, so that is checked first.
     fn engine_error(&self, err: anyhow::Error) -> Reply {
+        if let Some(refusal) = world_refusal(&err) {
+            return Reply::Error(refusal);
+        }
         tracing::warn!(error = %format!("{err:#}"), "hoardd: a request failed");
         if self.engine.handle().is_none() {
             return Reply::Error(IpcError::EngineDown {
@@ -872,6 +824,168 @@ async fn push_loop(
                     .await;
             }
             Err(broadcast::error::RecvError::Closed) => return,
+        }
+    }
+}
+
+/// A server refusal with its stable code, `None` for anything else. A 409 is
+/// `Conflict` and keeps its own tag (`held`, `stale`...), because the client
+/// branches on it; the other refusals are `Refused`, so a client can tell a
+/// sign-in problem or a missing save from a failure. A throttle's message
+/// already carries its retry-after.
+fn server_refusal(err: &anyhow::Error) -> Option<IpcError> {
+    use hoard_agent::api::ApiError;
+    let api = err.downcast_ref::<ApiError>()?;
+    let message = format!("{err:#}");
+    let conflict = match api {
+        ApiError::LeaseHeld(_) => Some("held"),
+        ApiError::LeaseStale(_) => Some("stale"),
+        ApiError::LeaseRequired(_) => Some("lease_required"),
+        ApiError::NotShared => Some("not_shared"),
+        ApiError::Conflict(_) => Some("conflict"),
+        _ => None,
+    };
+    if let Some(code) = conflict {
+        return Some(IpcError::Conflict {
+            code: code.to_string(),
+            message,
+        });
+    }
+    let code = match api {
+        ApiError::Unauthorized => "unauthorized",
+        ApiError::Forbidden => "forbidden",
+        ApiError::NotFound => "not_found",
+        ApiError::BadRequest(_) => "bad_request",
+        ApiError::RateLimited { .. } => "throttled",
+        ApiError::QuotaExceeded(_) => "quota_full",
+        _ => return None,
+    };
+    Some(IpcError::Refused {
+        code: code.to_string(),
+        message,
+    })
+}
+
+/// A share the engine refused before asking the server. A template game with
+/// no world named is `Refused` with `needs_input` and the worlds it found, so
+/// the caller can ask for one; the rest (a world name that is not a stem, a
+/// game with no template) are `Invalid`.
+fn share_refusal(err: &anyhow::Error) -> Option<IpcError> {
+    use hoard_agent::library::ShareError;
+    let message = format!("{err:#}");
+    Some(match err.downcast_ref::<ShareError>()? {
+        ShareError::NeedsWorld { .. } => IpcError::Refused {
+            code: "needs_input".to_string(),
+            message,
+        },
+        _ => IpcError::Invalid { message },
+    })
+}
+
+/// The engine's refusal of a world verb (a save it does not watch, or does not
+/// share), as a `Refused` naming the save.
+fn world_refusal(err: &anyhow::Error) -> Option<IpcError> {
+    let refused = err.downcast_ref::<hoard_agent::agent::WorldCommandError>()?;
+    Some(IpcError::Refused {
+        code: refused.code().to_string(),
+        message: refused.to_string(),
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{server_refusal, share_refusal, world_refusal};
+    use hoard_agent::agent::WorldCommandError;
+    use hoard_agent::api::{ApiError, RateLimitKind};
+    use hoard_agent::library::ShareError;
+    use hoard_core::ipc::IpcError;
+
+    /// An engine refusal crosses as `Refused` with its code and the save id.
+    #[test]
+    fn world_refusals_keep_their_code_and_save() {
+        for (err, code) in [
+            (WorldCommandError::NotWatched("s-1".into()), "not_watched"),
+            (WorldCommandError::NotShared("s-1".into()), "not_shared"),
+        ] {
+            match world_refusal(&anyhow::Error::new(err)) {
+                Some(IpcError::Refused { code: got, message }) => {
+                    assert_eq!(got, code);
+                    assert!(message.contains("s-1"), "{message}");
+                }
+                other => panic!("unexpected {other:?}"),
+            }
+        }
+        assert!(world_refusal(&anyhow::anyhow!("channel closed")).is_none());
+    }
+
+    /// A template game shared with no world is `needs_input` with the worlds;
+    /// the other share refusals stay `Invalid`, and anything else is not one.
+    #[test]
+    fn a_share_that_needs_a_world_asks_for_one() {
+        let needs = ShareError::NeedsWorld {
+            worlds: vec!["Alpha".into(), "Beta".into()],
+        };
+        match share_refusal(&anyhow::Error::new(needs)) {
+            Some(IpcError::Refused { code, message }) => {
+                assert_eq!(code, "needs_input");
+                assert!(message.ends_with("Alpha, Beta"), "{message}");
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        assert!(matches!(
+            share_refusal(&anyhow::Error::new(ShareError::NoTemplate(
+                "stardew".into()
+            ))),
+            Some(IpcError::Invalid { .. })
+        ));
+        assert!(share_refusal(&anyhow::Error::new(ApiError::NotFound)).is_none());
+    }
+
+    fn code_of(err: ApiError) -> Option<(&'static str, String)> {
+        match server_refusal(&anyhow::Error::new(err).context("sharing")) {
+            Some(IpcError::Refused { code, .. }) => Some(("refused", code)),
+            Some(IpcError::Conflict { code, .. }) => Some(("conflict", code)),
+            Some(other) => panic!("unexpected {other:?}"),
+            None => None,
+        }
+    }
+
+    /// Each server refusal crosses the socket with its code, through context;
+    /// the 409s stay `Conflict`, and what has no code stays out.
+    #[test]
+    fn server_refusals_keep_their_code() {
+        let refused = |c: &str| Some(("refused", c.to_string()));
+        assert_eq!(code_of(ApiError::Unauthorized), refused("unauthorized"));
+        assert_eq!(code_of(ApiError::Forbidden), refused("forbidden"));
+        assert_eq!(code_of(ApiError::NotFound), refused("not_found"));
+        assert_eq!(
+            code_of(ApiError::BadRequest("bad include".into())),
+            refused("bad_request")
+        );
+        assert_eq!(
+            code_of(ApiError::NotShared),
+            Some(("conflict", "not_shared".to_string()))
+        );
+        assert_eq!(
+            code_of(ApiError::Server {
+                status: 500,
+                body: String::new()
+            }),
+            None
+        );
+        assert!(server_refusal(&anyhow::anyhow!("disk full")).is_none());
+
+        let throttled = server_refusal(&anyhow::Error::new(ApiError::RateLimited {
+            kind: RateLimitKind::Paced,
+            retry_after_seconds: 7,
+            body: String::new(),
+        }));
+        match throttled {
+            Some(IpcError::Refused { code, message }) => {
+                assert_eq!(code, "throttled");
+                assert!(message.contains("7s"), "{message}");
+            }
+            other => panic!("unexpected {other:?}"),
         }
     }
 }
