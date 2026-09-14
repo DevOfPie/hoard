@@ -12,7 +12,7 @@ use hoard_core::wire::Group;
 use hoardd::client::Client;
 
 use super::link;
-use crate::output;
+use crate::output::{self, truncate};
 
 #[derive(Subcommand)]
 pub enum GroupCommand {
@@ -147,8 +147,12 @@ pub async fn list(client: &mut Client) -> Result<Vec<Group>> {
 }
 
 /// The id of the group `<group>` names: an id as-is, or an exact name looked up
-/// in the account's groups.
+/// in the account's groups. A UUID goes straight through without listing them:
+/// the server refuses one this account cannot reach.
 pub async fn resolve(client: &mut Client, query: &str) -> Result<String> {
+    if let Some(id) = as_id(query) {
+        return Ok(id);
+    }
     let groups = list(client).await?;
     resolve_in(&groups, query).map_err(|e| output::err(e.code(), e.to_string()))
 }
@@ -197,6 +201,14 @@ impl std::fmt::Display for Lookup {
     }
 }
 
+/// `query` as a group id when it is a canonical UUID, the shape the server
+/// mints; `None` sends it to the name lookup.
+pub fn as_id(query: &str) -> Option<String> {
+    hoard_core::ids::SaveId::parse(query)
+        .ok()
+        .map(|id| id.as_str().to_string())
+}
+
 /// An id wins over a name: an id is unique by construction, a name is not.
 pub fn resolve_in(groups: &[Group], query: &str) -> Result<String, Lookup> {
     if let Some(g) = groups.iter().find(|g| g.id == query) {
@@ -213,17 +225,25 @@ pub fn resolve_in(groups: &[Group], query: &str) -> Result<String, Lookup> {
     }
 }
 
-/// `7d`, `12h`, `30m` or `3600s` as seconds. A bare number is refused: it is
-/// not obvious whether `7` means days or seconds, so the unit has to be said.
+/// The server's cap on an invite's lifetime: one year.
+const MAX_EXPIRY_SECS: u64 = 365 * 86_400;
+
+/// `7d`, `12h`, `30m` or `3600s` as seconds, at most one year. A bare number is
+/// refused: it is not obvious whether `7` means days or seconds, so the unit has
+/// to be said.
 pub fn parse_expiry(raw: &str) -> Result<u64, String> {
     let raw = raw.trim();
     let (digits, unit) = raw.split_at(
         raw.trim_end_matches(|c: char| c.is_ascii_alphabetic())
             .len(),
     );
-    let n: u64 = digits.parse().map_err(|_| {
-        format!("expected a duration such as `7d`, `12h`, `30m` or `3600s`, got `{raw}`")
-    })?;
+    // Digits only: `u64::from_str` would take a leading `+`.
+    let n: u64 = Some(digits)
+        .filter(|d| d.bytes().all(|b| b.is_ascii_digit()))
+        .and_then(|d| d.parse().ok())
+        .ok_or_else(|| {
+            format!("expected a duration such as `7d`, `12h`, `30m` or `3600s`, got `{raw}`")
+        })?;
     let per_unit = match unit {
         "s" => 1,
         "m" => 60,
@@ -235,9 +255,16 @@ pub fn parse_expiry(raw: &str) -> Result<u64, String> {
             ))
         }
     };
-    n.checked_mul(per_unit)
+    let secs = n
+        .checked_mul(per_unit)
         .filter(|&s| s > 0)
-        .ok_or_else(|| format!("`{raw}` is not a usable expiry"))
+        .ok_or_else(|| format!("`{raw}` is not a usable expiry"))?;
+    if secs > MAX_EXPIRY_SECS {
+        return Err(format!(
+            "an invite expires in at most one year, got `{raw}`"
+        ));
+    }
+    Ok(secs)
 }
 
 fn row(g: &Group) -> GroupRow {
@@ -252,15 +279,6 @@ fn row(g: &Group) -> GroupRow {
         name: g.name.clone(),
         owner,
         members: g.members.len(),
-    }
-}
-
-fn truncate(s: &str, max: usize) -> String {
-    if s.chars().count() <= max {
-        s.to_string()
-    } else {
-        let cut: String = s.chars().take(max.saturating_sub(1)).collect();
-        format!("{cut}…")
     }
 }
 
@@ -334,5 +352,33 @@ mod tests {
         assert!(parse_expiry("0d").is_err());
         assert!(parse_expiry("d").is_err());
         assert!(parse_expiry("7w").is_err());
+    }
+
+    #[test]
+    fn expiry_refuses_a_sign() {
+        assert!(parse_expiry("+7d").is_err());
+        assert!(parse_expiry("-7d").is_err());
+    }
+
+    /// The server refuses past a year; saying so here costs no round trip.
+    #[test]
+    fn expiry_is_capped_at_a_year() {
+        assert_eq!(parse_expiry("365d").unwrap(), 365 * 86_400);
+        assert_eq!(parse_expiry("8760h").unwrap(), 365 * 86_400);
+        let err = parse_expiry("366d").unwrap_err();
+        assert!(err.contains("at most one year"), "{err}");
+        assert!(parse_expiry("8761h").is_err());
+        // Overflow stays its own refusal, not a panic.
+        assert!(parse_expiry("99999999999999999999d").is_err());
+    }
+
+    #[test]
+    fn a_uuid_skips_the_lookup_and_a_name_does_not() {
+        let id = "0f8a5c2e-3b1d-4e6f-9a7b-1c2d3e4f5a6b";
+        assert_eq!(as_id(id).as_deref(), Some(id));
+        assert_eq!(as_id("raid"), None);
+        assert_eq!(as_id("g1"), None);
+        // Not the canonical shape: looked up by name, where it can still match.
+        assert_eq!(as_id(&id.to_uppercase()), None);
     }
 }

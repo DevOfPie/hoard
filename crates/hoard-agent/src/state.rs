@@ -129,29 +129,57 @@ pub struct SaveState {
     /// setting worth having; `Some(false)` is an explicit no.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub allow_device_local: Option<bool>,
-    /// The group this save is shared into, when it is. Only the fact travels
-    /// to the engine (`WatchedSave::shared`); the names are for the UI.
-    /// `default` keeps older `state.json` files loading.
+    /// The group this save is shared into, when it is, and what it consists
+    /// of there. `default` keeps older `state.json` files loading. Written
+    /// only through [`Self::set_shared`], with [`Self::include`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub shared: Option<SharedRef>,
     /// What this save consists of when it is shared: `/`-separated patterns
     /// relative to `local_path`, copied from the server's row so every member
     /// walks the same files (`fileclass::included`). Empty is everything, and
     /// is what an unshared save always has. The row is the source of truth;
-    /// [`SharedRef`] only carries names for the UI. `default` keeps older
-    /// `state.json` files loading.
+    /// this is the mirror of `shared.include` the walks read, and only
+    /// [`Self::set_shared`] writes it so the two cannot drift. `default` keeps
+    /// older `state.json` files loading.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub include: Vec<String>,
 }
 
-/// Where a shared save lives: the group and its owner, as `state.json` keeps
-/// them. The on-disk twin of [`hoard_core::wire::SharedInfo`].
+impl SaveState {
+    /// Takes the server's answer on sharing: the group, its owner and the
+    /// include list, or nothing. The one place `shared` and `include` change,
+    /// so a row never carries one without the other.
+    pub fn set_shared(&mut self, info: Option<&hoard_core::wire::SharedInfo>) {
+        self.shared = info.map(SharedRef::from);
+        self.include = info.map(|s| s.include.clone()).unwrap_or_default();
+    }
+}
+
+/// Where a shared save lives and what it consists of: the group, its owner
+/// and the include list, as `state.json` keeps them. The on-disk twin of
+/// [`hoard_core::wire::SharedInfo`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SharedRef {
     pub group_id: String,
     pub group_name: String,
     pub owner_user_id: String,
     pub owner_username: String,
+    /// See [`SaveState::include`]. `default` keeps rows written before it
+    /// travelled here loading.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub include: Vec<String>,
+}
+
+impl From<&hoard_core::wire::SharedInfo> for SharedRef {
+    fn from(info: &hoard_core::wire::SharedInfo) -> Self {
+        SharedRef {
+            group_id: info.group_id.clone(),
+            group_name: info.group_name.clone(),
+            owner_user_id: info.owner_user_id.clone(),
+            owner_username: info.owner_username.to_string(),
+            include: info.include.clone(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -1101,6 +1129,10 @@ mod tests {
                 group_name: "the boys".into(),
                 owner_user_id: "u1".into(),
                 owner_username: "jacka".into(),
+                include: vec![
+                    "worlds_local/Alpha.db".into(),
+                    "worlds_local/Alpha.fwl".into(),
+                ],
             }),
             include: vec![
                 "worlds_local/Alpha.db".into(),

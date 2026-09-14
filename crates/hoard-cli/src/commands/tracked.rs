@@ -14,7 +14,7 @@ use hoard_agent::session;
 use hoard_agent::state::CliState;
 
 use super::{link, world};
-use crate::output;
+use crate::output::{self, truncate};
 
 /// One tracked save as agents and scripts see it. Declared here on purpose:
 /// `SaveState` is the engine's own struct and must stay free to change.
@@ -156,13 +156,4 @@ pub async fn run() -> Result<()> {
         }
         println!("\n{} save(s) · {}", out.saves.len(), out.state_file);
     })
-}
-
-fn truncate(s: &str, max: usize) -> String {
-    if s.chars().count() <= max {
-        s.to_string()
-    } else {
-        let cut: String = s.chars().take(max.saturating_sub(1)).collect();
-        format!("{cut}…")
-    }
 }

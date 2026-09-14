@@ -86,6 +86,10 @@ exit status grouped by what to do about it:
 | 4 | `rate_limited`: the envelope carries `retry_after_seconds`; wait that long, exactly once, and don't loop |
 | 5 | Storage limit (`quota_exceeded`, `too_large`, `archived`): will fail identically until the user frees space or upgrades |
 | 6 | Network (`network`, `storage_unreachable`): may work later |
+| 1 | `no_service`: the sync service isn't running, and groups, sharing and leases have nobody to ask without it: tell the user to run `hoard sync start` |
+| 1 | A shared save refused (`held`, `stale`, `lease_required`, `not_shared`, `conflict`): see below; retrying unchanged gets the same answer |
+| 1 | `bad_request`: the request itself is wrong (a world name that is not one, an expiry past a year); change it, don't retry |
+| 1 | `needs_input`, `needs_choice`: see below |
 | 1 | Anything else |
 
 Two codes are about you rather than the user's account: `needs_choice` and
@@ -94,6 +98,14 @@ re-run it with the flags the message names, never by feeding it input.
 `needs_confirmation` means the command destroys something and nobody is there to
 say yes: bring it to the user and let them decide, and only pass `--yes` when
 they have said so about that exact command.
+
+The shared-save codes name who is in the way. `held`: another member hosts the
+world, so this machine can only view it until they release. `stale`: the save
+moved past this machine's copy; it has to pull before it can host.
+`lease_required`: a push to a shared save without hosting it. `not_shared`: the
+save is not in a group. `conflict`: any other refusal; the message says which.
+Tell the user; taking the lease with `hoard world force` takes it off a person,
+so only on their word.
 
 ## The mental model
 
@@ -110,6 +122,27 @@ Other things worth knowing before you act:
 - A tracked folder can be **paused**: still known, not being watched.
 - Some rows exist **only in the cloud**, with no folder on this machine.
   Mutations on those fail; that is expected, not a bug to work around.
+- A save can be **shared** into a group: every member pulls it, and one of them
+  at a time **hosts** it, holding the lease that lets them push.
+
+## Shared saves
+
+These fields only appear on a self-hosted server with groups, so read them when
+present and do not expect them otherwise:
+
+- `hoard saves --json`: each row has `group` (null when not shared) and, while
+  somebody holds a live lease, `hosted`: `"hosted here"` or `"hosted by
+  <name>"`. No `hosted` means nobody hosts, or there was no service to ask.
+- `hoard status --json`: `shared` lists this machine's shared saves, each with
+  `save_id`, `game_slug`, `label`, `group` and the same optional `hosted`. An
+  empty list is also what you get when local state could not be read.
+- `hoard group list --json`: `groups`, each with `id`, `name`, `owner` and
+  `members` (a count).
+- `hoard share --json`: the save as shared, with `group_id`, `group_name`,
+  `owner` and `include`, the files members pull (empty for the whole folder).
+- `hoard world lease <save_id> --json`: `save_id` and `lease`, null when nobody
+  holds it, otherwise `holder`, `here` (this machine holds it), `acquired_at`,
+  `renewed_at`, `base_version`, `live` and `pushed_since`.
 
 ## Safety rules
 
@@ -130,7 +163,7 @@ dangerous thing here.
    command is `hoard save untrack <save_id>`; reach for that one first.
 
 Reading is free: `saves`, `save show`, `snapshots list`, `status`, `devices`,
-`scan`. Prefer reading and proposing over acting.
+`scan`, `group list`, `world lease`. Prefer reading and proposing over acting.
 
 Save folder paths say what the user has installed and where. Do not send them
 anywhere or include them in anything published.
