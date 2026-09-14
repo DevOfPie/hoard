@@ -105,6 +105,8 @@ export function applyWorldEvent(ev: AgentEvent, at: string = new Date().toISOStr
       // Forced by a member or expired: not ours any more, and who holds it
       // now is the server's to say. Unknown until asked.
       patch(ev.save_id, { state: "unknown" });
+      // The event carries no holder; the server knows who has it now.
+      void refreshLease(ev.save_id).catch(() => {});
       break;
     }
     case "game_stopped":
@@ -309,7 +311,9 @@ export async function subscribeWorldEvents(): Promise<void> {
       ...topics.map((t) =>
         listen<AgentEvent>(t, (event) => {
           applyWorldEvent(event.payload);
-          void noticeWorldEvent(event.payload);
+          // The backlog replays silently by contract (stores/agent.ts): a
+          // notice is for what happens now, not for what the journal kept.
+          if (!isReplaying()) void noticeWorldEvent(event.payload);
         }),
       ),
       listen<AgentEvent>("agent://world-claim-wanted", (event) => {
