@@ -124,16 +124,18 @@ pub async fn apply(
     // consulted when we know which game the folder belongs to; a bare `--to` over
     // a save that is not in the local state gets no shields and the kernel
     // decides on its own. A save new to this machine has no row until the
-    // restore is done, so with `--remember` its game comes from the plan; a
-    // shared save writes only its world's files, the list its backup walks.
+    // restore is done, so with `--remember` its game comes from the plan. A
+    // member's restore of a shared save writes only its world's files, the list
+    // its backup walks; the owner's restores the whole of their own history.
     let slug = home
         .as_ref()
         .map(|h| h.game_slug.as_str())
         .or(row.as_ref().map(|s| s.game_slug.as_str()))
         .unwrap_or_default();
+    let me = super::world::this_account();
     let include = row
         .as_ref()
-        .map(|s| s.include.as_slice())
+        .map(|s| hoard_agent::savefilter::restore_include(s.shared.as_ref(), me.as_deref()))
         .unwrap_or_default();
     let gate = hoard_agent::savefilter::gate_for_save(slug, include, allow_ini);
 

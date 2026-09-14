@@ -15,8 +15,9 @@ use crate::state::AppState;
 
 /// The lease as the card draws it: the server's row, and whether this machine
 /// is the holder. `here` is decided by the device fingerprint the service
-/// stamps on a lease it takes, not by the user, so the same account on two
-/// machines sees "hosted by" on the one that is not hosting.
+/// stamps on a lease it takes together with the account holding it, so the same
+/// account on two machines sees "hosted by" on the one that is not hosting, and
+/// two accounts on one machine see it on the one that is not the holder.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct LeaseView {
     pub lease: Option<Lease>,
@@ -211,7 +212,14 @@ pub async fn get_lease(save_id: String, state: State<'_, AppState>) -> Result<Le
             let lease = lease.map(|l| *l);
             // The engine decides by account once it knows who holds the lease;
             // while its slot reads unknown or free, or it has none, the
-            // fingerprint on the lease says.
+            // fingerprint on the lease says, and only for a lease this account
+            // holds: two accounts on one computer share the fingerprint. With no
+            // cached identity the account cannot be told, and it is not here.
+            let me = state
+                .user
+                .lock()
+                .ok()
+                .and_then(|u| u.as_ref().map(|u| u.user_id.clone()));
             let engine = match ask(&state, Request::Status).await {
                 Ok(Payload::Status(status)) => status
                     .slots
@@ -226,6 +234,7 @@ pub async fn get_lease(save_id: String, state: State<'_, AppState>) -> Result<Le
                 _ => {
                     l.holder_device_fp.as_deref()
                         == Some(hoard_agent::logship::device_identity().fingerprint.as_str())
+                        && me.as_deref() == Some(l.holder_user_id.as_str())
                 }
             });
             Ok(LeaseView { lease, here })
