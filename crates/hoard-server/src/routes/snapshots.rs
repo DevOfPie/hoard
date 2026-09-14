@@ -18,9 +18,10 @@ use uuid::Uuid;
 
 use crate::auth::AuthUser;
 use crate::namespace::{self, Namespace};
-use crate::routes::access::{save_access, Role};
+use crate::routes::access::{read_include, save_access, Role};
 use crate::routes::health::ServerState;
 use crate::routes::repair_ts;
+use hoard_core::kernel::fileclass::included;
 
 // ─── Response types ─────────────────────────────────────────────────────────
 //
@@ -982,13 +983,13 @@ pub async fn list(
 ) -> Result<Json<Vec<Snapshot>>, (StatusCode, Json<serde_json::Value>)> {
     let user_id = user.user_id.to_string();
 
-    if save_access(&state.pool, &save_id, &user_id)
+    let access = save_access(&state.pool, &save_id, &user_id)
         .await
         .map_err(|e| internal_logged("access lookup", e))?
-        .is_none()
-    {
-        return Err(err(StatusCode::NOT_FOUND, "save not found"));
-    }
+        .ok_or_else(|| err(StatusCode::NOT_FOUND, "save not found"))?;
+    let include = read_include(&state.pool, &save_id, &access)
+        .await
+        .map_err(|e| internal_logged("include lookup", e))?;
 
     let limit = q.limit.clamp(1, 200);
     let offset = q.offset.max(0);
@@ -1006,7 +1007,7 @@ pub async fn list(
          FROM snapshots WHERE save_id=? AND deleted_at IS NULL
          ORDER BY version_num DESC LIMIT ? OFFSET ?"
     };
-    let rows: Vec<Snapshot> = sqlx::query(sql)
+    let mut rows: Vec<Snapshot> = sqlx::query(sql)
         .bind(&save_id)
         .bind(limit)
         .bind(offset)
@@ -1054,7 +1055,39 @@ pub async fn list(
         });
     }
 
+    if !include.is_empty() {
+        for s in &mut rows {
+            restrict_to_include(&state.pool, s, &include).await?;
+        }
+    }
+
     Ok(Json(rows))
+}
+
+/// A version as a member of a share that names its files sees it: the count
+/// and size of those files only, and no insight, which is derived from the
+/// whole manifest and can name what the list leaves out.
+async fn restrict_to_include(
+    pool: &sqlx::SqlitePool,
+    snap: &mut Snapshot,
+    include: &[String],
+) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
+    let files: Vec<(String, i64)> =
+        sqlx::query_as("SELECT relative_path, size_bytes FROM snapshot_files WHERE snapshot_id=?")
+            .bind(&snap.id)
+            .fetch_all(pool)
+            .await
+            .map_err(|e| internal_logged("listing snapshot rows", e))?;
+    let (count, size) = files
+        .iter()
+        .filter(|(path, _)| included(include, path))
+        .fold((0i64, 0i64), |(n, total), (_, bytes)| {
+            (n + 1, total + bytes)
+        });
+    snap.file_count = count;
+    snap.total_size_bytes = size;
+    snap.insight = None;
+    Ok(())
 }
 
 // ─── GET /v1/saves/:save_id/snapshots/:version ──────────────────────────────
@@ -1065,13 +1098,13 @@ pub async fn detail(
     Path((save_id, version)): Path<(String, i64)>,
 ) -> Result<Json<SnapshotDetail>, (StatusCode, Json<serde_json::Value>)> {
     let user_id = user.user_id.to_string();
-    if save_access(&state.pool, &save_id, &user_id)
+    let access = save_access(&state.pool, &save_id, &user_id)
         .await
         .map_err(|e| internal_logged("access lookup", e))?
-        .is_none()
-    {
-        return Err(err(StatusCode::NOT_FOUND, "save not found"));
-    }
+        .ok_or_else(|| err(StatusCode::NOT_FOUND, "save not found"))?;
+    let include = read_include(&state.pool, &save_id, &access)
+        .await
+        .map_err(|e| internal_logged("include lookup", e))?;
 
     let snap = sqlx::query(
         "SELECT id, version_num, parent_version, device_name, notes, total_size_bytes,
@@ -1095,6 +1128,7 @@ pub async fn detail(
     .await
     .map_err(|e| internal_logged("listing snapshot rows", e))?
     .into_iter()
+    .filter(|r| included(&include, &r.relative_path))
     .map(|r| {
         // The sha is computed by the server itself on upload, so an invalid one
         // means a hand-edited DB. It is neither repaired nor skipped here: the
@@ -1113,28 +1147,31 @@ pub async fn detail(
     })
     .collect::<Result<Vec<_>, _>>()?;
 
-    Ok(Json(SnapshotDetail {
-        snapshot: Snapshot {
-            id: snap.get("id"),
-            save_id: None,
-            version_num: snap.get("version_num"),
-            parent_version: snap.get("parent_version"),
-            device_name: snap.get("device_name"),
-            notes: snap.get("notes"),
-            total_size_bytes: snap.get("total_size_bytes"),
-            file_count: snap.get("file_count"),
-            is_pinned: snap.get::<i64, _>("is_pinned") != 0,
-            deleted_at: snap
-                .get::<Option<String>, _>("deleted_at")
-                .as_deref()
-                .map(repair_ts),
-            created_at: repair_ts(&snap.get::<String, _>("created_at")),
-            insight: crate::insight::parse_stored(
-                snap.get::<Option<String>, _>("insight").as_deref(),
-            ),
-        },
-        files,
-    }))
+    let mut snapshot = Snapshot {
+        id: snap.get("id"),
+        save_id: None,
+        version_num: snap.get("version_num"),
+        parent_version: snap.get("parent_version"),
+        device_name: snap.get("device_name"),
+        notes: snap.get("notes"),
+        total_size_bytes: snap.get("total_size_bytes"),
+        file_count: snap.get("file_count"),
+        is_pinned: snap.get::<i64, _>("is_pinned") != 0,
+        deleted_at: snap
+            .get::<Option<String>, _>("deleted_at")
+            .as_deref()
+            .map(repair_ts),
+        created_at: repair_ts(&snap.get::<String, _>("created_at")),
+        insight: crate::insight::parse_stored(snap.get::<Option<String>, _>("insight").as_deref()),
+    };
+    // The files above are already the member's; the totals follow them.
+    if !include.is_empty() {
+        snapshot.file_count = files.len() as i64;
+        snapshot.total_size_bytes = files.iter().map(|f| f.size_bytes).sum();
+        snapshot.insight = None;
+    }
+
+    Ok(Json(SnapshotDetail { snapshot, files }))
 }
 
 // ─── GET /v1/saves/:save_id/snapshots/:version/download ─────────────────────
@@ -1149,6 +1186,9 @@ pub async fn download(
         .await
         .map_err(|e| internal_logged("access lookup", e))?
         .ok_or_else(|| err(StatusCode::NOT_FOUND, "save not found"))?;
+    let include = read_include(&state.pool, &save_id, &access)
+        .await
+        .map_err(|e| internal_logged("include lookup", e))?;
     let (game_slug, label) = (access.game_slug, access.label);
 
     let snap_id: Option<String> = sqlx::query_scalar(
@@ -1189,6 +1229,10 @@ pub async fn download(
     for r in &file_rows {
         let file_id: String = r.get("id");
         let rel: String = r.get("relative_path");
+        // A member of a share that names its files gets those, on every version.
+        if !included(&include, &rel) {
+            continue;
+        }
         let size: i64 = r.get("size_bytes");
         let sha: String = r.get("sha256");
 

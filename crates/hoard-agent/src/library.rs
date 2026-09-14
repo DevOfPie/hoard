@@ -2349,7 +2349,9 @@ fn watched_from_snapshot(save_id: String, s: &SaveState) -> WatchedSave {
         processes,
         shared_processes: s.shared_processes,
         policy: resolve_policy(&s.game_slug, s.preset.as_deref()),
-        known_version: None,
+        // The row's cursor, as the hydrate carries it. `None` here sent the next
+        // acquire out at base 0 after a share, refused as stale against head.
+        known_version: s.last_version_num,
         set_hash: None,
         track_only: false,
         shared: s.shared.clone(),
@@ -2668,7 +2670,7 @@ mod tests {
         apply_excluded_paths, auto_track_decision, conflicting_save, detected_paths_in, folder_key,
         local_detection, manual_override_conflict, occupied_slot, prune_poisoned_rows,
         reconcile_plan, resolve_processes, restore_twin, row_for_same_folder, rows_one_per_folder,
-        rows_unknown_to_server, spread_allow_device_local, superseded_rows,
+        rows_unknown_to_server, spread_allow_device_local, superseded_rows, watched_from_snapshot,
         watched_saves_from_state, AutoTrack, CachedDetection, ServerRow, ERR_SLOT_OCCUPIED,
     };
     use crate::detection::{
@@ -2694,6 +2696,17 @@ mod tests {
             processes: Vec::new(),
             shared_processes: false,
         }
+    }
+
+    /// A re-seat (a share, an unshare, a settings change) keeps the row's version
+    /// cursor. Without it the slot restarted at no version, and a shared save's
+    /// next lease went out at base 0 against a head of 1.
+    #[test]
+    fn a_reseat_carries_the_rows_version() {
+        let mut row = save_state("valheim", "/home/u/.config/unity3d/IronGate/Valheim");
+        row.last_version_num = Some(1);
+        let watched = watched_from_snapshot("sv".into(), &row);
+        assert_eq!(watched.known_version, Some(1));
     }
 
     /// A restore pointed at a folder another game tracks must be refused, not
