@@ -12,7 +12,7 @@ use axum::response::Json;
 use hoard_core::ids::Sha256 as Sha256Hex;
 use hoard_core::wire::{
     CasCommit, CasFile, CasInit, CreateGroupRequest, CreateInviteRequest, JoinGroupRequest,
-    LeaseAcquireRequest, Save, ShareSaveRequest,
+    LeaseAcquireRequest, Save, ShareSaveRequest, Snapshot,
 };
 use hoard_server::auth::AuthUser;
 use hoard_server::routes::health::ServerState;
@@ -712,8 +712,10 @@ async fn the_include_list_is_stored_with_the_share_and_listed_to_everyone() {
     assert!(save.shared.as_ref().unwrap().include.is_empty());
 }
 
-/// The list is enforced where it cannot be forgotten: a push carrying a file
-/// the share does not name is refused before a byte moves, whoever pushes.
+/// The list is enforced where it cannot be forgotten: a member's push carrying
+/// a file the share does not name is refused before a byte moves. Changed on
+/// purpose by HRD-D-0019: the owner's uploads carry the whole folder, so the
+/// same manifest from the owner is accepted, where it used to be refused too.
 #[tokio::test]
 async fn a_push_outside_the_include_list_is_refused() {
     let h = harness().await;
@@ -728,41 +730,40 @@ async fn a_push_outside_the_include_list_is_refused() {
     )
     .await
     .expect("shared");
-    let Json(_) = leases::acquire(
-        st(&h),
-        Extension(h.owner.clone()),
-        Path(SAVE.to_string()),
-        axum::http::HeaderMap::new(),
-        Json(LeaseAcquireRequest { base_version: 2 }),
-    )
-    .await
-    .expect("lease");
+    acquire_as(&h, &h.owner, 2).await.expect("lease");
 
     let stray: &[(&str, &[u8])] = &[
         ("worlds_local/Alpha.db", b"world"),
         ("characters_local/Me.fch", b"me"),
     ];
+    let (_, snap) = backup_as(&h, &h.owner, stray, Some(2)).await;
+    assert_eq!(snap.version_num, 3, "the owner's whole folder is accepted");
+    leases::release(st(&h), Extension(h.owner.clone()), Path(SAVE.to_string()))
+        .await
+        .expect("released");
+
+    acquire_as(&h, &h.member, 3).await.expect("lease");
     let err = match cas::init(
         st(&h),
-        Extension(h.owner.clone()),
+        Extension(h.member.clone()),
         Path(SAVE.to_string()),
         Json(CasInit {
-            base_version: Some(2),
+            base_version: Some(3),
             files: manifest(stray),
         }),
     )
     .await
     {
         Err(e) => e,
-        Ok(_) => panic!("a character file is refused"),
+        Ok(_) => panic!("a member's character file is refused"),
     };
     assert_eq!(err.0, StatusCode::BAD_REQUEST);
     assert_eq!(err.1 .0["code"], "outside_include");
     assert_eq!(err.1 .0["path"], "characters_local/Me.fch");
 
     let inside: &[(&str, &[u8])] = &[("worlds_local/Alpha.db", b"world")];
-    let (_, snap) = backup_as(&h, &h.owner, inside, Some(2)).await;
-    assert_eq!(snap.version_num, 3);
+    let (_, snap) = backup_as(&h, &h.member, inside, Some(3)).await;
+    assert_eq!(snap.version_num, 4);
 }
 
 /// One version of a whole Valheim folder, uploaded before any share: a
@@ -1549,4 +1550,476 @@ async fn removing_the_host_frees_the_lease_for_the_next_member() {
         .await,
         1
     );
+}
+
+// ---- the owner's whole folder stays backed up (HRD-D-0019)
+
+/// The group `folder_shared_as_alpha` shared into.
+async fn group_of(pool: &SqlitePool) -> String {
+    sqlx::query_scalar("SELECT group_id FROM shared_saves WHERE save_id=?")
+        .bind(SAVE)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+}
+
+/// `(path, sha)` of one version as `who` reads it.
+async fn detail_files_as(h: &Harness, who: &AuthUser, version: i64) -> Vec<(String, String)> {
+    let Json(d) = snapshots::detail(
+        st(h),
+        Extension(who.clone()),
+        Path((SAVE.to_string(), version)),
+    )
+    .await
+    .expect("detail");
+    d.files
+        .into_iter()
+        .map(|f| {
+            (
+                f.relative_path,
+                f.sha256.expect("a sha").as_str().to_string(),
+            )
+        })
+        .collect()
+}
+
+/// A push through the multipart route, one `files` field per file.
+async fn multipart_as(
+    h: &Harness,
+    who: &AuthUser,
+    files: &[(&str, &[u8])],
+    base: Option<i64>,
+) -> Result<Snapshot, (StatusCode, serde_json::Value)> {
+    use axum::extract::{FromRequest, Multipart};
+    let boundary = "hoard-test-boundary";
+    let mut body: Vec<u8> = Vec::new();
+    if let Some(b) = base {
+        body.extend(
+            format!(
+                "--{boundary}\r\nContent-Disposition: form-data; name=\"base_version\"\r\n\r\n{b}\r\n"
+            )
+            .as_bytes(),
+        );
+    }
+    for (path, bytes) in files {
+        body.extend(
+            format!(
+                "--{boundary}\r\nContent-Disposition: form-data; name=\"files\"; filename=\"{path}\"\r\nContent-Type: application/octet-stream\r\n\r\n"
+            )
+            .as_bytes(),
+        );
+        body.extend_from_slice(bytes);
+        body.extend(b"\r\n");
+    }
+    body.extend(format!("--{boundary}--\r\n").as_bytes());
+    let req = axum::http::Request::builder()
+        .method("POST")
+        .uri("/")
+        .header(
+            "content-type",
+            format!("multipart/form-data; boundary={boundary}"),
+        )
+        .body(Body::from(body))
+        .unwrap();
+    let multipart = Multipart::from_request(req, &()).await.expect("multipart");
+    snapshots::create(
+        st(h),
+        Extension(who.clone()),
+        Path(SAVE.to_string()),
+        multipart,
+    )
+    .await
+    .map(|(_, Json(s))| s)
+    .map_err(|(code, Json(body))| (code, body))
+}
+
+/// `Folder` with the Alpha world replaced by `alpha_db`.
+fn with_alpha<'a>(f: &'a Folder, alpha_db: &'a [u8]) -> Vec<(&'static str, &'a [u8])> {
+    f.files()
+        .into_iter()
+        .map(|(p, b)| {
+            (
+                p,
+                if p == "worlds_local/Alpha.db" {
+                    alpha_db
+                } else {
+                    b
+                },
+            )
+        })
+        .collect()
+}
+
+/// The two Alpha files with `alpha_db` for the database.
+fn alpha_only<'a>(f: &'a Folder, alpha_db: &'a [u8]) -> Vec<(&'static str, &'a [u8])> {
+    vec![
+        ("worlds_local/Alpha.db", alpha_db),
+        ("worlds_local/Alpha.fwl", &f.alpha_fwl),
+    ]
+}
+
+/// The owner pushes the whole folder without the lease while the world is what
+/// the head has; a changed world still needs the lease.
+#[tokio::test]
+async fn the_owner_backs_up_the_whole_folder_without_the_lease_while_the_world_is_unchanged() {
+    let h = harness().await;
+    let f = Folder::new();
+    folder_shared_as_alpha(&h, &f).await;
+
+    let character = b"alice levelled up".to_vec();
+    let beta = vec![17u8; 9_100];
+    let files: Vec<(&str, &[u8])> = vec![
+        ("characters_local/x.fch", &character),
+        ("worlds_local/Alpha.db", &f.alpha_db),
+        ("worlds_local/Alpha.fwl", &f.alpha_fwl),
+        ("worlds_local/Beta.db", &beta),
+        ("worlds_local/Beta.fwl", &f.beta_fwl),
+    ];
+    let (_, snap) = backup_as(&h, &h.owner, &files, Some(1)).await;
+    assert_eq!(snap.version_num, 2);
+    assert_eq!(snap.file_count, 5);
+    assert_eq!(detail_paths_as(&h, &h.owner, 2).await.len(), 5);
+    assert!(lease_as(&h, &h.owner).await.is_none(), "no lease was taken");
+
+    let changed = vec![18u8; 7_000];
+    let err = match cas::init(
+        st(&h),
+        Extension(h.owner.clone()),
+        Path(SAVE.to_string()),
+        Json(CasInit {
+            base_version: Some(2),
+            files: manifest(&with_alpha(&f, &changed)),
+        }),
+    )
+    .await
+    {
+        Err(e) => e,
+        Ok(_) => panic!("a changed world needs the lease"),
+    };
+    assert_eq!(err.0, StatusCode::CONFLICT);
+    assert_eq!(err.1 .0["code"], "lease_required");
+}
+
+/// A member hosting the world does not stop the owner backing up the rest,
+/// and the owner's push leaves the member's lease untouched.
+#[tokio::test]
+async fn the_owner_backs_up_beta_while_a_member_hosts_alpha() {
+    let h = harness().await;
+    let f = Folder::new();
+    folder_shared_as_alpha(&h, &f).await;
+    acquire_as(&h, &h.member, 1).await.expect("hosting");
+
+    let beta = vec![17u8; 9_100];
+    let files: Vec<(&str, &[u8])> = f
+        .files()
+        .into_iter()
+        .map(|(p, b)| {
+            (
+                p,
+                if p == "worlds_local/Beta.db" {
+                    &beta[..]
+                } else {
+                    b
+                },
+            )
+        })
+        .collect();
+    let (_, snap) = backup_as(&h, &h.owner, &files, Some(1)).await;
+    assert_eq!(snap.version_num, 2);
+    let lease = lease_as(&h, &h.owner).await.expect("still hosted");
+    assert_eq!(lease.holder_user_id, MEMBER);
+    assert!(!lease.pushed_since, "the owner's push is not the host's");
+}
+
+/// The per-file multipart checks a member's files against the list as they
+/// arrive, like the packed mode and the CAS already did.
+#[tokio::test]
+async fn a_members_per_file_multipart_outside_the_list_is_400() {
+    let h = harness().await;
+    let f = Folder::new();
+    folder_shared_as_alpha(&h, &f).await;
+    acquire_as(&h, &h.member, 1).await.expect("hosting");
+
+    let (code, body) = multipart_as(
+        &h,
+        &h.member,
+        &[
+            ("worlds_local/Alpha.db", &f.alpha_db),
+            ("characters_local/x.fch", b"not theirs"),
+        ],
+        Some(1),
+    )
+    .await
+    .expect_err("outside the list");
+    assert_eq!(code, StatusCode::BAD_REQUEST);
+    assert_eq!(body["code"], "outside_include");
+    assert_eq!(body["path"], "characters_local/x.fch");
+    assert_eq!(
+        count(
+            &h.state.pool,
+            "SELECT COUNT(*) FROM snapshots WHERE save_id=?",
+            SAVE
+        )
+        .await,
+        1
+    );
+}
+
+/// A member's world-only push, through the CAS and through the multipart, keeps
+/// every version whole for the owner: the character and Beta come forward with
+/// their shas and one more reference each, and no byte is stored twice.
+#[tokio::test]
+async fn a_members_push_carries_the_rest_of_the_folder_forward() {
+    let h = harness().await;
+    let f = Folder::new();
+    folder_shared_as_alpha(&h, &f).await;
+    let pool = &h.state.pool;
+    let gid = group_of(pool).await;
+    let all: i64 = f.files().iter().map(|(_, b)| b.len() as i64).sum();
+    acquire_as(&h, &h.member, 1).await.expect("hosting");
+
+    let alpha2 = vec![9u8; 7_000];
+    let (_, snap) = backup_as(&h, &h.member, &alpha_only(&f, &alpha2), Some(1)).await;
+    assert_eq!(snap.version_num, 2);
+    assert_eq!(
+        snap.file_count, 2,
+        "the response describes the member's push"
+    );
+
+    let owner_v2 = detail_files_as(&h, &h.owner, 2).await;
+    assert_eq!(owner_v2.len(), 5);
+    assert!(owner_v2.contains(&("characters_local/x.fch".into(), sha_of(&f.character))));
+    assert!(owner_v2.contains(&("worlds_local/Beta.db".into(), sha_of(&f.beta_db))));
+    assert!(owner_v2.contains(&("worlds_local/Alpha.db".into(), sha_of(&alpha2))));
+    assert_eq!(
+        detail_paths_as(&h, &h.member, 2).await,
+        ["worlds_local/Alpha.db", "worlds_local/Alpha.fwl"]
+    );
+    let v = versions_as(&h, &h.owner).await;
+    assert_eq!(v[0].file_count, 5);
+    assert_eq!(v[0].total_size_bytes, all);
+    assert_eq!(
+        group_blob(pool, &gid, &sha_of(&f.character)).await,
+        Some((2, f.character.len() as i64))
+    );
+    assert_eq!(used(pool, PAYER).await, all + alpha2.len() as i64);
+
+    let alpha3 = vec![10u8; 7_000];
+    let snap = multipart_as(&h, &h.member, &alpha_only(&f, &alpha3), Some(2))
+        .await
+        .expect("multipart push");
+    assert_eq!(snap.version_num, 3);
+    assert_eq!(detail_files_as(&h, &h.owner, 3).await.len(), 5);
+    assert_eq!(
+        group_blob(pool, &gid, &sha_of(&f.character)).await,
+        Some((3, f.character.len() as i64))
+    );
+    assert_eq!(
+        used(pool, PAYER).await,
+        all + (alpha2.len() + alpha3.len()) as i64
+    );
+    let mut want: Vec<(String, Vec<u8>)> = with_alpha(&f, &alpha3)
+        .into_iter()
+        .map(|(p, b)| (p.to_string(), b.to_vec()))
+        .collect();
+    want.sort_by(|x, y| x.0.cmp(&y.0));
+    assert_eq!(download_as(&h, &h.owner, 3).await, want);
+}
+
+/// The character's blob is referenced by the carried row, so purging the
+/// version it was uploaded in leaves it in place.
+#[tokio::test]
+async fn deleting_the_version_a_carried_file_came_from_keeps_its_blob() {
+    let h = harness().await;
+    let f = Folder::new();
+    folder_shared_as_alpha(&h, &f).await;
+    let pool = &h.state.pool;
+    let gid = group_of(pool).await;
+    acquire_as(&h, &h.member, 1).await.expect("hosting");
+    let alpha2 = vec![9u8; 7_000];
+    backup_as(&h, &h.member, &alpha_only(&f, &alpha2), Some(1)).await;
+
+    sqlx::query(
+        "UPDATE snapshots SET deleted_at='2000-01-01T00:00:00Z' WHERE save_id=? AND version_num=1",
+    )
+    .bind(SAVE)
+    .execute(pool)
+    .await
+    .unwrap();
+    hoard_server::cleanup::run_once(
+        pool,
+        &h.state.config.storage.data_dir,
+        &h.state.store,
+        24,
+        0,
+        None,
+    )
+    .await
+    .expect("cleanup");
+
+    let sha = sha_of(&f.character);
+    assert_eq!(
+        group_blob(pool, &gid, &sha).await,
+        Some((1, f.character.len() as i64))
+    );
+    assert!(stored(&h, &group_key(&gid, &sha)).await);
+    assert_eq!(group_blob(pool, &gid, &sha_of(&f.alpha_db)).await, None);
+    let got = download_as(&h, &h.owner, 2).await;
+    assert_eq!(got.len(), 5);
+    assert!(got.contains(&("characters_local/x.fch".to_string(), f.character.clone())));
+}
+
+/// A cap of one version, three member pushes, the trash purged: the latest
+/// version still holds the owner's whole folder, bytes included.
+#[tokio::test]
+async fn a_version_cap_of_one_keeps_the_whole_folder_on_the_latest_version() {
+    let h = harness().await;
+    let f = Folder::new();
+    folder_shared_as_alpha(&h, &f).await;
+    let pool = &h.state.pool;
+    let gid = group_of(pool).await;
+    sqlx::query("UPDATE users SET max_versions = 1 WHERE id = ?")
+        .bind(OWNER)
+        .execute(pool)
+        .await
+        .unwrap();
+    acquire_as(&h, &h.member, 1).await.expect("hosting");
+
+    let worlds: Vec<Vec<u8>> = (0..3).map(|i| vec![20 + i as u8; 7_000]).collect();
+    for (i, alpha) in worlds.iter().enumerate() {
+        let base = i as i64 + 1;
+        backup_as(&h, &h.member, &alpha_only(&f, alpha), Some(base)).await;
+    }
+    // The prune runs after the response; wait for it.
+    for _ in 0..200 {
+        let live = count(
+            pool,
+            "SELECT COUNT(*) FROM snapshots WHERE save_id=? AND deleted_at IS NULL",
+            SAVE,
+        )
+        .await;
+        if live == 1 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert_eq!(
+        count(
+            pool,
+            "SELECT COUNT(*) FROM snapshots WHERE save_id=? AND deleted_at IS NULL",
+            SAVE
+        )
+        .await,
+        1
+    );
+    sqlx::query(
+        "UPDATE snapshots SET deleted_at='2000-01-01T00:00:00Z' WHERE save_id=? AND deleted_at IS NOT NULL",
+    )
+    .bind(SAVE)
+    .execute(pool)
+    .await
+    .unwrap();
+    hoard_server::cleanup::run_once(
+        pool,
+        &h.state.config.storage.data_dir,
+        &h.state.store,
+        24,
+        0,
+        None,
+    )
+    .await
+    .expect("cleanup");
+
+    assert_eq!(detail_files_as(&h, &h.owner, 4).await.len(), 5);
+    let mut want: Vec<(String, Vec<u8>)> = with_alpha(&f, &worlds[2])
+        .into_iter()
+        .map(|(p, b)| (p.to_string(), b.to_vec()))
+        .collect();
+    want.sort_by(|x, y| x.0.cmp(&y.0));
+    assert_eq!(download_as(&h, &h.owner, 4).await, want);
+    assert_eq!(
+        group_blob(pool, &gid, &sha_of(&f.character)).await,
+        Some((1, f.character.len() as i64))
+    );
+}
+
+/// A member hosting from v1 pushes after the owner backed up Beta: the world
+/// did not move, so the push lands on top and keeps the owner's Beta.
+#[tokio::test]
+async fn a_member_based_before_an_owner_backup_lands_on_top_of_it() {
+    let h = harness().await;
+    let f = Folder::new();
+    folder_shared_as_alpha(&h, &f).await;
+    acquire_as(&h, &h.member, 1).await.expect("hosting");
+
+    let beta = vec![17u8; 9_100];
+    let files: Vec<(&str, &[u8])> = f
+        .files()
+        .into_iter()
+        .map(|(p, b)| {
+            (
+                p,
+                if p == "worlds_local/Beta.db" {
+                    &beta[..]
+                } else {
+                    b
+                },
+            )
+        })
+        .collect();
+    let (_, snap) = backup_as(&h, &h.owner, &files, Some(1)).await;
+    assert_eq!(snap.version_num, 2);
+
+    let alpha2 = vec![9u8; 7_000];
+    let (_, snap) = backup_as(&h, &h.member, &alpha_only(&f, &alpha2), Some(1)).await;
+    assert_eq!(snap.version_num, 3);
+    let owner_v3 = detail_files_as(&h, &h.owner, 3).await;
+    assert_eq!(owner_v3.len(), 5);
+    assert!(owner_v3.contains(&("worlds_local/Alpha.db".into(), sha_of(&alpha2))));
+    assert!(owner_v3.contains(&("worlds_local/Beta.db".into(), sha_of(&beta))));
+
+    // A world that did move still refuses the stale base.
+    let alpha3 = vec![10u8; 7_000];
+    let err = match cas::init(
+        st(&h),
+        Extension(h.member.clone()),
+        Path(SAVE.to_string()),
+        Json(CasInit {
+            base_version: Some(2),
+            files: manifest(&alpha_only(&f, &alpha3)),
+        }),
+    )
+    .await
+    {
+        Err(e) => e,
+        Ok(_) => panic!("the world moved since v2"),
+    };
+    assert_eq!(err.0, StatusCode::CONFLICT);
+    assert_eq!(err.1 .0["code"], "non_fast_forward");
+}
+
+/// Only the save's owner reads `caller_owns`, in the list and on its own.
+#[tokio::test]
+async fn caller_owns_is_set_only_on_the_owners_row() {
+    let h = harness().await;
+    let f = Folder::new();
+    folder_shared_as_alpha(&h, &f).await;
+    for (who, owns) in [(&h.owner, true), (&h.member, false), (&h.payer, false)] {
+        let listed = list_as(&h, who).await;
+        assert_eq!(
+            listed[0].shared.as_ref().map(|s| s.caller_owns),
+            Some(owns),
+            "{} in the list",
+            who.username
+        );
+        let Json(one) = saves::get_one(st(&h), Extension(who.clone()), Path(SAVE.to_string()))
+            .await
+            .expect("get");
+        assert_eq!(
+            one.shared.as_ref().map(|s| s.caller_owns),
+            Some(owns),
+            "{} on its own",
+            who.username
+        );
+    }
 }

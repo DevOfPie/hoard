@@ -227,15 +227,13 @@ pub async fn create(
     // A shared save's bytes live in its group and the group's owner pays,
     // whoever pushes.
     let ns = Namespace::of(&access.owner_user_id, access.group_id.as_deref());
-    // What a shared save consists of, enforced per file below: a client whose
-    // row lost the list must not push the rest of its folder into the group.
-    let include = if let Namespace::Group(_) = ns {
-        crate::routes::share::include_for(&state.pool, &save_id)
-            .await
-            .map_err(|e| internal_logged("include lookup", e))?
-    } else {
-        Vec::new()
-    };
+    // What a member may push, checked per file as it arrives so a client whose
+    // row lost the list is refused before its folder is uploaded. Empty for
+    // the owner, whose uploads carry the whole folder (HRD-D-0019). The gate
+    // inside the transaction rules again on the whole manifest.
+    let include = read_include(&state.pool, &save_id, &access)
+        .await
+        .map_err(|e| internal_logged("include lookup", e))?;
     let billing = ns
         .billing_user(&state.pool)
         .await
@@ -425,6 +423,10 @@ pub async fn create(
         if !is_safe_relative_path(&file_name) {
             cleanup_tmp();
             return Err(err(StatusCode::BAD_REQUEST, "unsafe file path"));
+        }
+        if crate::routes::share::first_outside_include(&include, [file_name.as_str()]).is_some() {
+            cleanup_tmp();
+            return Err(crate::routes::cas::outside_include(&file_name));
         }
 
         if files.len() >= max_files {
@@ -703,21 +705,39 @@ pub async fn create(
             internal_logged("reading the save's latest version", e)
         })?;
 
-    // A shared save is pushed by its host alone, the owner included.
-    if let Namespace::Group(_) = ns {
-        if let Err(e) = crate::routes::leases::require_host(&mut *tx, &save_id, &user_id).await {
+    // A shared save's lease and include list (`share::push_gate`).
+    let manifest: Vec<(&str, &str)> = files
+        .iter()
+        .map(|(rel, _, sha)| (rel.as_str(), sha.as_str()))
+        .collect();
+    let gate = match crate::routes::share::push_gate(
+        &mut tx, &ns, &access, &save_id, &user_id, head, &manifest,
+    )
+    .await
+    {
+        Ok(g) => g,
+        Err(e) => {
             rollback_blobs(&created_blobs);
             cleanup_tmp();
             return Err(e);
         }
-    }
+    };
 
     // Fast-forward check (the DAG's enforcement). A client that declares a
     // base version which is no longer the head has diverged: another device
     // pushed since it last synced. Reject so the client can pull + merge
-    // (keep-both) instead of silently overwriting the other line.
+    // (keep-both) instead of silently overwriting the other line. A member
+    // whose listed files did not move in between is not diverged.
     if let Some(base) = base_version {
-        if base != head {
+        let accepted = match gate.base_accepted(&mut tx, &save_id, base, head).await {
+            Ok(a) => a,
+            Err(e) => {
+                rollback_blobs(&created_blobs);
+                cleanup_tmp();
+                return Err(e);
+            }
+        };
+        if !accepted {
             rollback_blobs(&created_blobs);
             cleanup_tmp();
             return Err((
@@ -740,7 +760,18 @@ pub async fn create(
     // descended from.
     let parent_version: Option<i64> = (head > 0).then_some(head);
 
-    let file_count = files.len() as i64;
+    // A member's push names the world only; the head's other files come
+    // forward so the version stays whole for the owner (HRD-D-0019).
+    let carried = gate.carried(&mut tx, &save_id, head).await.map_err(|e| {
+        rollback_blobs(&created_blobs);
+        cleanup_tmp();
+        internal_logged("reading the head's other files", e)
+    })?;
+    // What the caller pushed, which is what the response describes; the row
+    // holds the whole version.
+    let pushed_count = files.len() as i64;
+    let file_count = pushed_count + carried.len() as i64;
+    let stored_size = total_size + carried.iter().map(|r| r.size_bytes()).sum::<i64>();
     sqlx::query(
         "INSERT INTO snapshots (id, save_id, version_num, device_name, notes,
                                 total_size_bytes, file_count, parent_version)
@@ -751,7 +782,7 @@ pub async fn create(
     .bind(new_version)
     .bind(&device_name)
     .bind(&notes)
-    .bind(total_size)
+    .bind(stored_size)
     .bind(file_count)
     .bind(parent_version)
     .execute(&mut *tx)
@@ -833,6 +864,13 @@ pub async fn create(
             return Err(internal());
         }
     }
+    crate::routes::share::insert_carried(&mut tx, &ns, &snapshot_id, &carried)
+        .await
+        .map_err(|e| {
+            rollback_blobs(&created_blobs);
+            cleanup_tmp();
+            internal_logged("carrying the head's other files forward", e)
+        })?;
 
     sqlx::query!(
         "UPDATE saves SET latest_version_num=? WHERE id=?",
@@ -854,7 +892,7 @@ pub async fn create(
             cleanup_tmp();
             internal_logged("updating storage accounting", e)
         })?;
-    if let Namespace::Group(_) = ns {
+    if gate.hosted {
         crate::routes::leases::mark_pushed(&mut *tx, &save_id, &user_id)
             .await
             .map_err(|e| {
@@ -869,8 +907,9 @@ pub async fn create(
         "save_id": save_id,
         "version_num": new_version,
         "files": file_count,
-        "bytes": total_size,
+        "bytes": stored_size,
         "new_bytes": newly_stored_bytes,
+        "carried_files": carried.len(),
     })
     .to_string();
     sqlx::query!(
@@ -940,7 +979,8 @@ pub async fn create(
     {
         warn!(error = %e, save_id = %save_id, "save event: recipients not resolved");
     }
-    if let Namespace::Group(_) = ns {
+    // Only a push that went through the lease is the host's news.
+    if gate.hosted {
         crate::routes::leases::announce_push(&state, &save_id, &user_id).await;
     }
 
@@ -964,7 +1004,7 @@ pub async fn create(
             device_name,
             notes,
             total_size_bytes: total_size,
-            file_count,
+            file_count: pushed_count,
             is_pinned: false,
             deleted_at: None,
             created_at: time::OffsetDateTime::now_utc(),

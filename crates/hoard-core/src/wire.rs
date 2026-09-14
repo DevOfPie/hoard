@@ -279,6 +279,11 @@ pub struct SharedInfo {
     /// every member, so every machine walks the same files.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub include: Vec<String>,
+    /// The caller owns the save: their uploads carry the whole folder, while a
+    /// member's carry `include` (HRD-D-0019). An older server omits it, which
+    /// reads as a member and keeps every walk narrowed to the list.
+    #[serde(default)]
+    pub caller_owns: bool,
 }
 
 // ---- /v1/groups
@@ -1040,6 +1045,7 @@ mod tests {
         )
         .unwrap();
         assert!(info.include.is_empty());
+        assert!(!info.caller_owns, "an older server reads as a member");
         // And an empty list is not emitted, so an older reader sees the old shape.
         let json = serde_json::to_value(&info).unwrap();
         assert!(json.get("include").is_none(), "{json}");

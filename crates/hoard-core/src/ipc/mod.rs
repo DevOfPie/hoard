@@ -1673,6 +1673,7 @@ mod tests {
                     owner_user_id: "u1".into(),
                     owner_username: Username::parse("alice").unwrap(),
                     include: Vec::new(),
+                    caller_owns: false,
                 }),
             })),
             Payload::Worlds {

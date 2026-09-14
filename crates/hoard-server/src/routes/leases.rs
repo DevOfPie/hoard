@@ -7,11 +7,13 @@
 //! reasoning of 0019). The holder renews every 30 s (HRD-D-0003).
 //!
 //! The lease gates the push: `cas::init`, `cas::commit` and `snapshots::create`
-//! call [`require_host`] on a save in a group namespace, the owner included,
-//! since a world is played on one machine at a time and the one playing it is
-//! the one pushing. Acquire carries the caller's head and is refused while the
-//! save has moved past it, which is where "a viewer upgrades to host only if
-//! the head has not moved" cannot be raced.
+//! go through `share::push_gate`, which calls [`require_host`] on a save in a
+//! group namespace, since a world is played on one machine at a time and the
+//! one playing it is the one pushing. It guards the include list only: the
+//! owner pushes the rest of the folder without it (HRD-D-0019). Acquire carries
+//! the caller's head and is refused while the listed files have moved past it,
+//! which is where "a viewer upgrades to host only if the head has not moved"
+//! cannot be raced.
 //!
 //! Every change of holder, liveness or `pushed_since` goes out as an
 //! `event: lease` frame to the owner and every member (`events.rs`). A renew
@@ -275,7 +277,17 @@ pub async fn acquire(
         .fetch_one(&mut *tx)
         .await
         .map_err(|e| internal_logged("reading the save's latest version", e))?;
-    if head > body.base_version {
+    // A head that moved only outside the include list moved nothing the lease
+    // guards: the owner's backups of the rest of the folder (HRD-D-0019).
+    let world_moved = head > body.base_version && {
+        let include = crate::routes::share::include_for(&mut *tx, &save_id)
+            .await
+            .map_err(|e| internal_logged("include lookup", e))?;
+        !crate::routes::share::world_unchanged(&mut tx, &save_id, &include, body.base_version, head)
+            .await
+            .map_err(|e| internal_logged("comparing the world across versions", e))?
+    };
+    if world_moved {
         return Err(conflict_with(
             "stale",
             "the save moved past your version: pull before hosting",

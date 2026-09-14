@@ -3978,6 +3978,7 @@ mod sharing_tests {
             owner_user_id: "u-owner".into(),
             owner_username: "jacka".parse().unwrap(),
             include: include.iter().map(|s| s.to_string()).collect(),
+            caller_owns: false,
         }
     }
 
