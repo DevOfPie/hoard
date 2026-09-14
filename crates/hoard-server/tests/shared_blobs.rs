@@ -765,6 +765,189 @@ async fn a_push_outside_the_include_list_is_refused() {
     assert_eq!(snap.version_num, 3);
 }
 
+/// One version of a whole Valheim folder, uploaded before any share: a
+/// character and two worlds.
+struct Folder {
+    character: Vec<u8>,
+    alpha_db: Vec<u8>,
+    alpha_fwl: Vec<u8>,
+    beta_db: Vec<u8>,
+    beta_fwl: Vec<u8>,
+}
+
+impl Folder {
+    fn new() -> Self {
+        Folder {
+            character: b"the character alice plays".to_vec(),
+            alpha_db: vec![5u8; 7_000],
+            alpha_fwl: vec![6u8; 300],
+            beta_db: vec![7u8; 9_000],
+            beta_fwl: vec![8u8; 400],
+        }
+    }
+
+    fn files(&self) -> Vec<(&'static str, &[u8])> {
+        vec![
+            ("characters_local/x.fch", &self.character),
+            ("worlds_local/Alpha.db", &self.alpha_db),
+            ("worlds_local/Alpha.fwl", &self.alpha_fwl),
+            ("worlds_local/Beta.db", &self.beta_db),
+            ("worlds_local/Beta.fwl", &self.beta_fwl),
+        ]
+    }
+}
+
+/// `Folder` as v1, then shared naming the Alpha world only.
+async fn folder_shared_as_alpha(h: &Harness, f: &Folder) {
+    backup_as(h, &h.owner, &f.files(), Some(0)).await;
+    let gid = group_with_everyone(h).await;
+    share_with(
+        h,
+        &h.owner,
+        &gid,
+        &[
+            "worlds_local/Alpha.db",
+            "worlds_local/Alpha.fwl",
+            "worlds_local/Alpha_backup_*",
+        ],
+    )
+    .await
+    .expect("shared");
+}
+
+async fn versions_as(h: &Harness, who: &AuthUser) -> Vec<hoard_core::wire::Snapshot> {
+    snapshots::list(
+        st(h),
+        Extension(who.clone()),
+        Path(SAVE.to_string()),
+        Query(snapshots::ListQuery {
+            include_deleted: false,
+            limit: 50,
+            offset: 0,
+        }),
+    )
+    .await
+    .map(|Json(v)| v)
+    .expect("list")
+}
+
+async fn detail_paths_as(h: &Harness, who: &AuthUser, version: i64) -> Vec<String> {
+    let Json(d) = snapshots::detail(
+        st(h),
+        Extension(who.clone()),
+        Path((SAVE.to_string(), version)),
+    )
+    .await
+    .expect("detail");
+    d.files.into_iter().map(|f| f.relative_path).collect()
+}
+
+/// A member reads what the share names and nothing else, on a version uploaded
+/// before the share: the listing's totals, the manifest and the download. The
+/// owner still reads all five files.
+#[tokio::test]
+async fn a_member_reads_only_the_include_list_even_on_an_older_version() {
+    let h = harness().await;
+    let f = Folder::new();
+    folder_shared_as_alpha(&h, &f).await;
+
+    let v = versions_as(&h, &h.member).await;
+    assert_eq!(v.len(), 1);
+    assert_eq!(v[0].file_count, 2);
+    assert_eq!(
+        v[0].total_size_bytes,
+        (f.alpha_db.len() + f.alpha_fwl.len()) as i64
+    );
+    assert!(v[0].insight.is_none());
+    assert_eq!(
+        detail_paths_as(&h, &h.member, 1).await,
+        ["worlds_local/Alpha.db", "worlds_local/Alpha.fwl"]
+    );
+    let got = download_as(&h, &h.member, 1).await;
+    assert_eq!(
+        got,
+        vec![
+            ("worlds_local/Alpha.db".to_string(), f.alpha_db.clone()),
+            ("worlds_local/Alpha.fwl".to_string(), f.alpha_fwl.clone()),
+        ]
+    );
+
+    let v = versions_as(&h, &h.owner).await;
+    assert_eq!(v[0].file_count, 5);
+    assert_eq!(detail_paths_as(&h, &h.owner, 1).await.len(), 5);
+    let got = download_as(&h, &h.owner, 1).await;
+    let mut want: Vec<(String, Vec<u8>)> = f
+        .files()
+        .into_iter()
+        .map(|(p, b)| (p.to_string(), b.to_vec()))
+        .collect();
+    want.sort_by(|x, y| x.0.cmp(&y.0));
+    assert_eq!(got, want);
+}
+
+/// The group's tables hold the character's blob, but a member hosting the save
+/// cannot reach it by its hash: `init` asks for its bytes like absent content,
+/// and a commit that references it without them is refused. Content the member
+/// can read still deduplicates.
+#[tokio::test]
+async fn a_member_cannot_reach_an_excluded_blob_by_its_hash() {
+    let h = harness().await;
+    let f = Folder::new();
+    folder_shared_as_alpha(&h, &f).await;
+    acquire_as(&h, &h.member, 1).await.expect("hosting");
+
+    let m = manifest(&[
+        ("worlds_local/Alpha.db", &f.character),
+        ("worlds_local/Alpha.fwl", &f.alpha_fwl),
+    ]);
+    let Json(init) = cas::init(
+        st(&h),
+        Extension(h.member.clone()),
+        Path(SAVE.to_string()),
+        Json(CasInit {
+            base_version: Some(1),
+            files: m.clone(),
+        }),
+    )
+    .await
+    .expect("init");
+    let missing: Vec<String> = init
+        .missing
+        .iter()
+        .map(|m| m.sha256.as_str().to_string())
+        .collect();
+    assert_eq!(missing, vec![sha_of(&f.character)]);
+
+    let (code, Json(body)) = cas::commit(
+        st(&h),
+        Extension(h.member.clone()),
+        Path(SAVE.to_string()),
+        Json(CasCommit {
+            upload_id: init.upload_id,
+            base_version: Some(1),
+            device_name: Some("desk".into()),
+            notes: None,
+            files: m,
+        }),
+    )
+    .await
+    .expect_err("the character's blob was never sent");
+    assert_eq!(code, StatusCode::BAD_REQUEST);
+    assert_eq!(
+        body["error"],
+        "manifest references a blob that was not uploaded"
+    );
+    assert_eq!(
+        count(
+            &h.state.pool,
+            "SELECT COUNT(*) FROM snapshots WHERE save_id=?",
+            SAVE
+        )
+        .await,
+        1
+    );
+}
+
 /// A list the client cannot have made from a world name is refused whole,
 /// before anything moves.
 #[tokio::test]

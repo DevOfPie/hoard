@@ -75,7 +75,7 @@ use uuid::Uuid;
 
 use crate::auth::AuthUser;
 use crate::namespace::{self, Namespace};
-use crate::routes::access::save_access;
+use crate::routes::access::{read_include, save_access};
 use crate::routes::health::ServerState;
 use crate::routes::snapshots::{
     blob_in_db, chunk_in_db, err, internal, internal_logged, is_safe_relative_path,
@@ -156,6 +156,40 @@ async fn stored_representation(
         size_bytes: r.get("size_bytes"),
         file_id: r.get("id"),
     }))
+}
+
+/// May this push reference stored content without sending its bytes?
+///
+/// Referencing a sha is reading it: the next download hands the bytes back. A
+/// user's own namespace holds only what that user uploaded, so there it always
+/// may. A group's holds every save shared into it, whole, so there it may only
+/// when an entry of this save that the caller can read already references the
+/// sha: any entry for the owner, an included one for a member (`include` is
+/// [`read_include`]). Otherwise the sha is reported missing like absent content,
+/// which neither confirms that it exists nor lets it through without its bytes.
+async fn may_reuse(
+    conn: &mut sqlx::SqliteConnection,
+    ns: &Namespace,
+    save_id: &str,
+    include: &[String],
+    sha: &str,
+) -> Result<bool, sqlx::Error> {
+    if let Namespace::User(_) = ns {
+        return Ok(true);
+    }
+    let paths: Vec<String> = sqlx::query_scalar(
+        "SELECT sf.relative_path
+           FROM snapshot_files sf
+           JOIN snapshots s ON s.id = sf.snapshot_id
+          WHERE s.save_id = ? AND sf.sha256 = ?",
+    )
+    .bind(save_id)
+    .bind(sha)
+    .fetch_all(conn)
+    .await?;
+    Ok(paths
+        .iter()
+        .any(|p| hoard_core::kernel::fileclass::included(include, p)))
 }
 
 /// An upload's staging folder. It sits flush against `tmp/` so
@@ -275,6 +309,9 @@ pub async fn init(
     if now.as_ref() != Some(&ns) {
         return Err(namespace_changed());
     }
+    let reuse_include = read_include(&mut *tx, &save_id, &access)
+        .await
+        .map_err(|e| internal_logged("include lookup", e))?;
 
     // Reject the non-fast-forward *before* a byte moves. In the multipart this
     // check arrives after the whole save has been uploaded; here it is the first
@@ -332,11 +369,14 @@ pub async fn init(
         if !valid_sha256(&sha) {
             return Err(err(StatusCode::BAD_REQUEST, "invalid sha256 in manifest"));
         }
-        if stored_representation(&mut tx, &ns, &sha)
+        let reusable = stored_representation(&mut tx, &ns, &sha)
             .await
             .map_err(|e| internal_logged("blob dedup lookup", e))?
-            .is_none()
-        {
+            .is_some()
+            && may_reuse(&mut tx, &ns, &save_id, &reuse_include, &sha)
+                .await
+                .map_err(|e| internal_logged("blob dedup lookup", e))?;
+        if !reusable {
             missing_bytes += size;
             missing.push(CasMissing {
                 sha256: body
@@ -736,6 +776,12 @@ pub async fn commit(
         cleanup_staging();
         internal_logged("blob dedup lookup", e)
     })?;
+    let reuse_include = read_include(&mut *conn, &save_id, &access)
+        .await
+        .map_err(|e| {
+            cleanup_staging();
+            internal_logged("include lookup", e)
+        })?;
     for (sha, _declared) in unique_shas(&body.files) {
         if !valid_sha256(&sha) {
             cleanup_staging();
@@ -765,6 +811,22 @@ pub async fn commit(
                         "manifest references a blob that was not uploaded",
                     ));
                 };
+                // Content the caller cannot read is refused exactly like
+                // content that is not there: see `may_reuse`.
+                if !may_reuse(&mut conn, &ns, &save_id, &reuse_include, &sha)
+                    .await
+                    .map_err(|e| {
+                        cleanup_staging();
+                        internal_logged("blob dedup lookup", e)
+                    })?
+                {
+                    cleanup_staging();
+                    warn!(sha = %sha, save_id = %save_id, "cas commit: manifest references content the caller cannot read");
+                    return Err(err(
+                        StatusCode::BAD_REQUEST,
+                        "manifest references a blob that was not uploaded",
+                    ));
+                }
                 reused.insert(sha, stored);
             }
         }
@@ -812,7 +874,13 @@ pub async fn commit(
                     new_bytes += c.len as i64;
                 }
             }
-        } else {
+        } else if !blob_in_db(&state.pool, &ns, sha).await.map_err(|e| {
+            cleanup_staging();
+            internal_logged("blob dedup lookup", e)
+        })? {
+            // A blob can be staged and stored at once: `may_reuse` asks a
+            // member for bytes the group already holds. It is referenced again,
+            // not charged again.
             new_bytes += size;
         }
     }
