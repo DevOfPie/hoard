@@ -507,10 +507,13 @@ enum AgentCommand {
     AttachLease(crate::lease::LeaseHandle),
     /// What the server said about a shared save's lease, from the lease task
     /// or the live stream. `holder` is the holder's username when there is one.
+    /// `verdict` when it answers an acquire (the only answer that clears
+    /// `lease_requested`); a refresh or a live frame is an observation.
     SetLease {
         save_id: String,
         lease: kernel::LeaseObs,
         holder: Option<String>,
+        verdict: bool,
     },
     /// The user takes a role on a shared world. `Host` asks for the lease.
     ClaimWorld {
@@ -649,18 +652,40 @@ impl AgentHandle {
         Ok(())
     }
 
-    /// The server's word on a shared save's lease. See [`AgentCommand::SetLease`].
+    /// The server's word on a shared save's lease, observed (a refresh, a live
+    /// frame). See [`AgentCommand::SetLease`].
     pub async fn set_lease(
         &self,
         save_id: String,
         lease: kernel::LeaseObs,
         holder: Option<String>,
     ) -> Result<()> {
+        self.send_lease(save_id, lease, holder, false).await
+    }
+
+    /// The server's answer to an acquire. See [`AgentCommand::SetLease`].
+    pub async fn lease_verdict(
+        &self,
+        save_id: String,
+        lease: kernel::LeaseObs,
+        holder: Option<String>,
+    ) -> Result<()> {
+        self.send_lease(save_id, lease, holder, true).await
+    }
+
+    async fn send_lease(
+        &self,
+        save_id: String,
+        lease: kernel::LeaseObs,
+        holder: Option<String>,
+        verdict: bool,
+    ) -> Result<()> {
         self.tx
             .send(AgentCommand::SetLease {
                 save_id,
                 lease,
                 holder,
+                verdict,
             })
             .await?;
         Ok(())
@@ -798,7 +823,7 @@ pub(crate) struct SaveSlot {
     pending: Option<tokio::task::JoinHandle<()>>,
     /// Currently-running guess from the last process poll. Drives
     /// GameStarted/Stopped transitions.
-    is_running: bool,
+    pub(crate) is_running: bool,
     /// The session in progress started on a weak signal alone (folder-to-process
     /// correlation) and no strong signal has corroborated it since. If it also ends
     /// without a single write to the folder, it was a phantom session: the
@@ -832,7 +857,7 @@ pub(crate) struct SaveSlot {
     /// device landed at most one per window on the receiver. This lets the veto
     /// tell our own restore writes apart from the user's. Only set when files
     /// were actually applied (not on a no-op "already synced" pass).
-    last_restore_at: Option<OffsetDateTime>,
+    pub(crate) last_restore_at: Option<OffsetDateTime>,
     /// When the currently-pending backup will fire (UTC). `None` if no
     /// backup is scheduled. Recomputed in `schedule_backup`.
     next_scheduled_backup_at: Option<OffsetDateTime>,
@@ -978,12 +1003,27 @@ pub(crate) struct SaveSlot {
     /// What this machine does with the world this session. `Host` by default:
     /// a shared save that is written gets its lease asked for.
     pub(crate) role: WorldRole,
+    /// `role` was chosen by `ClaimWorld` with no session running: it is the
+    /// next session's answer, and `on_game_started` keeps it instead of
+    /// resetting to `Host`. Spent when that session opens.
+    pub(crate) role_pinned: bool,
+    /// A session's local-only writes are still in the folder (the side copy
+    /// failed or moved nothing). The slot stays a viewer and asks for no
+    /// lease until `has_pending` clears, so they never go up as the head.
+    pub(crate) local_only_pending: bool,
+    /// GameStarted came while a side copy was landing: the new session opens
+    /// when the copy does (`claim::on_side_copied`). Cleared by GameStopped.
+    pub(crate) relaunch_pending: bool,
+    /// When the last side copy landed: watcher hits in its tail are the
+    /// renames' own, not pending (`claim::hit_is_side_copy`).
+    pub(crate) side_copy_landed_at: Option<TokioInstant>,
     /// An acquire is out and unanswered. Set on the hold's rising edge, cleared
-    /// by `SetLease`, so a hold that repeats every tick asks once.
+    /// by the acquire's verdict (`SetLease { verdict: true }`), so a hold that
+    /// repeats every tick asks once.
     pub(crate) lease_requested: bool,
     /// `WorldHostedElsewhere` has gone out for the current hold. Cleared when
     /// the lease stops being somebody else's.
-    hosted_elsewhere_notified: bool,
+    pub(crate) hosted_elsewhere_notified: bool,
     /// The claim flow's view of the running session on a shared world
     /// (`claim.rs`): the prompt, the clock, the writes, what is owed on stop.
     /// `None` outside a session.
@@ -1088,6 +1128,10 @@ fn state_from_slot(slot: &SaveSlot, config: &AgentConfig, now: OffsetDateTime) -
 /// the GameStarted and GameStopped events, playtime); the reducer only reads them.
 fn apply_state_to_slot(slot: &mut SaveSlot, next: kernel::State) {
     slot.has_pending = next.has_pending;
+    // Writes kept local have gone up or away: the slot may host again.
+    if !next.has_pending {
+        slot.local_only_pending = false;
+    }
     slot.last_fs_event_at = next.last_fs_event_at;
     slot.last_restore_at = next.last_restore_at;
     // A lease refused as stale is asked for again once the head moved, and
@@ -1663,11 +1707,12 @@ fn reconcile_all(
         // this tick's `has_pending` and `in_flight`: the auto-host clock, the
         // release once the final flush is up, the side copy of a session that
         // never pushes.
-        if let Some(slot) = slots.get_mut(&id) {
-            let followup = crate::claim::on_reconciled(slot, TokioInstant::now(), events_tx, lease);
-            if followup == crate::claim::Followup::SideCopy {
-                launch_side_copy(slot, config, cmd_tx);
-            }
+        let followup = match slots.get_mut(&id) {
+            Some(slot) => crate::claim::on_reconciled(slot, TokioInstant::now(), events_tx, lease),
+            None => crate::claim::Followup::Nothing,
+        };
+        if followup == crate::claim::Followup::SideCopy {
+            launch_side_copy(slots, &id, config, cmd_tx, events_tx);
         }
     }
 }
@@ -1679,10 +1724,15 @@ fn reconcile_all(
 /// a folder emptied of its world with nothing to refill it is worse than one
 /// that diverges.
 fn launch_side_copy(
-    slot: &mut SaveSlot,
+    slots: &mut HashMap<String, SaveSlot>,
+    id: &str,
     config: &AgentConfig,
     cmd_tx: &mpsc::Sender<AgentCommand>,
+    events_tx: &mpsc::Sender<AgentEvent>,
 ) {
+    let Some(slot) = slots.get(id) else {
+        return;
+    };
     let restore_enabled = slot
         .save
         .policy
@@ -1694,7 +1744,7 @@ fn launch_side_copy(
             restore_enabled,
             "agent: a session's local-only writes stay in the folder; no conflict dir or no auto-restore to bring the head back"
         );
-        crate::claim::on_side_copy_failed(slot);
+        crate::claim::on_side_copy_failed(slots, id, TokioInstant::now(), events_tx);
         return;
     };
     let save = slot.save.clone();
@@ -1715,9 +1765,9 @@ fn launch_side_copy(
 }
 
 /// The reducer held a push for want of the lease: ask for it, once per hold.
-/// The answer (`SetLease`) clears the flag; a refusal leaves the hold standing
-/// and the next answer, from the live stream or a later claim, asks again. Only
-/// a host asks: a viewer's writes stay local by choice.
+/// The acquire's verdict (`SetLease { verdict: true }`) clears the flag; a
+/// refusal leaves the hold standing and the next answer asks again. Who may ask
+/// is `claim::may_request_lease`.
 fn request_lease(
     slots: &mut HashMap<String, SaveSlot>,
     id: &str,
@@ -1726,11 +1776,7 @@ fn request_lease(
     let Some(slot) = slots.get_mut(id) else {
         return;
     };
-    if !slot.save.shared
-        || !slot.has_pending
-        || slot.role != WorldRole::Host
-        || slot.lease_requested
-    {
+    if !crate::claim::may_request_lease(slot) {
         return;
     }
     let Some(lease) = lease else {
@@ -2442,24 +2488,9 @@ async fn run_agent(
                     Some(AgentCommand::AttachLease(handle)) => {
                         lease_task = Some(handle);
                     }
-                    Some(AgentCommand::SetLease { save_id, lease: obs, holder }) => {
+                    Some(AgentCommand::SetLease { save_id, lease: obs, holder, verdict }) => {
                         if let Some(slot) = slots.get_mut(&save_id) {
-                            let was = slot.lease;
-                            slot.lease = obs;
-                            slot.lease_holder = holder;
-                            slot.lease_requested = false;
-                            if obs != kernel::LeaseObs::Other {
-                                slot.hosted_elsewhere_notified = false;
-                            }
-                            // The lease this machine held is gone: forced, or
-                            // expired while the renew could not get through.
-                            if was == kernel::LeaseObs::Mine && obs != kernel::LeaseObs::Mine {
-                                tracing::warn!(save_id = %save_id, ?obs, "agent: hosting lease lost");
-                                let _ = events_tx.try_send(AgentEvent::WorldLeaseLost {
-                                    save_id: save_id.clone(),
-                                    game_slug: slot.save.game_slug.clone(),
-                                });
-                            }
+                            crate::claim::on_lease(slot, obs, holder, verdict, &events_tx);
                             reconcile_all(
                                 &mut slots, &api, &events_tx, &cmd_tx, &config, &done_tx,
                                 &cloud_heads, lease_task.as_ref(),
@@ -2468,20 +2499,7 @@ async fn run_agent(
                     }
                     Some(AgentCommand::ClaimWorld { save_id, role }) => {
                         if let Some(slot) = slots.get_mut(&save_id) {
-                            slot.role = role;
-                            crate::claim::on_claim(slot);
-                            if role == WorldRole::Host {
-                                if let Some(lease) = lease_task.as_ref() {
-                                    slot.lease_requested = true;
-                                    lease.acquire(save_id.clone(), slot.known_version.unwrap_or(0));
-                                }
-                            }
-                            let _ = events_tx.try_send(AgentEvent::WorldClaimed {
-                                save_id: save_id.clone(),
-                                game_slug: slot.save.game_slug.clone(),
-                                role,
-                                auto: false,
-                            });
+                            crate::claim::on_claim_world(slot, role, &events_tx, lease_task.as_ref());
                         }
                     }
                     Some(AgentCommand::ReleaseWorld { save_id }) => {
@@ -2501,15 +2519,15 @@ async fn run_agent(
                         }
                     }
                     Some(AgentCommand::SideCopied { save_id, dir, moved }) => {
-                        if let Some(slot) = slots.get_mut(&save_id) {
+                        if let Some(game_slug) = slots.get(&save_id).map(|s| s.save.game_slug.clone()) {
                             match moved {
                                 Ok(moved) => {
                                     tracing::info!(save_id = %save_id, moved, dir = %dir.display(), "agent: session's local-only writes set aside");
-                                    crate::claim::on_side_copied(slot, moved);
+                                    crate::claim::on_side_copied(&mut slots, &save_id, moved, TokioInstant::now(), &events_tx);
                                     if moved > 0 {
                                         let _ = events_tx.try_send(AgentEvent::SaveConflictsBackedUp {
                                             save_id: save_id.clone(),
-                                            game_slug: slot.save.game_slug.clone(),
+                                            game_slug,
                                             count: moved,
                                             conflict_dir: dir,
                                         });
@@ -2517,7 +2535,7 @@ async fn run_agent(
                                 }
                                 Err(error) => {
                                     tracing::warn!(save_id = %save_id, error, "agent: could not set the session's writes aside; they stay pending");
-                                    crate::claim::on_side_copy_failed(slot);
+                                    crate::claim::on_side_copy_failed(&mut slots, &save_id, TokioInstant::now(), &events_tx);
                                 }
                             }
                             reconcile_all(
@@ -2567,7 +2585,13 @@ async fn run_agent(
 
             // ----- Filesystem debounce hits -----
             Some(path) = fs_rx.recv() => {
-                if let Some(save_id) = match_save_for_path(&slots, &path) {
+                // A side copy's own renames are not writes (`claim::hit_is_side_copy`).
+                let save_id = match_save_for_path(&slots, &path).filter(|id| {
+                    !slots
+                        .get(id)
+                        .is_some_and(|s| crate::claim::hit_is_side_copy(s, TokioInstant::now()))
+                });
+                if let Some(save_id) = save_id {
                     let now = OffsetDateTime::now_utc();
                     // Per-save preset overrides win over the global config.
                     let debounce_secs = slots
@@ -2901,6 +2925,10 @@ fn handle_add(
         lease: kernel::LeaseObs::Unknown,
         lease_holder: None,
         role: WorldRole::Host,
+        role_pinned: false,
+        local_only_pending: false,
+        relaunch_pending: false,
+        side_copy_landed_at: None,
         lease_requested: false,
         hosted_elsewhere_notified: false,
         session: None,
@@ -5870,9 +5898,7 @@ fn process_poll(
                 save_id: id.clone(),
                 game_slug,
             });
-            if let Some(slot) = slots.get_mut(&id) {
-                crate::claim::on_game_stopped(slot);
-            }
+            crate::claim::on_game_stopped_all(slots, &id);
             // The final flush when the game closes and the deferred pull's landing are
             // NO LONGER launched here: they are sync decisions the reducer emits in the
             // `reconcile_all` that follows this poll. Clearing `is_running` above lifts
@@ -5934,6 +5960,10 @@ pub(crate) fn test_slot(save: WatchedSave) -> SaveSlot {
         lease: kernel::LeaseObs::Unknown,
         lease_holder: None,
         role: WorldRole::Host,
+        role_pinned: false,
+        local_only_pending: false,
+        relaunch_pending: false,
+        side_copy_landed_at: None,
         lease_requested: false,
         hosted_elsewhere_notified: false,
         session: None,

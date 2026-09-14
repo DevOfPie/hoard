@@ -3,7 +3,8 @@
 //!
 //! One task beside the presence beat, in the same shape: the engine sends it
 //! commands through a [`LeaseHandle`], it talks to the server, and every
-//! answer goes back to the engine as `AgentHandle::set_lease`, which is the one
+//! answer goes back to the engine as `AgentHandle::lease_verdict` (an
+//! acquire's answer) or `AgentHandle::set_lease` (anything else), the one
 //! place a slot's lease changes. The task holds no policy: whether to ask for a
 //! lease is the reducer's call (`HOLD_LEASE_NEEDED`), and what a lost lease
 //! means for a session is the engine's.
@@ -168,18 +169,32 @@ impl LeaseApi for ApiClient {
 }
 
 /// Where the answers go. The engine in production; a recorder in the tests.
+/// `verdict` marks the answer to an acquire; everything else is an observation
+/// and leaves the engine's pending request alone.
 trait LeaseSink: Send + Sync + 'static {
     fn set_lease(
         &self,
         save_id: String,
         lease: LeaseObs,
         holder: Option<String>,
+        verdict: bool,
     ) -> impl Future<Output = ()> + Send;
 }
 
 impl LeaseSink for AgentHandle {
-    async fn set_lease(&self, save_id: String, lease: LeaseObs, holder: Option<String>) {
-        if let Err(e) = AgentHandle::set_lease(self, save_id, lease, holder).await {
+    async fn set_lease(
+        &self,
+        save_id: String,
+        lease: LeaseObs,
+        holder: Option<String>,
+        verdict: bool,
+    ) {
+        let sent = if verdict {
+            AgentHandle::lease_verdict(self, save_id, lease, holder).await
+        } else {
+            AgentHandle::set_lease(self, save_id, lease, holder).await
+        };
+        if let Err(e) = sent {
             tracing::debug!(error = %e, "lease: the engine is gone");
         }
     }
@@ -240,13 +255,13 @@ async fn run<A: LeaseApi, S: LeaseSink>(api: A, sink: S, mut rx: mpsc::Receiver<
                         }
                     }
                     held.remove(&save_id);
-                    sink.set_lease(save_id, LeaseObs::Free, None).await;
+                    sink.set_lease(save_id, LeaseObs::Free, None, false).await;
                 }
                 Some(Cmd::Force { save_id }) => {
                     match api.force(save_id.clone()).await {
                         Ok(()) => {
                             tracing::info!(save_id = %save_id, "lease: forced off its holder");
-                            sink.set_lease(save_id, LeaseObs::Free, None).await;
+                            sink.set_lease(save_id, LeaseObs::Free, None, false).await;
                         }
                         Err(e) => {
                             tracing::info!(save_id = %save_id, error = %e, "lease: force refused");
@@ -269,13 +284,18 @@ async fn run<A: LeaseApi, S: LeaseSink>(api: A, sink: S, mut rx: mpsc::Receiver<
                             };
                             let holder = l.holder_username.as_str().to_string();
                             if ours {
-                                sink.set_lease(save_id, LeaseObs::Mine, Some(holder)).await;
+                                // Ours on the server is ours to renew: a lease
+                                // left by a restart expires otherwise.
+                                held.entry(save_id.clone()).or_insert(Held {
+                                    since: Instant::now(),
+                                });
+                                sink.set_lease(save_id, LeaseObs::Mine, Some(holder), false).await;
                             } else {
                                 held.remove(&save_id);
-                                sink.set_lease(save_id, LeaseObs::Other, Some(holder)).await;
+                                sink.set_lease(save_id, LeaseObs::Other, Some(holder), false).await;
                             }
                         }
-                        Ok(None) => sink.set_lease(save_id, LeaseObs::Free, None).await,
+                        Ok(None) => sink.set_lease(save_id, LeaseObs::Free, None, false).await,
                         Err(e) => {
                             tracing::debug!(save_id = %save_id, error = %e, "lease: refresh failed (state kept)");
                         }
@@ -330,7 +350,8 @@ async fn acquire<A: LeaseApi, S: LeaseSink>(
                 since: Instant::now(),
             });
             let me = lease.holder_username.as_str().to_string();
-            sink.set_lease(save_id, LeaseObs::Mine, Some(me)).await;
+            sink.set_lease(save_id, LeaseObs::Mine, Some(me), true)
+                .await;
         }
         Err(e) => match e.downcast_ref::<ApiError>() {
             Some(ApiError::LeaseHeld(c)) => {
@@ -338,7 +359,7 @@ async fn acquire<A: LeaseApi, S: LeaseSink>(
                 tracing::info!(save_id = %save_id, holder = holder.as_deref().unwrap_or("?"), "lease: held by another member");
                 wanted.remove(&save_id);
                 held.remove(&save_id);
-                sink.set_lease(save_id, LeaseObs::Other, holder).await;
+                sink.set_lease(save_id, LeaseObs::Other, holder, true).await;
             }
             Some(ApiError::LeaseStale(st)) => {
                 // Nobody holds it; this machine is behind. The pull is the
@@ -347,7 +368,7 @@ async fn acquire<A: LeaseApi, S: LeaseSink>(
                 wanted.remove(&save_id);
                 held.remove(&save_id);
                 stale.insert(save_id.clone(), base_version);
-                sink.set_lease(save_id, LeaseObs::Free, None).await;
+                sink.set_lease(save_id, LeaseObs::Free, None, true).await;
             }
             _ if refusal(&e).is_some() => {
                 // A verdict with nothing to hold: not shared, not found, not
@@ -393,7 +414,7 @@ async fn renew_all<A: LeaseApi, S: LeaseSink>(api: &A, sink: &S, held: &mut Hash
         } else {
             LeaseObs::Free
         };
-        sink.set_lease(save_id, obs, holder).await;
+        sink.set_lease(save_id, obs, holder, false).await;
     }
 }
 
@@ -496,8 +517,9 @@ mod tests {
 
     type Seen = Vec<(String, LeaseObs, Option<String>)>;
 
+    /// What the engine was told, and beside it whether each was a verdict.
     #[derive(Clone, Default)]
-    struct Recorder(Arc<Mutex<Seen>>);
+    struct Recorder(Arc<Mutex<Seen>>, Arc<Mutex<Vec<bool>>>);
 
     impl LeaseSink for Recorder {
         fn set_lease(
@@ -505,8 +527,10 @@ mod tests {
             save_id: String,
             lease: LeaseObs,
             holder: Option<String>,
+            verdict: bool,
         ) -> impl Future<Output = ()> + Send {
             self.0.lock().unwrap().push((save_id, lease, holder));
+            self.1.lock().unwrap().push(verdict);
             async {}
         }
     }
@@ -760,6 +784,34 @@ mod tests {
             &[("w1".to_string(), LeaseObs::Mine, Some("me".to_string()))],
             "one verdict, no noise for the failed try"
         );
+    }
+
+    /// A refresh that finds this account holding a lease the task did not
+    /// know of (a restart within the TTL) keeps it alive, and tells the
+    /// engine as an observation, not as the answer to an acquire.
+    #[tokio::test(start_paused = true)]
+    async fn a_refresh_that_reads_mine_is_renewed() {
+        let fake = Fake::default();
+        fake.0.acquire.lock().unwrap().push(Ok(lease("me")));
+        *fake.0.current.lock().unwrap() = Some(lease("me"));
+        let (h, sink, _task) = start(fake.clone());
+        h.refresh("w1");
+        settle().await;
+        assert_eq!(
+            sink.0.lock().unwrap().as_slice(),
+            &[("w1".to_string(), LeaseObs::Mine, Some("me".to_string()))]
+        );
+        // The fresh interval's immediate tick may already have renewed it.
+        let before = *fake.0.renews.lock().unwrap();
+        tokio::time::advance(Duration::from_secs(RENEW_SECS + 1)).await;
+        settle().await;
+        assert!(
+            *fake.0.renews.lock().unwrap() > before,
+            "renewed on the next tick"
+        );
+        h.acquire("w1", 1);
+        settle().await;
+        assert_eq!(sink.1.lock().unwrap().as_slice(), &[false, true]);
     }
 
     /// A refresh reads mine only when the server names this account, whatever
