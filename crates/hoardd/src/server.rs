@@ -879,6 +879,7 @@ fn server_refusal(err: &anyhow::Error) -> Option<IpcError> {
         ApiError::LeaseStale(_) => Some("stale"),
         ApiError::LeaseRequired(_) => Some("lease_required"),
         ApiError::NotShared => Some("not_shared"),
+        ApiError::LeasePushed(_) => Some("pushed"),
         ApiError::Conflict(_) => Some("conflict"),
         _ => None,
     };
@@ -1003,6 +1004,10 @@ mod tests {
         assert_eq!(
             code_of(ApiError::NotShared),
             Some(("conflict", "not_shared".to_string()))
+        );
+        assert_eq!(
+            code_of(ApiError::LeasePushed("the holder has pushed".into())),
+            Some(("conflict", "pushed".to_string()))
         );
         assert_eq!(
             code_of(ApiError::Server {

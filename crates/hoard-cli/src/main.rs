@@ -80,6 +80,16 @@ enum Commands {
         #[arg(long)]
         deep: bool,
     },
+    /// Give a save that is on the server but not on this machine a folder
+    /// here: a world shared with you, or your own save from another machine.
+    /// The sync service watches the folder from then on, as after `hoard track`.
+    Adopt {
+        /// Save id (UUID), see `hoard save list`
+        save_id: String,
+        /// The save's folder on this machine (created if missing)
+        #[arg(long)]
+        path: PathBuf,
+    },
     /// List the saves this machine tracks (local, no network)
     Saves,
     /// Show server status (uses /v1/health)
@@ -351,6 +361,7 @@ fn supports_json(cmd: &Commands) -> bool {
         | Commands::Doctor
         | Commands::Whoami
         | Commands::Scan { .. }
+        | Commands::Adopt { .. }
         | Commands::Restore { .. } => true,
         Commands::Save { action } => matches!(
             action,
@@ -359,11 +370,7 @@ fn supports_json(cmd: &Commands) -> bool {
                 | commands::saves::SaveCommand::Untrack { .. }
         ),
         Commands::Snapshots { action } => matches!(action, SnapshotCommand::List { .. }),
-        Commands::Group { action } => matches!(action, commands::group::GroupCommand::List),
-        Commands::World { action } => {
-            matches!(action, commands::world::WorldCommand::Lease { .. })
-        }
-        Commands::Share { .. } => true,
+        Commands::Group { .. } | Commands::World { .. } | Commands::Share { .. } => true,
         _ => false,
     }
 }
@@ -377,9 +384,9 @@ async fn dispatch(cli: Cli) -> Result<()> {
         return Err(output::err(
             "json_unsupported",
             "this command has no --json output yet. The ones that do: saves, \
-             doctor, status, devices, whoami, scan, restore, save list, \
-             save show, save untrack, snapshots list, group list, share, \
-             world lease.",
+             doctor, status, devices, whoami, scan, restore, adopt, save list, \
+             save show, save untrack, snapshots list, share, and every group \
+             and world verb.",
         ));
     }
 
@@ -416,6 +423,9 @@ async fn dispatch(cli: Cli) -> Result<()> {
                 deep,
             })
             .await
+        }
+        Commands::Adopt { save_id, path } => {
+            commands::adopt::run(commands::adopt::Args { save_id, path }).await
         }
         Commands::Saves => commands::tracked::run().await,
         Commands::Status => commands::status::run().await,
@@ -651,5 +661,52 @@ fn fmt_bytes(b: u64) -> String {
         format!("{:.2}K", b / KB)
     } else {
         format!("{}B", b as u64)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse(args: &[&str]) -> Result<Cli, clap::Error> {
+        Cli::try_parse_from(std::iter::once("hoard").chain(args.iter().copied()))
+    }
+
+    #[test]
+    fn adopt_takes_a_save_and_a_folder() {
+        let cli = parse(&["adopt", "s1", "--path", "/games/valheim"]).unwrap();
+        match cli.command {
+            Some(Commands::Adopt { save_id, path }) => {
+                assert_eq!(save_id, "s1");
+                assert_eq!(path, PathBuf::from("/games/valheim"));
+            }
+            _ => panic!("not an adopt"),
+        }
+        // The folder is the user's to name: no default, no guess.
+        assert!(parse(&["adopt", "s1"]).is_err());
+        assert!(parse(&["adopt", "--path", "/games/valheim"]).is_err());
+    }
+
+    #[test]
+    fn the_sharing_verbs_answer_json() {
+        for args in [
+            &["adopt", "s1", "--path", "/x"][..],
+            &["world", "claim", "s1"],
+            &["world", "claim", "s1", "--view"],
+            &["world", "release", "s1"],
+            &["world", "force", "s1"],
+            &["world", "dismiss", "s1"],
+            &["world", "lease", "s1"],
+            &["group", "create", "raid"],
+            &["group", "invite", "raid"],
+            &["group", "join", "tok"],
+            &["group", "leave", "raid"],
+            &["group", "list"],
+        ] {
+            let cli = parse(args).unwrap();
+            assert!(supports_json(cli.command.as_ref().unwrap()), "{args:?}");
+        }
+        let cli = parse(&["track", "valheim"]).unwrap();
+        assert!(!supports_json(cli.command.as_ref().unwrap()));
     }
 }
