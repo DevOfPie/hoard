@@ -692,7 +692,9 @@ pub enum IpcError {
     /// The server refused for a reason other than a 409: `code` is one of
     /// `unauthorized`, `forbidden`, `not_found`, `bad_request`, `throttled`,
     /// `quota_full`, for a client that sorts refusals into its own groups;
-    /// `message` is what the user reads.
+    /// `message` is what the user reads. The engine refuses a world verb the
+    /// same way: `not_watched` for a save it does not track, `not_shared` for
+    /// one that is not shared with a group.
     #[error("{message}")]
     Refused { code: String, message: String },
     #[error("the Hoard service couldn't do it: {message}")]

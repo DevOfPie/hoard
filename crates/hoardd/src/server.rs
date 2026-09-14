@@ -365,7 +365,8 @@ impl Daemon {
                 self.with_engine(|h| async move { h.set_global_sync(enabled).await })
                     .await
             }
-            // The world verbs are engine commands: the outcome arrives as events.
+            // The world verbs are engine commands: the outcome arrives as events,
+            // and a save that is not a shared world here is refused up front.
             Request::ClaimWorld { save_id, role } => {
                 self.with_engine(|h| async move { h.claim_world(save_id, role).await })
                     .await
@@ -548,7 +549,11 @@ impl Daemon {
     /// A command that does not reach the engine almost always means the engine is
     /// gone (a closed channel), so it is reported as `EngineDown` with whatever reason
     /// the keeper recorded, not as an opaque `Internal`.
+    /// An engine that answered with a refusal is up, so that is checked first.
     fn engine_error(&self, err: anyhow::Error) -> Reply {
+        if let Some(refusal) = world_refusal(&err) {
+            return Reply::Error(refusal);
+        }
         tracing::warn!(error = %format!("{err:#}"), "hoardd: a request failed");
         if self.engine.handle().is_none() {
             return Reply::Error(IpcError::EngineDown {
@@ -833,11 +838,40 @@ fn server_refusal(err: &anyhow::Error) -> Option<IpcError> {
     })
 }
 
+/// The engine's refusal of a world verb (a save it does not watch, or does not
+/// share), as a `Refused` naming the save.
+fn world_refusal(err: &anyhow::Error) -> Option<IpcError> {
+    let refused = err.downcast_ref::<hoard_agent::agent::WorldCommandError>()?;
+    Some(IpcError::Refused {
+        code: refused.code().to_string(),
+        message: refused.to_string(),
+    })
+}
+
 #[cfg(test)]
 mod tests {
-    use super::server_refusal;
+    use super::{server_refusal, world_refusal};
+    use hoard_agent::agent::WorldCommandError;
     use hoard_agent::api::{ApiError, RateLimitKind};
     use hoard_core::ipc::IpcError;
+
+    /// An engine refusal crosses as `Refused` with its code and the save id.
+    #[test]
+    fn world_refusals_keep_their_code_and_save() {
+        for (err, code) in [
+            (WorldCommandError::NotWatched("s-1".into()), "not_watched"),
+            (WorldCommandError::NotShared("s-1".into()), "not_shared"),
+        ] {
+            match world_refusal(&anyhow::Error::new(err)) {
+                Some(IpcError::Refused { code: got, message }) => {
+                    assert_eq!(got, code);
+                    assert!(message.contains("s-1"), "{message}");
+                }
+                other => panic!("unexpected {other:?}"),
+            }
+        }
+        assert!(world_refusal(&anyhow::anyhow!("channel closed")).is_none());
+    }
 
     fn code_of(err: ApiError) -> Option<(&'static str, String)> {
         match server_refusal(&anyhow::Error::new(err).context("sharing")) {
