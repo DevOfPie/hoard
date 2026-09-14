@@ -577,6 +577,7 @@ fn playtime_watched_save(slug: &str, install_dir: Option<PathBuf>) -> WatchedSav
         policy: SavePolicy::default(),
         known_version: None,
         set_hash: None,
+        world_hash: None,
         track_only: true,
         shared: None,
         include: Vec::new(),
@@ -733,6 +734,7 @@ pub fn watched_saves_from_state(
             allow_device_local: s.allow_device_local,
             known_version: s.last_version_num,
             set_hash: s.set_hash.clone(),
+            world_hash: s.world_hash.clone(),
             track_only: false,
             shared: s.shared.clone(),
             include: s.include.clone(),
@@ -1188,6 +1190,7 @@ pub async fn add_to_tracking(client: &ApiClient, args: AddGameArgs) -> Result<Tr
             paused: false,
             preset: preset_name.clone(),
             set_hash: None,
+            world_hash: None,
             processes: pinned_processes.clone(),
             shared_processes: args.shared_processes,
             allow_device_local: None,
@@ -1278,6 +1281,7 @@ pub async fn add_to_tracking(client: &ApiClient, args: AddGameArgs) -> Result<Tr
         paused: false,
         preset: preset_name.clone(),
         set_hash: None,
+        world_hash: None,
         processes: pinned_processes.clone(),
         shared_processes: args.shared_processes,
         allow_device_local: None,
@@ -1390,6 +1394,7 @@ pub async fn adopt(client: &ApiClient, args: AdoptArgs) -> Result<TrackOutcome> 
         paused: false,
         preset: preset.clone(),
         set_hash: None,
+        world_hash: None,
         processes: Vec::new(),
         shared_processes: false,
         allow_device_local: None,
@@ -1536,9 +1541,11 @@ pub async fn plan_home_for_restore(
     }
 
     let (game_slug, label, shared) = server_name_of(client, save_id).await?;
+    // The walks' list, as `set_shared` mirrors it: the owner's is the whole
+    // folder (HRD-D-0019).
     let include = shared
         .as_ref()
-        .map(|s| s.include.clone())
+        .map(|s| s.walk_include().to_vec())
         .unwrap_or_default();
     reject_degenerate_slug(&game_slug)?;
     restore_twin(&state, save_id, &game_slug, &label, local_path)?;
@@ -1838,6 +1845,7 @@ pub async fn reconcile_with_server(client: &ApiClient) -> Result<Reconciliation>
                     SaveState {
                         last_version_num: None,
                         set_hash: None,
+                        world_hash: None,
                         ..row
                     },
                 );
@@ -2086,7 +2094,9 @@ fn sync_shared_from_server(state: &mut CliState, server: &[hoard_core::wire::Sav
             continue;
         };
         let shared = row.shared.as_ref().map(SharedRef::from);
-        let include = shared.as_ref().map_or(&[][..], |s| s.include.as_slice());
+        // What `set_shared` would mirror: the list for a member, nothing for
+        // the owner (HRD-D-0019).
+        let include = shared.as_ref().map_or(&[][..], |s| s.walk_include());
         if st.shared != shared || st.include != include {
             st.set_shared(row.shared.as_ref());
             changed += 1;
@@ -2363,6 +2373,7 @@ fn watched_from_snapshot(save_id: String, s: &SaveState) -> WatchedSave {
         // acquire out at base 0 after a share, refused as stale against head.
         known_version: s.last_version_num,
         set_hash: None,
+        world_hash: None,
         track_only: false,
         shared: s.shared.clone(),
         include: s.include.clone(),
@@ -2741,6 +2752,7 @@ mod tests {
             shared: None,
             include: Vec::new(),
             set_hash: None,
+            world_hash: None,
             processes: Vec::new(),
             shared_processes: false,
         }
@@ -3988,6 +4000,7 @@ mod sharing_tests {
             owner_user_id: "u-owner".into(),
             owner_username: "jacka".parse().unwrap(),
             include: include.iter().map(|s| s.to_string()).collect(),
+            caller_owns: false,
         }
     }
 
@@ -4018,6 +4031,7 @@ mod sharing_tests {
             paused: false,
             preset: None,
             set_hash: None,
+            world_hash: None,
             processes: Vec::new(),
             shared_processes: false,
             allow_device_local: None,
@@ -4056,6 +4070,8 @@ mod sharing_tests {
     }
 
     /// The server's share reaches the local row, and so does its going away.
+    /// Changed on purpose by HRD-D-0019: the owner's row keeps the list as its
+    /// world and walks the whole folder, and ownership changing is a change.
     #[test]
     fn reconcile_copies_shared_and_include_from_the_server() {
         let mut state = CliState::default();
@@ -4078,6 +4094,7 @@ mod sharing_tests {
                     "worlds_local/Alpha.db".into(),
                     "worlds_local/Alpha.fwl".into()
                 ],
+                caller_owns: false,
             })
         );
         assert_eq!(
@@ -4095,6 +4112,24 @@ mod sharing_tests {
         assert_eq!(sync_shared_from_server(&mut state, &rows), 1);
         assert!(state.saves[ID].shared.is_none());
         assert!(state.saves[ID].include.is_empty());
+
+        // The owner's own row: the list is the world on `shared`, and the walks
+        // take the whole folder.
+        let owned = SharedInfo {
+            caller_owns: true,
+            ..shared_info(&["worlds_local/Alpha.db"])
+        };
+        let rows = vec![server_row(Some(owned))];
+        assert_eq!(sync_shared_from_server(&mut state, &rows), 1);
+        let st = &state.saves[ID];
+        assert!(st.include.is_empty(), "{:?}", st.include);
+        assert_eq!(st.world(), ["worlds_local/Alpha.db".to_string()]);
+        assert!(st.shared.as_ref().is_some_and(|s| s.caller_owns));
+        assert_eq!(sync_shared_from_server(&mut state, &rows), 0);
+        // The same share read as a member's narrows the walks again.
+        let rows = vec![server_row(Some(shared_info(&["worlds_local/Alpha.db"])))];
+        assert_eq!(sync_shared_from_server(&mut state, &rows), 1);
+        assert_eq!(state.saves[ID].include, vec!["worlds_local/Alpha.db"]);
 
         // A server row this machine does not track is nobody's business here.
         let mut other = CliState::default();

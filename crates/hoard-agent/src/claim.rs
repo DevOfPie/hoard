@@ -429,7 +429,9 @@ pub(crate) fn on_lease(
 pub(crate) fn on_stale(slot: &mut SaveSlot, base: i64) {
     tracing::info!(save_id = %slot.save.save_id, base, "agent: the world is behind; pulling the head before hosting");
     slot.stale_base = Some(base);
-    if !slot.has_pending {
+    // Only writes to the world hold the pull back: the owner's other files
+    // survive the merge and go up without the lease (HRD-D-0019).
+    if !crate::agent::world_pending(slot) {
         slot.pull_pending = true;
     }
 }
@@ -474,6 +476,8 @@ fn set_aside_behind(slot: &mut SaveSlot, now: Instant) -> bool {
         || slot.in_flight.is_some()
         || slot.local_only_pending
         || slot.lease == LeaseObs::Mine
+        // Only the world is set aside, the owner's included (HRD-D-0019).
+        || !crate::agent::world_pending(slot)
     {
         return false;
     }
@@ -667,6 +671,30 @@ pub(crate) fn on_write(
     }
 }
 
+/// [`on_write`] for a hit at `path`: only a write to the shared world is
+/// evidence of playing it (HRD-D-0019). A character or another world written
+/// during the session claims nothing. A hit that names no file under the
+/// folder is taken as a write, as before, and so is a directory the world can
+/// reach into.
+pub(crate) fn on_write_at(
+    slot: &mut SaveSlot,
+    path: &Path,
+    events_tx: &mpsc::Sender<AgentEvent>,
+    lease: Option<&LeaseHandle>,
+) {
+    let rel = path
+        .strip_prefix(&slot.save.local_path)
+        .map(|r| r.to_string_lossy().replace('\\', "/"))
+        .unwrap_or_default();
+    let world = slot.save.world();
+    let in_world = rel.is_empty()
+        || hoard_core::kernel::fileclass::included(world, &rel)
+        || (path.is_dir() && hoard_core::kernel::fileclass::reaches_beneath(world, &rel));
+    if in_world {
+        on_write(slot, events_tx, lease);
+    }
+}
+
 /// Hosts on the engine's own decision: the lease is asked for and the user
 /// is told it was the engine, not them.
 fn acquire_auto(
@@ -761,16 +789,17 @@ pub(crate) fn on_reconciled(
         return Followup::Nothing;
     }
     let local_only = slot.role == WorldRole::View || slot.lease == LeaseObs::Other;
-    if local_only && slot.has_pending {
-        if session.side_copy_started {
-            return Followup::Nothing;
-        }
+    // Only writes to the world are set aside: a member's pending is all world,
+    // and the owner's other files go up without the lease (HRD-D-0019).
+    if local_only && crate::agent::world_pending(slot) {
         // An upload still streaming the folder (the final flush of a lease
         // lost meanwhile) reads the files the copy would move: it goes first.
         if slot.in_flight.is_some() {
             return Followup::Nothing;
         }
-        session.side_copy_started = true;
+        if let Some(session) = slot.session.as_mut() {
+            session.side_copy_started = true;
+        }
         return Followup::SideCopy;
     }
     end_session(slot);
@@ -900,7 +929,8 @@ pub(crate) fn side_copy_dir(root: &Path, save_id: &str, at: OffsetDateTime) -> P
     root.join(save_id).join(ts)
 }
 
-/// Moves the world's files (the save's include list, nothing else) into
+/// Moves the world's files (the share's list, nothing else, even when the
+/// save's walk takes the whole folder as the owner's does) into
 /// `dir`, so the folder holds nothing newer than the head and the next pull
 /// puts the head back without an mtime contest. Rename first, copy and
 /// remove across filesystems. Returns how many moved.
@@ -910,7 +940,7 @@ pub(crate) async fn move_world_aside(save: &WatchedSave, dir: &Path) -> anyhow::
         &save.local_path,
         Scope {
             shields: &shields,
-            include: &save.include,
+            include: save.world(),
         },
     )?;
     let mut moved = 0;
@@ -957,6 +987,10 @@ pub(crate) fn on_side_copied(
         // unversioned any more, and the head has to come back.
         slot.has_pending = false;
         slot.local_only_pending = false;
+        // The owner's writes outside the world are still unversioned. Marked
+        // now they would veto the very pull that refills the world, so they
+        // are marked again once it lands (HRD-D-0019).
+        slot.recheck_pending_after_pull = slot.save.owns_whole_folder();
         slot.known_version = None;
         slot.pull_pending = true;
         slot.last_restore_at = Some(OffsetDateTime::now_utc());
@@ -1057,6 +1091,7 @@ mod tests {
             allow_device_local: None,
             known_version: Some(3),
             set_hash: None,
+            world_hash: None,
             track_only: false,
             shared: Some(crate::state::SharedRef {
                 group_id: "g1".into(),
@@ -1064,6 +1099,7 @@ mod tests {
                 owner_user_id: "u-owner".into(),
                 owner_username: "owner".into(),
                 include: Vec::new(),
+                caller_owns: false,
             }),
             include: Vec::new(),
         }
@@ -2163,6 +2199,11 @@ mod tests {
         let mut save = world("w1", "valheim");
         save.local_path = folder.clone();
         save.include = vec!["worlds_local/Alpha.db".into()];
+        // A member's row, as `set_shared` writes it: the share's list is the
+        // world the side copy takes (HRD-D-0019).
+        if let Some(shared) = save.shared.as_mut() {
+            shared.include = save.include.clone();
+        }
         let dir = side_copy_dir(
             &tmp.path().join("conflicts"),
             "w1",
@@ -2177,6 +2218,201 @@ mod tests {
         assert!(!folder.join("worlds_local/Alpha.db").exists());
         assert!(folder.join("worlds_local/Beta.db").exists());
         assert!(folder.join("characters_local/me.fch").exists());
+    }
+
+    /// An owner's share of one world out of a folder holding more (HRD-D-0019).
+    fn owned_world(folder: &Path) -> WatchedSave {
+        let mut save = world("w1", "valheim");
+        save.local_path = folder.to_path_buf();
+        if let Some(shared) = save.shared.as_mut() {
+            shared.include = vec!["worlds_local/Alpha.db".into()];
+            shared.caller_owns = true;
+        }
+        save
+    }
+
+    fn owner_folder(tmp: &Path) -> PathBuf {
+        let folder = tmp.join("save");
+        std::fs::create_dir_all(folder.join("worlds_local")).unwrap();
+        std::fs::create_dir_all(folder.join("characters_local")).unwrap();
+        std::fs::write(folder.join("worlds_local/Alpha.db"), b"world").unwrap();
+        std::fs::write(folder.join("worlds_local/Beta.db"), b"other world").unwrap();
+        std::fs::write(folder.join("characters_local/me.fch"), b"me").unwrap();
+        folder
+    }
+
+    /// The owner's walk takes the whole folder; its side copy still takes
+    /// the world alone.
+    #[tokio::test]
+    async fn the_owners_side_copy_moves_only_the_world() {
+        let tmp = tempfile::tempdir().unwrap();
+        let folder = owner_folder(tmp.path());
+        let save = owned_world(&folder);
+        assert!(save.include.is_empty() && save.owns_whole_folder());
+        let dir = side_copy_dir(
+            &tmp.path().join("conflicts"),
+            "w1",
+            OffsetDateTime::UNIX_EPOCH,
+        );
+        assert_eq!(move_world_aside(&save, &dir).await.unwrap(), 1);
+        assert!(dir.join("worlds_local/Alpha.db").exists());
+        assert!(!folder.join("worlds_local/Alpha.db").exists());
+        assert!(folder.join("worlds_local/Beta.db").exists());
+        assert!(folder.join("characters_local/me.fch").exists());
+    }
+
+    /// An owner who viewed the world and changed only a character: nothing is
+    /// set aside, the change stays pending, and it goes up without the lease.
+    #[tokio::test(start_paused = true)]
+    async fn an_owner_viewers_character_change_is_not_set_aside_and_backs_up() {
+        let (tx, mut rx) = mpsc::channel(8);
+        let tmp = tempfile::tempdir().unwrap();
+        let folder = owner_folder(tmp.path());
+        let now = Instant::now();
+        let mut s = slots(vec![owned_world(&folder)]);
+        {
+            let slot = s.get_mut("w1").unwrap();
+            slot.lease = LeaseObs::Other;
+            crate::agent::test_sync_now(slot);
+        }
+        on_game_started(&mut s, "w1", now, &tx);
+        drain(&mut rx);
+        let slot = s.get_mut("w1").unwrap();
+        slot.role = WorldRole::View;
+        std::fs::write(folder.join("characters_local/me.fch"), b"me, levelled up").unwrap();
+        slot.has_pending = true;
+        on_game_stopped(slot);
+        assert_eq!(on_reconciled(slot, now, &tx, None), Followup::Nothing);
+        assert!(slot.session.is_none());
+        assert!(slot.has_pending);
+        assert!(folder.join("worlds_local/Alpha.db").exists());
+        let decisions = crate::agent::test_decisions(slot);
+        assert!(
+            decisions.contains(&kernel::Decision::Act(kernel::Action::Backup)),
+            "{decisions:?}"
+        );
+    }
+
+    /// The owner changed the world and a character under somebody else's
+    /// lease: the world is set aside, the character stays, and it is pending
+    /// again once the pull that refills the world has landed.
+    #[tokio::test(start_paused = true)]
+    async fn an_owners_world_and_character_change_sets_aside_only_the_world() {
+        let (tx, mut rx) = mpsc::channel(8);
+        let tmp = tempfile::tempdir().unwrap();
+        let folder = owner_folder(tmp.path());
+        let now = Instant::now();
+        let mut s = slots(vec![owned_world(&folder)]);
+        {
+            let slot = s.get_mut("w1").unwrap();
+            slot.lease = LeaseObs::Other;
+            crate::agent::test_sync_now(slot);
+        }
+        on_game_started(&mut s, "w1", now, &tx);
+        drain(&mut rx);
+        {
+            let slot = s.get_mut("w1").unwrap();
+            std::fs::write(folder.join("worlds_local/Alpha.db"), b"world, changed").unwrap();
+            std::fs::write(folder.join("characters_local/me.fch"), b"me, levelled up").unwrap();
+            slot.has_pending = true;
+            on_game_stopped(slot);
+            assert_eq!(on_reconciled(slot, now, &tx, None), Followup::SideCopy);
+        }
+        let dir = side_copy_dir(
+            &tmp.path().join("conflicts"),
+            "w1",
+            OffsetDateTime::UNIX_EPOCH,
+        );
+        let moved = move_world_aside(&s["w1"].save, &dir).await.unwrap();
+        assert_eq!(moved, 1);
+        on_side_copied(&mut s, "w1", moved, now, &tx);
+        let slot = s.get_mut("w1").unwrap();
+        assert!(
+            !slot.has_pending,
+            "nothing vetoes the pull that refills the world"
+        );
+        assert!(slot.pull_pending);
+        assert!(slot.recheck_pending_after_pull);
+        assert_eq!(
+            std::fs::read(folder.join("characters_local/me.fch")).unwrap(),
+            b"me, levelled up"
+        );
+        assert_eq!(
+            std::fs::read(dir.join("worlds_local/Alpha.db")).unwrap(),
+            b"world, changed"
+        );
+
+        // The pull lands with the head's world; the character is still newer.
+        std::fs::write(folder.join("worlds_local/Alpha.db"), b"world").unwrap();
+        crate::agent::after_pull_landed(slot, None);
+        assert!(slot.has_pending, "the character stays pending");
+        assert!(!slot.recheck_pending_after_pull);
+    }
+
+    /// A write to a character during a session on the owner's world is not
+    /// evidence of playing it: no lease is asked for. A write to the world is.
+    #[tokio::test(start_paused = true)]
+    async fn a_write_outside_the_world_claims_nothing() {
+        let (tx, mut rx) = mpsc::channel(8);
+        let (lease, mut seen) = LeaseHandle::probe();
+        let tmp = tempfile::tempdir().unwrap();
+        let folder = owner_folder(tmp.path());
+        let mut s = slots(vec![owned_world(&folder)]);
+        s.get_mut("w1").unwrap().lease = LeaseObs::Free;
+        on_game_started(&mut s, "w1", Instant::now(), &tx);
+        drain(&mut rx);
+        let slot = s.get_mut("w1").unwrap();
+        on_write_at(
+            slot,
+            &folder.join("characters_local/me.fch"),
+            &tx,
+            Some(&lease),
+        );
+        on_write_at(
+            slot,
+            &folder.join("worlds_local/Beta.db"),
+            &tx,
+            Some(&lease),
+        );
+        tokio::task::yield_now().await;
+        assert!(
+            seen.try_recv().is_err(),
+            "a write outside the world asked for the lease"
+        );
+        assert!(!slot.session.as_ref().unwrap().claimed);
+        assert!(drain(&mut rx).is_empty());
+
+        on_write_at(
+            slot,
+            &folder.join("worlds_local/Alpha.db"),
+            &tx,
+            Some(&lease),
+        );
+        tokio::task::yield_now().await;
+        assert_eq!(seen.try_recv().unwrap(), "acquire w1");
+    }
+
+    /// Behind the head with only the owner's files outside the world pending:
+    /// nothing is set aside and the pull is not held back for them. A write to
+    /// the world behind the head still is set aside.
+    #[tokio::test(start_paused = true)]
+    async fn behind_the_head_the_owners_other_writes_are_not_set_aside() {
+        let (tx, _rx) = mpsc::channel(8);
+        let tmp = tempfile::tempdir().unwrap();
+        let folder = owner_folder(tmp.path());
+        let now = Instant::now();
+        let mut s = slots(vec![owned_world(&folder)]);
+        let slot = s.get_mut("w1").unwrap();
+        crate::agent::test_sync_now(slot);
+        std::fs::write(folder.join("characters_local/me.fch"), b"me, levelled up").unwrap();
+        slot.has_pending = true;
+        on_stale(slot, 3);
+        assert!(slot.pull_pending);
+        assert_eq!(on_reconciled(slot, now, &tx, None), Followup::Nothing);
+        assert!(slot.session.is_none());
+
+        std::fs::write(folder.join("worlds_local/Alpha.db"), b"world, changed").unwrap();
+        assert_eq!(on_reconciled(slot, now, &tx, None), Followup::SideCopy);
     }
 
     fn lines(seen: &mut mpsc::UnboundedReceiver<String>) -> Vec<String> {
@@ -2262,6 +2498,11 @@ mod tests {
         let mut save = world("w1", "valheim");
         save.local_path = folder.clone();
         save.include = vec!["worlds_local/Alpha.db".into()];
+        // A member's row, as `set_shared` writes it: the share's list is the
+        // world the side copy takes (HRD-D-0019).
+        if let Some(shared) = save.shared.as_mut() {
+            shared.include = save.include.clone();
+        }
         let mut s = slots(vec![save]);
         {
             let slot = s.get_mut("w1").unwrap();

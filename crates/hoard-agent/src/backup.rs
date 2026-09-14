@@ -369,6 +369,11 @@ pub struct ServerHead {
 }
 
 /// Outcome of a skip-aware backup ([`upload_directory_checked`]).
+///
+/// Every variant carries `world`: the cheap signature of the shared world
+/// inside the walk ([`world_signature`]), what the owner's push without the lease
+/// is judged against (HRD-D-0019). For anything but an owner it equals the cheap
+/// half of the set signature.
 // One value per backup run, moved straight to the caller and never stored in
 // bulk, so the size gap between variants costs nothing worth a Box.
 #[allow(clippy::large_enum_variant)]
@@ -376,18 +381,19 @@ pub struct ServerHead {
 pub enum BackupResult {
     /// The cheap set signature matched the cached one, so nothing was read or
     /// uploaded. The fast path.
-    Skipped,
+    Skipped { world: String },
     /// The cheap signature drifted (the game rewrote its save files, bumping
     /// mtimes) but the actual bytes are identical to the last upload, so no
     /// new snapshot was created. `signature` is the refreshed composite the
     /// caller should persist so the *next* check hits the fast path again
     /// instead of re-hashing the whole save every cycle.
-    Unchanged { signature: String },
+    Unchanged { signature: String, world: String },
     /// A new snapshot was created. `signature` is the freshly-computed
     /// composite signature the caller should persist for the next skip check.
     Uploaded {
         outcome: UploadOutcome,
         signature: String,
+        world: String,
     },
     /// It was already on the server: the local content is, byte for byte, that of
     /// the version the cloud publishes as its head (ADR 0021 D.8.3). Nothing was
@@ -396,7 +402,11 @@ pub enum BackupResult {
     ///
     /// What produces it is a daemon restart with an upload in flight that did
     /// commit: the in-memory `in_flight` was lost, but the content is up there.
-    AlreadyLanded { version_num: i64, signature: String },
+    AlreadyLanded {
+        version_num: i64,
+        signature: String,
+        world: String,
+    },
 }
 
 /// A cheap signature over the sorted `(relative_path, size, mtime)` set.
@@ -422,6 +432,21 @@ pub fn compute_set_signature(files: &[UploadFile]) -> String {
         h.update([0u8]);
     }
     hex::encode(h.finalize())
+}
+
+/// [`compute_set_signature`] over the files of the shared world alone
+/// ([`fileclass::included`]), out of a walk that may take more: the owner's
+/// whole folder (HRD-D-0019). An empty world is the whole walk.
+pub fn world_signature(files: &[UploadFile], world: &[String]) -> String {
+    if world.is_empty() {
+        return compute_set_signature(files);
+    }
+    let inside: Vec<UploadFile> = files
+        .iter()
+        .filter(|f| fileclass::included(world, &f.relative_path))
+        .cloned()
+        .collect();
+    compute_set_signature(&inside)
 }
 
 /// The digest of a version's manifest: the content identity the server publishes
@@ -2000,13 +2025,16 @@ fn verify_sent(
 /// It costs no transfer either, since the content is addressed, so the blobs are
 /// already there and the commit only adds a version row.
 ///
-/// The signature persisted by the caller is `"<cheap>:<content>"`.
+/// The signature persisted by the caller is `"<cheap>:<content>"`. `world` is the
+/// share's list (`WatchedSave::world`), which the returned world signature is
+/// taken over; it never changes what is walked or uploaded, `include` does.
 #[allow(clippy::too_many_arguments)]
 pub async fn upload_directory_checked<F, G>(
     client: &ApiClient,
     save_id: &str,
     game_slug: &str,
     include: &[String],
+    world: &[String],
     label: &str,
     source: &Path,
     prev_signature: Option<&str>,
@@ -2057,6 +2085,7 @@ where
     }
     let (prev_cheap, prev_content) = split_signature(prev_signature);
     let cheap = compute_set_signature(&files);
+    let world = world_signature(&files, world);
     // `is_deliberate` rather than `== Manual`: the safety net taken before a
     // restore counts too, and skipping it there is worse, since it is the copy that
     // lets a wrong restore be undone.
@@ -2064,7 +2093,7 @@ where
     if !deliberate && prev_cheap == Some(cheap.as_str()) {
         // Fast path: the cheap (path, size, mtime) signature is unchanged, so
         // the bytes can't have moved either, so skip without reading any file.
-        return Ok(BackupResult::Skipped);
+        return Ok(BackupResult::Skipped { world });
     }
     // The cheap signature drifted. That's often just an mtime bump (a game or
     // background daemon rewriting save files on a timer), so confirm whether
@@ -2073,6 +2102,7 @@ where
     if !deliberate && prev_content == Some(content.as_str()) {
         return Ok(BackupResult::Unchanged {
             signature: join_signature(&cheap, &content),
+            world,
         });
     }
     // The bytes genuinely moved: we're about to push a real snapshot. Signal
@@ -2100,11 +2130,13 @@ where
         return Ok(BackupResult::AlreadyLanded {
             version_num: outcome.snapshot.version_num,
             signature: join_signature(&cheap, &content),
+            world,
         });
     }
     Ok(BackupResult::Uploaded {
         outcome,
         signature: join_signature(&cheap, &content),
+        world,
     })
 }
 
@@ -2129,6 +2161,7 @@ pub async fn remember_save(
         // Preserve the skip-by-hash signature across a metadata refresh too,
         // so re-remembering a save doesn't force a redundant next upload.
         let prev_hash = state.saves.get(save_id).and_then(|s| s.set_hash.clone());
+        let prev_world_hash = state.saves.get(save_id).and_then(|s| s.world_hash.clone());
         let prev_preset = state.saves.get(save_id).and_then(|s| s.preset.clone());
         let prev_processes = state
             .saves
@@ -2149,6 +2182,7 @@ pub async fn remember_save(
             paused: was_paused,
             preset: prev_preset,
             set_hash: prev_hash,
+            world_hash: prev_world_hash,
             processes: prev_processes,
             shared_processes: prev_shared,
             allow_device_local: prev_allow_device_local,
@@ -2631,6 +2665,7 @@ mod tests {
             "save-1",
             "furi",
             &[],
+            &[],
             "main",
             &prefix_root,
             None,
@@ -2663,6 +2698,7 @@ mod tests {
             &client,
             "save-1",
             "furi",
+            &[],
             &[],
             "main",
             &save_dir,

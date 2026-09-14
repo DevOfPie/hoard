@@ -344,7 +344,11 @@ fn decide_backup(
     // the upload without the lease (`409 lease_required`), so the tick holds
     // rather than burning an attempt. `Unknown` holds too: a push on a guess is
     // the race the lease exists to prevent.
-    if next.shared {
+    //
+    // Except the owner's push that leaves the shared world as last synced
+    // (HRD-D-0019): the lease guards the world and nothing else, and the
+    // server takes the owner's other files without it.
+    if next.shared && !world_unchanged(next, obs) {
         match obs.lease {
             LeaseObs::Mine => {}
             LeaseObs::Other => return Some(hold(HOLD_LEASE_OTHER)),
@@ -530,6 +534,16 @@ fn local_diverged(state: &State, obs: &Observation) -> bool {
     }
 }
 
+/// Does this owner's push leave the shared world as last synced (HRD-D-0019)?
+/// Then the hosting lease, which guards the world alone, is not needed. A world
+/// unknown on either side is not unchanged, and nobody but the owner has the
+/// exception.
+fn world_unchanged(state: &State, obs: &Observation) -> bool {
+    state.owner
+        && obs.world_fingerprint.is_some()
+        && obs.world_fingerprint == state.synced_world_fingerprint
+}
+
 /// Derives `is_running` (durable status) from process evidence with a sticky
 /// grace window. A correlation match is CPU-gated and can drop below the
 /// threshold for one tick, and without grace that flaps GameStarted and
@@ -569,6 +583,7 @@ fn ingest_op_result(
             version,
             fingerprint,
             wrote,
+            world_fingerprint,
         } => {
             // A restore can come back `Ok` without moving anything: the snapshot
             // is downloaded, diffed against the folder, and the diff decides
@@ -592,6 +607,9 @@ fn ingest_op_result(
             }
             if fingerprint.is_some() {
                 next.synced_fingerprint = fingerprint;
+            }
+            if world_fingerprint.is_some() {
+                next.synced_world_fingerprint = world_fingerprint;
             }
             match op {
                 Some(Op::Backup) => {
@@ -692,6 +710,20 @@ fn ingest_op_result(
         OpResult::ConflictStalled => {
             if let Some(delay) = record_conflict(&mut next.backup_conflict, obs.cloud_version) {
                 next.next_backup_at = Some(now + Duration::seconds(delay));
+            }
+        }
+        // 409 `lease_required` (HRD-D-0019): the server wanted the lease for this
+        // push, because the world it holds is not the one this owner synced, or
+        // because it predates the owner's exception. Forgetting the world's
+        // fingerprint turns the next tick into a hold for the lease, and the
+        // hold is the wait: no backoff on top. Only a lease this machine
+        // believes it holds backs off, since no hold can come of it and pushing
+        // again at once would loop until the lease task corrects the view.
+        // `has_pending` stays, as for any refused upload.
+        OpResult::LeaseRequired => {
+            next.synced_world_fingerprint = None;
+            if matches!(op, Some(Op::Backup)) && obs.lease == LeaseObs::Mine {
+                next.next_backup_at = Some(now + Duration::seconds(BACKUP_FAILURE_BACKOFF_SECS));
             }
         }
         // Any other error, depending on the op:
@@ -1156,6 +1188,7 @@ mod tests {
                 version: Some(2),
                 fingerprint: None,
                 wrote: false,
+                world_fingerprint: None,
             }),
             ..quiet_obs()
         };
@@ -1192,6 +1225,7 @@ mod tests {
                 version: Some(2),
                 fingerprint: None,
                 wrote: true,
+                world_fingerprint: None,
             }),
             ..quiet_obs()
         };
@@ -1281,6 +1315,7 @@ mod tests {
                 version: Some(7),
                 fingerprint: Some(2),
                 wrote: false,
+                world_fingerprint: None,
             }),
             ..quiet_obs()
         };
@@ -1605,6 +1640,7 @@ mod tests {
                 version: Some(5),
                 fingerprint: Some(2),
                 wrote: true,
+                world_fingerprint: None,
             }),
             ..quiet_obs()
         };
@@ -1713,6 +1749,7 @@ mod tests {
                 version: None,
                 fingerprint: Some(2),
                 wrote: false,
+                world_fingerprint: None,
             }),
             ..quiet_obs()
         };
@@ -1736,6 +1773,7 @@ mod tests {
                 version: Some(9),
                 fingerprint: Some(2),
                 wrote: true,
+                world_fingerprint: None,
             }),
             ..quiet_obs()
         };
@@ -1773,6 +1811,7 @@ mod tests {
                 version: Some(9),
                 fingerprint: Some(2),
                 wrote: false,
+                world_fingerprint: None,
             }),
             ..quiet_obs()
         };
@@ -1814,6 +1853,7 @@ mod tests {
                 version: Some(9),
                 fingerprint: Some(2),
                 wrote: false,
+                world_fingerprint: None,
             }),
             upload_landed: Some(true),
             ..quiet_obs()
@@ -2183,6 +2223,125 @@ mod tests {
         assert_eq!(ds, vec![hold("track-only entry")]);
     }
 
+    /// HRD-D-0019: the owner's push that leaves the shared world as last synced
+    /// (a character or another world changed) goes without the lease; one that
+    /// changes the world, or whose world is unknown, holds for it like anyone's.
+    #[test]
+    fn an_owner_pushes_without_the_lease_only_while_the_world_is_unchanged() {
+        let owner = State {
+            shared: true,
+            owner: true,
+            has_pending: true,
+            synced_fingerprint: Some(1),
+            synced_world_fingerprint: Some(10),
+            known_version: Some(3),
+            ..base_state()
+        };
+        let beta_only = Observation {
+            lease: LeaseObs::Other,
+            local_fingerprint: Some(2),
+            world_fingerprint: Some(10),
+            ..quiet_obs()
+        };
+        let (next, ds) = reconcile(&owner, &beta_only, world(0));
+        assert_eq!(acts(&ds), vec![&Action::Backup], "{ds:?}");
+        assert_eq!(next.in_flight, Some(Op::Backup));
+
+        let alpha_too = Observation {
+            world_fingerprint: Some(11),
+            ..beta_only.clone()
+        };
+        let (_n, ds) = reconcile(&owner, &alpha_too, world(0));
+        assert_eq!(ds, vec![hold(HOLD_LEASE_OTHER)]);
+
+        let unknown = Observation {
+            world_fingerprint: None,
+            ..beta_only.clone()
+        };
+        let (_n, ds) = reconcile(&owner, &unknown, world(0));
+        assert_eq!(ds, vec![hold(HOLD_LEASE_OTHER)]);
+        let never_synced = State {
+            synced_world_fingerprint: None,
+            ..owner.clone()
+        };
+        let (_n, ds) = reconcile(&never_synced, &beta_only, world(0));
+        assert_eq!(ds, vec![hold(HOLD_LEASE_OTHER)]);
+        let free = Observation {
+            lease: LeaseObs::Free,
+            ..unknown
+        };
+        let (_n, ds) = reconcile(&owner, &free, world(0));
+        assert_eq!(ds, vec![hold(HOLD_LEASE_NEEDED)]);
+
+        // A member with the very same fingerprints still needs the lease.
+        let member = State {
+            owner: false,
+            ..owner.clone()
+        };
+        let (_n, ds) = reconcile(&member, &beta_only, world(0));
+        assert_eq!(ds, vec![hold(HOLD_LEASE_OTHER)]);
+    }
+
+    /// A push refused `lease_required` forgets the world's fingerprint: the
+    /// next tick holds for the lease with no backoff to sit out first, and the
+    /// changes stay pending. Hosting, the push goes, and landing adopts the
+    /// world again. A lease believed held here backs off instead of looping.
+    #[test]
+    fn lease_required_forgets_the_world_and_holds_for_the_lease() {
+        let flying = State {
+            shared: true,
+            owner: true,
+            has_pending: true,
+            synced_fingerprint: Some(1),
+            synced_world_fingerprint: Some(10),
+            known_version: Some(3),
+            in_flight: Some(Op::Backup),
+            ..base_state()
+        };
+        let refused = Observation {
+            lease: LeaseObs::Free,
+            local_fingerprint: Some(2),
+            world_fingerprint: Some(10),
+            op_result: Some(OpResult::LeaseRequired),
+            ..quiet_obs()
+        };
+        let (next, ds) = reconcile(&flying, &refused, world(0));
+        assert_eq!(next.synced_world_fingerprint, None);
+        assert!(next.has_pending);
+        assert_eq!(next.in_flight, None);
+        assert_eq!(next.next_backup_at, None);
+        assert_eq!(ds, vec![hold(HOLD_LEASE_NEEDED)]);
+
+        let hosted = Observation {
+            lease: LeaseObs::Mine,
+            op_result: None,
+            ..refused.clone()
+        };
+        let (next, ds) = reconcile(&next, &hosted, world(1));
+        assert_eq!(acts(&ds), vec![&Action::Backup], "{ds:?}");
+        let landed = Observation {
+            op_result: Some(OpResult::Ok {
+                version: Some(4),
+                fingerprint: Some(2),
+                wrote: true,
+                world_fingerprint: Some(10),
+            }),
+            ..hosted.clone()
+        };
+        let (next, _ds) = reconcile(&next, &landed, world(2));
+        assert_eq!(next.synced_world_fingerprint, Some(10));
+        assert!(!next.has_pending);
+
+        let believed_mine = Observation {
+            lease: LeaseObs::Mine,
+            ..refused
+        };
+        let (next, ds) = reconcile(&flying, &believed_mine, world(0));
+        assert_eq!(next.synced_world_fingerprint, None);
+        assert!(next.next_backup_at.is_some(), "{ds:?}");
+        assert!(acts(&ds).is_empty(), "{ds:?}");
+    }
+
     // ---- invariants (proptest with shrinking)
 
     prop_compose! {
@@ -2213,6 +2372,7 @@ mod tests {
         fn arb_state()(
             track_only in any::<bool>(),
             shared in any::<bool>(),
+            owner in any::<bool>(),
             restore_enabled in any::<bool>(),
             is_running in any::<bool>(),
             running_seen in prop::option::of(-100i64..100),
@@ -2221,6 +2381,7 @@ mod tests {
             restore_at in prop::option::of(-100i64..100),
             known_version in prop::option::of(0i64..20),
             synced_fp in prop::option::of(0u64..8),
+            synced_world_fp in prop::option::of(0u64..8),
             backup_at in prop::option::of(-100i64..100),
             in_flight in prop::option::of(prop_oneof![Just(Op::Backup), Just(Op::Restore)]),
             next_backup in prop::option::of(-100i64..200),
@@ -2239,6 +2400,7 @@ mod tests {
             State {
                 track_only,
                 shared,
+                owner,
                 restore_enabled,
                 is_running,
                 last_running_seen: running_seen.map(at),
@@ -2247,6 +2409,7 @@ mod tests {
                 last_restore_at: restore_at.map(at),
                 known_version,
                 synced_fingerprint: synced_fp,
+                synced_world_fingerprint: synced_world_fp,
                 last_backup_at: backup_at.map(at),
                 in_flight,
                 next_backup_at: next_backup.map(at),
@@ -2271,6 +2434,7 @@ mod tests {
             size in prop::option::of(0u64..1_000),
             local_empty in any::<bool>(),
             local_fp in prop::option::of(0u64..8),
+            world_fp in prop::option::of(0u64..8),
             process_alive in any::<bool>(),
             lease in prop_oneof![
                 Just(LeaseObs::Unknown),
@@ -2288,19 +2452,26 @@ mod tests {
             fs_event in any::<bool>(),
             retry in 0u32..600,
             has_op in any::<bool>(),
-            op_kind in 0u8..5,
+            op_kind in 0u8..6,
             ok_ver in prop::option::of(0i64..20),
             ok_fp in prop::option::of(0u64..8),
             ok_wrote in any::<bool>(),
+            ok_world_fp in prop::option::of(0u64..8),
         ) -> Observation {
             let op_result = if quiescent || !has_op {
                 None
             } else {
                 Some(match op_kind {
-                    0 => OpResult::Ok { version: ok_ver, fingerprint: ok_fp, wrote: ok_wrote },
+                    0 => OpResult::Ok {
+                        version: ok_ver,
+                        fingerprint: ok_fp,
+                        wrote: ok_wrote,
+                        world_fingerprint: ok_world_fp,
+                    },
                     1 => OpResult::NotFound,
                     2 => OpResult::Unauthorized,
                     3 => OpResult::Throttled { retry_after_secs: retry },
+                    4 => OpResult::LeaseRequired,
                     _ => OpResult::Failed,
                 })
             };
@@ -2309,6 +2480,7 @@ mod tests {
                 folder_size: size,
                 local_empty,
                 local_fingerprint: local_fp,
+                world_fingerprint: world_fp,
                 process_alive,
                 // The proptest does not model the lock probe: it is a shell-side
                 // pacing brake (only Windows can assert it) and leaving it always
@@ -2404,7 +2576,7 @@ mod tests {
                 && state.in_flight.is_none()
                 && obs.op_result.is_none()
                 && !state.backup_conflict.needs_attention
-                && !(state.shared && obs.lease != LeaseObs::Mine)
+                && !(state.shared && obs.lease != LeaseObs::Mine && !world_unchanged(&state, &obs))
                 && (state.has_pending || obs.fs_event)
                 && local_diverged(&state, &obs)
                 && state.next_backup_at.is_none_or(|t| w.now >= t)
@@ -2419,12 +2591,17 @@ mod tests {
 
         /// A shared save is pushed only by its host: never `Act(Backup)` while
         /// the lease is somebody else's, free, or not known.
+        ///
+        /// Changed on purpose by HRD-D-0019: exempt exactly an owner whose world
+        /// fingerprint equals the synced one, as it stands after this tick's op
+        /// result was ingested (a landed push adopts one, `lease_required`
+        /// forgets it).
         #[test]
         fn inv_shared_save_pushes_only_as_host(
             state in arb_state(), obs in arb_obs(false), w in arb_world()
         ) {
-            let (_n, ds) = reconcile(&state, &obs, w);
-            if state.shared && obs.lease != LeaseObs::Mine {
+            let (n, ds) = reconcile(&state, &obs, w);
+            if state.shared && obs.lease != LeaseObs::Mine && !world_unchanged(&n, &obs) {
                 prop_assert!(
                     !acts(&ds).contains(&&Action::Backup),
                     "a push on a shared save without the lease: {ds:?}"

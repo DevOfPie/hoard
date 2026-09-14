@@ -279,6 +279,11 @@ pub struct SharedInfo {
     /// every member, so every machine walks the same files.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub include: Vec<String>,
+    /// The caller owns the save: their uploads carry the whole folder, while
+    /// members read and push only `include`. False from a server older than
+    /// this field, which keeps the narrowing.
+    #[serde(default)]
+    pub caller_owns: bool,
 }
 
 // ---- /v1/groups

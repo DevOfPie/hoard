@@ -514,6 +514,7 @@ mod tests {
             version_num: 12,
             total_bytes: 2048,
             set_hash: None,
+            world_hash: None,
             already_landed,
             deliberate,
         }

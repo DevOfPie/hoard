@@ -70,11 +70,19 @@ pub async fn run(save_id: String, source: Option<PathBuf>, remember: bool) -> Re
         .get(&save_id)
         .map(|s| s.include.clone())
         .unwrap_or_default();
+    // And its world, whose signature is kept beside the set's so the service's
+    // owner exception reads the same folder (HRD-D-0019).
+    let world_list = state
+        .saves
+        .get(&save_id)
+        .map(|s| s.world().to_vec())
+        .unwrap_or_default();
     let result = upload_directory_checked(
         &client,
         &save_id,
         &game_slug,
         &include,
+        &world_list,
         &label,
         &source,
         prev_sig.as_deref(),
@@ -95,34 +103,41 @@ pub async fn run(save_id: String, source: Option<PathBuf>, remember: bool) -> Re
     .await
     .context("upload failed")?;
 
-    let (outcome, signature) = match result {
-        BackupResult::Skipped => {
+    let (outcome, signature, world) = match result {
+        BackupResult::Skipped { .. } => {
             pb.finish_and_clear();
             println!("no changes since last backup — skipped");
             return Ok(());
         }
-        BackupResult::Unchanged { signature } => {
+        BackupResult::Unchanged { signature, world } => {
             pb.finish_and_clear();
             println!("no changes since last backup — skipped");
             // Persist the refreshed composite signature so the next run hits
             // the cheap fast path instead of re-reading every file.
             if let Some(s) = state.saves.get_mut(&save_id) {
                 s.set_hash = Some(signature);
+                s.world_hash = Some(world);
             }
             state.save(&state_path)?;
             return Ok(());
         }
-        BackupResult::Uploaded { outcome, signature } => (outcome, signature),
+        BackupResult::Uploaded {
+            outcome,
+            signature,
+            world,
+        } => (outcome, signature, world),
         // Unreachable with `head: None` above, but the compiler does not know
         // that, and the day it is reachable, saying so is the right answer.
         BackupResult::AlreadyLanded {
             version_num,
             signature,
+            world,
         } => {
             pb.finish_and_clear();
             println!("already on the server as v{version_num} — nothing to upload");
             if let Some(s) = state.saves.get_mut(&save_id) {
                 s.set_hash = Some(signature);
+                s.world_hash = Some(world);
                 s.last_version_num = Some(version_num);
             }
             state.save(&state_path)?;
@@ -152,6 +167,7 @@ pub async fn run(save_id: String, source: Option<PathBuf>, remember: bool) -> Re
     // Cache the fresh signature so an unchanged re-run is skipped next time.
     if let Some(s) = state.saves.get_mut(&save_id) {
         s.set_hash = Some(signature);
+        s.world_hash = Some(world);
     }
     state.save(&state_path)?;
 

@@ -6884,6 +6884,7 @@ mod tests {
                 shared: None,
                 include: Vec::new(),
                 set_hash: None,
+                world_hash: None,
                 processes: Vec::new(),
                 shared_processes: false,
             },

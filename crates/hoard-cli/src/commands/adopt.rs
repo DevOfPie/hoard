@@ -176,6 +176,7 @@ mod tests {
                 paused: false,
                 preset: None,
                 set_hash: None,
+                world_hash: None,
                 processes: Vec::new(),
                 shared_processes: false,
                 allow_device_local: None,

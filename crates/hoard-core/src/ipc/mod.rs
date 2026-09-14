@@ -980,6 +980,7 @@ mod tests {
             version_num: 42,
             total_bytes: 1024,
             set_hash: Some("cheap:content".into()),
+            world_hash: None,
             already_landed: false,
             deliberate: true,
         };
@@ -1673,6 +1674,7 @@ mod tests {
                     owner_user_id: "u1".into(),
                     owner_username: Username::parse("alice").unwrap(),
                     include: Vec::new(),
+                    caller_owns: false,
                 }),
             })),
             Payload::Worlds {

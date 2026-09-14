@@ -897,20 +897,26 @@ pub async fn pump(
 /// cursor and the anti-reupload signature. Without this, every daemon restart would
 /// re-upload identical snapshots and re-download to diff them.
 fn persist(event: &AgentEvent) {
-    let (save_id, version, set_hash) = match event {
+    let (save_id, version, set_hash, world_hash) = match event {
         AgentEvent::BackupSuccess {
             save_id,
             version_num,
             set_hash,
+            world_hash,
             ..
-        } => (save_id, Some(*version_num), set_hash.clone()),
+        } => (
+            save_id,
+            Some(*version_num),
+            set_hash.clone(),
+            world_hash.clone(),
+        ),
         // After a restore the slot is synced to that version: remembering it is what
         // makes the version gate survive a restart.
         AgentEvent::SaveAutoRestored {
             save_id,
             version_num,
             ..
-        } => (save_id, Some(*version_num), None),
+        } => (save_id, Some(*version_num), None, None),
         _ => return,
     };
 
@@ -930,6 +936,12 @@ fn persist(event: &AgentEvent) {
     }
     if let Some(hash) = set_hash {
         entry.set_hash = Some(hash);
+    }
+    // The world's signature travels with the set's: a backup that knows the
+    // one knows the other, and a stale world hash beside a fresh set hash
+    // would let the owner push past a lease on the next start.
+    if matches!(event, AgentEvent::BackupSuccess { .. }) {
+        entry.world_hash = world_hash;
     }
     if matches!(event, AgentEvent::BackupSuccess { .. }) {
         entry.last_backup_at = Some(OffsetDateTime::now_utc());

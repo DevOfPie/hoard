@@ -546,6 +546,23 @@ fn conflict_from(body: &str) -> ApiError {
     }
 }
 
+/// The server's text for a manifest file outside a shared save's include list
+/// (`code: "outside_include"`, a 400).
+const OUTSIDE_INCLUDE_TEXT: &str = "is not part of what this shared save consists of";
+
+/// Was this a 400 refusing a file outside a shared save's include list? The
+/// `code` does not survive into [`ApiError::BadRequest`], so the message those
+/// servers write is matched instead. What needs it is the owner's fallback for a
+/// server older than the owner's exception (HRD-D-0019), whose text is fixed.
+pub fn refused_outside_include(err: &anyhow::Error) -> bool {
+    err.chain().any(|c| {
+        matches!(
+            c.downcast_ref::<ApiError>(),
+            Some(ApiError::BadRequest(m)) if m.contains(OUTSIDE_INCLUDE_TEXT)
+        )
+    })
+}
+
 fn extract_message(body: &str) -> String {
     if let Ok(v) = serde_json::from_str::<serde_json::Value>(body) {
         if let Some(s) = v.get("message").and_then(|x| x.as_str()) {

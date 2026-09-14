@@ -90,10 +90,25 @@ pub fn gate_for_save(game_slug: &str, include: &[String], allow_device_local: bo
     }
 }
 
+impl SharedRef {
+    /// The shared world: the files members read and push, and the only ones
+    /// the hosting lease guards (HRD-D-0019). Empty is the whole folder.
+    pub fn world(&self) -> &[String] {
+        &self.include
+    }
+}
+
 impl SaveState {
     /// See [`gate_for_save`].
     pub fn gate(&self, allow_device_local: bool) -> RestoreGate {
         gate_for_save(&self.game_slug, &self.include, allow_device_local)
+    }
+
+    /// See [`SharedRef::world`]; nothing for an unshared save. Unlike
+    /// [`Self::include`], which is empty for the owner, this is the share's
+    /// list for owner and member alike.
+    pub fn world(&self) -> &[String] {
+        self.shared.as_ref().map_or(&[], SharedRef::world)
     }
 }
 
@@ -101,6 +116,21 @@ impl WatchedSave {
     /// See [`gate_for_save`].
     pub fn gate(&self, allow_device_local: bool) -> RestoreGate {
         gate_for_save(&self.game_slug, &self.include, allow_device_local)
+    }
+
+    /// See [`SaveState::world`].
+    pub fn world(&self) -> &[String] {
+        self.shared.as_ref().map_or(&[], SharedRef::world)
+    }
+
+    /// The caller owns a share of part of this folder and walks all of it:
+    /// its uploads carry the whole folder, and one that leaves the world as
+    /// last synced needs no lease. False once the walk was narrowed to the
+    /// world for an older server, where the owner pushes like a member.
+    pub fn owns_whole_folder(&self) -> bool {
+        self.shared.as_ref().is_some_and(|s| s.caller_owns)
+            && self.include.is_empty()
+            && !self.world().is_empty()
     }
 }
 
@@ -116,6 +146,7 @@ mod tests {
             owner_user_id: "u1".into(),
             owner_username: "alice".into(),
             include: vec!["worlds/One.wld".into()],
+            caller_owns: false,
         };
         // The owner restores the whole of their own history.
         assert!(restore_include(Some(&shared), Some("u1")).is_empty());

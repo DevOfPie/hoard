@@ -139,19 +139,36 @@ pub struct SaveState {
     /// walks the same files (`fileclass::included`). Empty is everything, and
     /// is what an unshared save always has. The row is the source of truth;
     /// this is the mirror of `shared.include` the walks read, and only
-    /// [`Self::set_shared`] writes it so the two cannot drift. `default` keeps
-    /// older `state.json` files loading.
+    /// [`Self::set_shared`] writes it so the two cannot drift. Since HRD-D-0019
+    /// it mirrors the list only for a member: the owner's walks take the whole
+    /// folder, and the list is read as `world()`. `default` keeps older
+    /// `state.json` files loading.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub include: Vec<String>,
+    /// Cheap signature of the shared world (`SaveState::world`) as of the last
+    /// successful upload, beside [`Self::set_hash`]: what lets the owner's
+    /// push without the lease survive a restart (HRD-D-0019). `None` reads as
+    /// "world unknown" and holds for the lease. `default` keeps older
+    /// `state.json` files loading.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub world_hash: Option<String>,
 }
 
 impl SaveState {
     /// Takes the server's answer on sharing: the group, its owner and the
     /// include list, or nothing. The one place `shared` and `include` change,
     /// so a row never carries one without the other.
+    ///
+    /// The walks narrow to the list only for a member: the owner's folder is
+    /// backed up whole, and the list stays on `shared` as the world
+    /// (HRD-D-0019).
     pub fn set_shared(&mut self, info: Option<&hoard_core::wire::SharedInfo>) {
         self.shared = info.map(SharedRef::from);
-        self.include = info.map(|s| s.include.clone()).unwrap_or_default();
+        self.include = self
+            .shared
+            .as_ref()
+            .map(|s| s.walk_include().to_vec())
+            .unwrap_or_default();
     }
 }
 
@@ -168,6 +185,23 @@ pub struct SharedRef {
     /// travelled here loading.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub include: Vec<String>,
+    /// This machine's account owns the save (`SharedInfo::caller_owns`): its
+    /// walks take the whole folder and `include` is the world only
+    /// (HRD-D-0019). `default` keeps older rows loading, as a member's.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub caller_owns: bool,
+}
+
+impl SharedRef {
+    /// What the walks of this share read: the list for a member, everything
+    /// for the owner. [`SaveState::include`] mirrors it.
+    pub fn walk_include(&self) -> &[String] {
+        if self.caller_owns {
+            &[]
+        } else {
+            &self.include
+        }
+    }
 }
 
 impl From<&hoard_core::wire::SharedInfo> for SharedRef {
@@ -178,6 +212,7 @@ impl From<&hoard_core::wire::SharedInfo> for SharedRef {
             owner_user_id: info.owner_user_id.clone(),
             owner_username: info.owner_username.to_string(),
             include: info.include.clone(),
+            caller_owns: info.caller_owns,
         }
     }
 }
@@ -683,6 +718,7 @@ mod tests {
             shared: None,
             include: Vec::new(),
             set_hash: None,
+            world_hash: None,
             processes: vec![],
             shared_processes: false,
         }
@@ -1120,6 +1156,7 @@ mod tests {
         let plain = save_state("valheim");
         let json = serde_json::to_value(&plain).unwrap();
         assert!(json.get("include").is_none(), "{json}");
+        assert!(json.get("world_hash").is_none(), "{json}");
         let back: SaveState = serde_json::from_value(json).unwrap();
         assert!(back.include.is_empty());
 
@@ -1133,6 +1170,10 @@ mod tests {
                     "worlds_local/Alpha.db".into(),
                     "worlds_local/Alpha.fwl".into(),
                 ],
+                // A member's row, whose walks mirror the list. Since HRD-D-0019
+                // the owner's keeps `include` empty instead; see
+                // `the_owner_walks_the_whole_folder_and_keeps_the_world`.
+                caller_owns: false,
             }),
             include: vec![
                 "worlds_local/Alpha.db".into(),
@@ -1144,5 +1185,46 @@ mod tests {
         let back: SaveState = serde_json::from_str(&json).unwrap();
         assert_eq!(back.include, shared.include);
         assert_eq!(back.shared, shared.shared);
+    }
+
+    /// HRD-D-0019: the server's answer narrows a member's walks to the share's
+    /// list and leaves the owner's whole, the list kept as the world for both.
+    /// Ownership and the world's signature survive the file; a row written
+    /// before them reads as a member's with the world unknown.
+    #[test]
+    fn the_owner_walks_the_whole_folder_and_keeps_the_world() {
+        let info = |caller_owns| hoard_core::wire::SharedInfo {
+            group_id: "g1".into(),
+            group_name: "the boys".into(),
+            owner_user_id: "u1".into(),
+            owner_username: "jacka".parse().unwrap(),
+            include: vec!["worlds_local/Alpha.db".into()],
+            caller_owns,
+        };
+        let mut owner = save_state("valheim");
+        owner.set_shared(Some(&info(true)));
+        assert!(owner.include.is_empty());
+        assert_eq!(owner.world(), ["worlds_local/Alpha.db".to_string()]);
+
+        let mut member = save_state("valheim");
+        member.set_shared(Some(&info(false)));
+        assert_eq!(member.include, ["worlds_local/Alpha.db".to_string()]);
+        assert_eq!(member.world(), member.include.as_slice());
+
+        owner.world_hash = Some("world".into());
+        let back: SaveState =
+            serde_json::from_str(&serde_json::to_string(&owner).unwrap()).unwrap();
+        assert!(back.include.is_empty());
+        assert!(back.shared.as_ref().is_some_and(|s| s.caller_owns));
+        assert_eq!(back.world_hash.as_deref(), Some("world"));
+
+        let json = serde_json::to_value(&member).unwrap();
+        assert!(json["shared"].get("caller_owns").is_none(), "{json}");
+        let back: SaveState = serde_json::from_value(json).unwrap();
+        assert!(!back.shared.as_ref().unwrap().caller_owns);
+        assert!(back.world_hash.is_none());
+
+        member.set_shared(None);
+        assert!(member.world().is_empty() && member.include.is_empty());
     }
 }

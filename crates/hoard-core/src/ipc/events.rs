@@ -74,6 +74,12 @@ pub enum AgentEvent {
         /// `state.json` so the next session can skip a no-op re-upload of the
         /// same bytes. `None` only if the agent couldn't compute it.
         set_hash: Option<String>,
+        /// Cheap signature of the shared world inside that snapshot (the
+        /// share's include list), persisted beside `set_hash` so an owner's
+        /// push without the lease survives a restart (HRD-D-0019). `None` from
+        /// an older daemon, which reads as "world unknown" and holds.
+        #[serde(default)]
+        world_hash: Option<String>,
         /// Nothing was uploaded, because the content already was the server's
         /// head (ADR 0021 D.8.3). Happens when the daemon restarts with an
         /// upload in flight that did commit: the in-memory `in_flight` is gone
