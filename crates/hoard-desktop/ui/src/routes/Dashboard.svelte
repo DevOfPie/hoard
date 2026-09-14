@@ -56,7 +56,7 @@
     coverAspect,
     hydrateCoverAspect,
   } from "../lib/stores/coverAspect.svelte";
-  import { toastError, toastSuccess } from "../lib/stores/toasts";
+  import { toastError, toastInfo, toastSuccess } from "../lib/stores/toasts";
   import { showError } from "../lib/stores/error_dialog";
   import { refreshLease } from "../lib/stores/groups";
   import {
@@ -512,7 +512,8 @@
   async function releaseWorld(save: TrackedSave) {
     try {
       await api.releaseWorld(save.save_id);
-      toastSuccess($_("lease.released_toast"));
+      // Sent, not done: the verdict arrives as a lease event and moves the pill.
+      toastInfo($_("lease.release_asked_toast", { values: { world: save.label } }));
     } catch (e) {
       showError(e);
     }
@@ -524,7 +525,7 @@
     leaseBusy = true;
     try {
       await api.forceWorld(target.save_id);
-      toastSuccess($_("lease.take_over_toast"));
+      toastInfo($_("lease.take_over_asked_toast", { values: { world: target.label } }));
       takeOverTarget = null;
     } catch (e) {
       showError(e);

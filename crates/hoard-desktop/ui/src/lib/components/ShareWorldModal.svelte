@@ -38,18 +38,25 @@
   const picked = $derived(worlds.find((w) => w.name === world) ?? null);
   const canShare = $derived(!!groupId && (!byWorld || !!picked) && !sharing);
 
-  // Each opening starts clean: the groups list may have changed, and the
-  // worlds belong to this save's folder.
+  const open = $derived(save !== null);
+  const saveId = $derived(save?.save_id ?? null);
+
+  // The groups list may have changed since the last opening: read it once
+  // per opening. Keyed on `open` alone, never on `$groups`, which every
+  // `refreshGroups` sets anew.
   $effect(() => {
-    const target = save;
-    if (!target) return;
+    if (open) void refreshGroups().catch(() => {});
+  });
+
+  // The worlds belong to this save's folder: each save starts clean.
+  $effect(() => {
+    const id = saveId;
+    if (!open || !id) return;
     world = "";
     worlds = [];
-    if (!groupId && $groups.length > 0) groupId = $groups[0].id;
-    void refreshGroups().catch(() => {});
     loadingWorlds = true;
     api
-      .listWorlds(target.save_id)
+      .listWorlds(id)
       .then((list) => {
         worlds = list;
         if (list.length === 1) world = list[0].name;
@@ -79,7 +86,7 @@
 </script>
 
 <Modal
-  open={save !== null}
+  {open}
   title={$_("share.title")}
   description={save ? `${prettifySlug(save.game_slug)} · ${save.local_path}` : ""}
   dismissible={!sharing}
