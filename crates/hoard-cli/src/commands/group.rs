@@ -164,7 +164,7 @@ pub async fn run(cmd: GroupCommand) -> Result<()> {
 /// The groups this account belongs to, as the service reports them.
 pub async fn list(client: &mut Client) -> Result<Vec<Group>> {
     match link::ask(client, Request::ListGroups).await? {
-        Payload::Groups(groups) => Ok(groups),
+        Payload::Groups { groups } => Ok(groups),
         other => anyhow::bail!("unexpected answer to a group list: {other:?}"),
     }
 }

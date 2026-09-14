@@ -356,7 +356,7 @@ pub async fn lease(client: &mut Client, save_id: &str) -> Result<Option<Lease>> 
     )
     .await?
     {
-        Payload::Lease(lease) => Ok(lease.map(|l| *l)),
+        Payload::Lease { lease } => Ok(lease.map(|l| *l)),
         other => anyhow::bail!("unexpected answer to a lease request: {other:?}"),
     }
 }

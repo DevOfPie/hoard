@@ -15,7 +15,8 @@
 //!   the network was down) drops the lease from the map and tells the engine
 //!   who holds it now, which is where `WorldLeaseLost` comes from.
 //! - A transport error changes nothing: the last state stands and the next tick
-//!   retries.
+//!   retries. A release or a cancel drops that retry, so it cannot take back a
+//!   lease the engine no longer wants.
 //! - `closing()` releases every held lease, bounded, so quitting never hangs.
 
 use std::collections::HashMap;
@@ -41,6 +42,7 @@ const CLOSING_TIMEOUT_SECS: u64 = 3;
 enum Cmd {
     Acquire { save_id: String, base_version: i64 },
     Release { save_id: String },
+    Cancel { save_id: String },
     Force { save_id: String },
     Refresh { save_id: String },
     Closing { done: oneshot::Sender<()> },
@@ -65,6 +67,15 @@ impl LeaseHandle {
 
     pub fn release(&self, save_id: impl Into<String>) {
         let _ = self.tx.try_send(Cmd::Release {
+            save_id: save_id.into(),
+        });
+    }
+
+    /// Stop asking for the lease: an acquire the task still retries is dropped
+    /// and answers nothing. One already on the wire answers as usual, and the
+    /// engine gives back a `Mine` it no longer wants (`claim::on_lease`).
+    pub fn cancel(&self, save_id: impl Into<String>) {
+        let _ = self.tx.try_send(Cmd::Cancel {
             save_id: save_id.into(),
         });
     }
@@ -96,6 +107,7 @@ impl LeaseHandle {
                 let line = match cmd {
                     Cmd::Acquire { save_id, .. } => format!("acquire {save_id}"),
                     Cmd::Release { save_id } => format!("release {save_id}"),
+                    Cmd::Cancel { save_id } => format!("cancel {save_id}"),
                     Cmd::Force { save_id } => format!("force {save_id}"),
                     Cmd::Refresh { save_id } => format!("refresh {save_id}"),
                     Cmd::Closing { done } => {
@@ -245,6 +257,8 @@ async fn run<A: LeaseApi, S: LeaseSink>(api: A, sink: S, mut rx: mpsc::Receiver<
                     acquire(&api, &sink, &mut held, &mut wanted, &mut stale, save_id, base_version).await;
                 }
                 Some(Cmd::Release { save_id }) => {
+                    // A retry still queued would take back what is given back.
+                    wanted.remove(&save_id);
                     match api.release(save_id.clone()).await {
                         Ok(()) => {}
                         Err(e) if refusal(&e).is_some() => {
@@ -257,6 +271,9 @@ async fn run<A: LeaseApi, S: LeaseSink>(api: A, sink: S, mut rx: mpsc::Receiver<
                     }
                     held.remove(&save_id);
                     sink.set_lease(save_id, LeaseObs::Free, None, false).await;
+                }
+                Some(Cmd::Cancel { save_id }) => {
+                    wanted.remove(&save_id);
                 }
                 Some(Cmd::Force { save_id }) => {
                     match api.force(save_id.clone()).await {
@@ -785,6 +802,43 @@ mod tests {
             &[("w1".to_string(), LeaseObs::Mine, Some("me".to_string()))],
             "one verdict, no noise for the failed try"
         );
+    }
+
+    /// A release, or a cancel, while an acquire the server never answered
+    /// waits for the tick: the retry is dropped, and nothing ends held.
+    #[tokio::test(start_paused = true)]
+    async fn a_release_or_cancel_drops_the_acquire_waiting_for_the_tick() {
+        for verb in ["release", "cancel"] {
+            let fake = Fake::default();
+            fake.0.acquire.lock().unwrap().push(Err(transport()));
+            fake.0.acquire.lock().unwrap().push(Ok(lease("me")));
+            let (h, sink, _task) = start(fake.clone());
+            // A fresh interval ticks at once: spend it, so the retry waits
+            // for the next one.
+            settle().await;
+            h.acquire("w1", 1);
+            settle().await;
+            match verb {
+                "release" => h.release("w1"),
+                _ => h.cancel("w1"),
+            }
+            settle().await;
+            for _ in 0..2 {
+                tokio::time::advance(Duration::from_secs(RENEW_SECS + 1)).await;
+                settle().await;
+            }
+            assert_eq!(
+                fake.0.acquire.lock().unwrap().len(),
+                1,
+                "{verb}: retried the acquire"
+            );
+            assert_eq!(*fake.0.renews.lock().unwrap(), 0, "{verb}: held");
+            let seen = sink.0.lock().unwrap().clone();
+            match verb {
+                "release" => assert_eq!(seen, [("w1".to_string(), LeaseObs::Free, None)]),
+                _ => assert!(seen.is_empty(), "{verb}: {seen:?}"),
+            }
+        }
     }
 
     /// A refresh that finds this account holding a lease the task did not
