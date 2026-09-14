@@ -235,7 +235,7 @@ async function noticeWorldEvent(ev: AgentEvent): Promise<void> {
       const title = tr("claim.notice_hosted_elsewhere_title", { holder: ev.holder, world });
       const body = tr("claim.notice_hosted_elsewhere_body");
       pushNotification({ id, title, body, priority: "normal" });
-      updateNotification(id, { title, body });
+      updateNotification(id, { title, body, at: Date.now() });
       if (await mainWindowFocused()) {
         toastInfo(tr("claim.toast_hosted_elsewhere", { holder: ev.holder, world }));
       }
@@ -249,7 +249,7 @@ async function noticeWorldEvent(ev: AgentEvent): Promise<void> {
       const title = tr("claim.notice_lease_lost_title", { world });
       const body = tr("claim.notice_lease_lost_body");
       pushNotification({ id, title, body, priority: "high" });
-      updateNotification(id, { title, body });
+      updateNotification(id, { title, body, at: Date.now() });
       if (await mainWindowFocused()) {
         toastInfo(tr("claim.toast_lease_lost", { world }));
       }

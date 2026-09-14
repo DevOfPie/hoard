@@ -449,9 +449,7 @@ impl Daemon {
             // a test fixture must never read the tester's own `state.json`.
             Request::ListWorlds { save_id } => {
                 if self.engine.client().is_none() {
-                    return Reply::Error(IpcError::EngineDown {
-                        reason: self.engine.down_reason(),
-                    });
+                    return Reply::Error(self.engine.down_error());
                 }
                 match hoard_agent::library::list_worlds(&save_id) {
                     Ok(worlds) => Reply::Ok(Payload::Worlds { worlds }),
@@ -533,9 +531,7 @@ impl Daemon {
         Fut: std::future::Future<Output = anyhow::Result<()>>,
     {
         let Some(handle) = self.engine.handle() else {
-            return Reply::Error(IpcError::EngineDown {
-                reason: self.engine.down_reason(),
-            });
+            return Reply::Error(self.engine.down_error());
         };
         match f(handle).await {
             Ok(()) => Reply::Ok(Payload::Ack),
@@ -551,9 +547,7 @@ impl Daemon {
         Fut: std::future::Future<Output = anyhow::Result<Payload>>,
     {
         let Some(client) = self.engine.client() else {
-            return Reply::Error(IpcError::EngineDown {
-                reason: self.engine.down_reason(),
-            });
+            return Reply::Error(self.engine.down_error());
         };
         match f(client).await {
             Ok(payload) => Reply::Ok(payload),
@@ -584,9 +578,7 @@ impl Daemon {
         }
         tracing::warn!(error = %format!("{err:#}"), "hoardd: a request failed");
         if self.engine.handle().is_none() {
-            return Reply::Error(IpcError::EngineDown {
-                reason: self.engine.down_reason(),
-            });
+            return Reply::Error(self.engine.down_error());
         }
         Reply::Error(IpcError::Internal {
             message: format!("{err:#}"),

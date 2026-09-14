@@ -176,11 +176,20 @@ pub fn classify(e: &anyhow::Error) -> Classified {
             };
         }
         Some(hoard_core::ipc::IpcError::Invalid { .. }) => return plain("bad_request", 1),
+        // Only a missing or expired session is the sign-in group; an engine
+        // still starting, shutting down, failing, or whose keyring will not
+        // answer is not fixed by signing in.
         Some(
-            hoard_core::ipc::IpcError::EngineDown { .. }
+            hoard_core::ipc::IpcError::EngineDown {
+                kind:
+                    hoard_core::ipc::EngineDownReason::NoSession
+                    | hoard_core::ipc::EngineDownReason::SessionExpired,
+                ..
+            }
             | hoard_core::ipc::IpcError::NoServerSession { .. }
             | hoard_core::ipc::IpcError::CloudSessionExpired { .. },
         ) => return plain("no_session", 2),
+        Some(hoard_core::ipc::IpcError::EngineDown { .. }) => return plain("engine_down", 1),
         _ => {}
     }
 
@@ -364,6 +373,7 @@ mod tests {
         for e in [
             IpcError::EngineDown {
                 reason: "no session".into(),
+                kind: hoard_core::ipc::EngineDownReason::NoSession,
             },
             IpcError::NoServerSession {
                 reason: "none".into(),
@@ -374,6 +384,18 @@ mod tests {
         ] {
             let c = classify(&anyhow::Error::new(e));
             assert_eq!((c.code.as_ref(), c.exit), ("no_session", 2));
+        }
+        // Starting, stopping, failing or a mute keyring: not a sign-in.
+        for kind in [
+            hoard_core::ipc::EngineDownReason::Unknown,
+            hoard_core::ipc::EngineDownReason::Other,
+            hoard_core::ipc::EngineDownReason::KeyringUnreadable,
+        ] {
+            let c = classify(&anyhow::Error::new(IpcError::EngineDown {
+                reason: "the engine is still starting".into(),
+                kind,
+            }));
+            assert_eq!((c.code.as_ref(), c.exit), ("engine_down", 1), "{kind:?}");
         }
     }
 

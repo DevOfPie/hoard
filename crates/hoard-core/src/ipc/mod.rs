@@ -693,7 +693,14 @@ pub enum IpcError {
     /// session, another agent holds the engine, a failing start). A client that
     /// only saw "error" would retry forever with nothing to tell the user.
     #[error("the Hoard service has no engine: {reason}")]
-    EngineDown { reason: String },
+    EngineDown {
+        reason: String,
+        /// The same reason classified, so a client can tell "sign in" from
+        /// "wait for it to start". `Unknown` from a service older than this
+        /// field (append only, the protocol does not go up).
+        #[serde(default)]
+        kind: EngineDownReason,
+    },
     /// There is no Cloud session to lend and rotating will not fix it: either
     /// there is no session on disk, or GoTrue revoked the whole token family
     /// (reuse detection). Only a fresh login gets it back.

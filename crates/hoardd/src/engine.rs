@@ -192,6 +192,21 @@ impl Engine {
             .unwrap_or_else(|| "the engine is still starting".to_string())
     }
 
+    /// The error a request gets while there is no engine: the readable reason
+    /// and its classification, so a client asks for a sign-in only when a
+    /// sign-in fixes it.
+    pub fn down_error(&self) -> hoard_core::ipc::IpcError {
+        let kind = if self.lock().stopping {
+            hoard_core::ipc::EngineDownReason::Other
+        } else {
+            self.status().reason
+        };
+        hoard_core::ipc::IpcError::EngineDown {
+            reason: self.down_reason(),
+            kind,
+        }
+    }
+
     pub fn set_watched(&self, count: usize) {
         self.lock().status.watched = count;
     }

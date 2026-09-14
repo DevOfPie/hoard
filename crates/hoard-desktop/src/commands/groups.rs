@@ -47,7 +47,7 @@ fn map_err(err: anyhow::Error) -> AppError {
             None => AppError::new("groups.err_title", message.clone()),
         },
         Some(IpcError::Invalid { message }) => AppError::new("groups.err_title", message.clone()),
-        Some(IpcError::EngineDown { reason }) => {
+        Some(IpcError::EngineDown { reason, .. }) => {
             AppError::new("groups.err_title", "groups.err_engine_down").with_detail(reason.clone())
         }
         _ => {
@@ -209,8 +209,9 @@ pub async fn get_lease(save_id: String, state: State<'_, AppState>) -> Result<Le
     {
         Payload::Lease(lease) => {
             let lease = lease.map(|l| *l);
-            // The engine decides by account when it has a slot for the save;
-            // only without one does the fingerprint on the lease say.
+            // The engine decides by account once it knows who holds the lease;
+            // while its slot reads unknown or free, or it has none, the
+            // fingerprint on the lease says.
             let engine = match ask(&state, Request::Status).await {
                 Ok(Payload::Status(status)) => status
                     .slots
@@ -220,8 +221,9 @@ pub async fn get_lease(save_id: String, state: State<'_, AppState>) -> Result<Le
                 _ => None,
             };
             let here = lease.as_ref().is_some_and(|l| match engine {
-                Some(verdict) => verdict == WorldLease::Mine,
-                None => {
+                Some(WorldLease::Mine) => true,
+                Some(WorldLease::Other) => false,
+                _ => {
                     l.holder_device_fp.as_deref()
                         == Some(hoard_agent::logship::device_identity().fingerprint.as_str())
                 }

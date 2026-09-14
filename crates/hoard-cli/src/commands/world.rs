@@ -250,12 +250,14 @@ fn this_device() -> String {
     hoard_agent::logship::device_identity().fingerprint
 }
 
-/// Whether the lease is held here. The engine decides by account when it has a
-/// slot for the save; only without one does the fingerprint on the lease say.
+/// Whether the lease is held here. The engine decides by account once it knows
+/// who holds the lease; while its slot reads unknown or free (just restarted),
+/// or it has no slot, the fingerprint on the lease says.
 fn held_here(lease: &Lease, engine: Option<WorldLease>, my_fp: &str) -> bool {
     match engine {
-        Some(verdict) => verdict == WorldLease::Mine,
-        None => lease.holder_device_fp.as_deref() == Some(my_fp),
+        Some(WorldLease::Mine) => true,
+        Some(WorldLease::Other) => false,
+        _ => lease.holder_device_fp.as_deref() == Some(my_fp),
     }
 }
 
@@ -319,6 +321,11 @@ mod tests {
         assert!(!held_here(&l, Some(WorldLease::Other), "fp-me"));
         // With no slot the fingerprint decides.
         assert!(held_here(&l, None, "fp-me"));
+        // Just restarted, the engine has not heard who holds it: the
+        // fingerprint still says, either way.
+        assert!(held_here(&l, Some(WorldLease::Unknown), "fp-me"));
+        assert!(held_here(&l, Some(WorldLease::Free), "fp-me"));
+        assert!(!held_here(&l, Some(WorldLease::Unknown), "fp-other"));
     }
 
     #[test]

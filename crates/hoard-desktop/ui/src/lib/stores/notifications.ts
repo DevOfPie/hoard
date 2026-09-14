@@ -235,14 +235,20 @@ export function pushNotification(
 }
 
 /** Change an app notification in place (its actions, once the side copy has
- *  a folder). Nothing happens when the id is gone: the user dismissed it. */
+ *  a folder). A new `at` is the same event happening again: the row moves to
+ *  the top. Nothing happens when the id is gone: the user dismissed it. */
 export function updateNotification(
   id: string,
-  patch: Partial<Pick<AppNotification, "title" | "body" | "actions">>,
+  patch: Partial<Pick<AppNotification, "title" | "body" | "actions" | "at">>,
 ): void {
   notifications.update((list) => {
-    if (!list.some((n) => n.id === id)) return list;
-    const next = list.map((n) => (n.id === id ? { ...n, ...patch } : n));
+    const old = list.find((n) => n.id === id);
+    if (!old) return list;
+    const updated = { ...old, ...patch };
+    const next =
+      patch.at === undefined
+        ? list.map((n) => (n.id === id ? updated : n))
+        : [updated, ...list.filter((n) => n.id !== id)];
     persist(next);
     return next;
   });

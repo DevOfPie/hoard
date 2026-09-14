@@ -81,13 +81,14 @@ exit status grouped by what to do about it:
 
 | Exit | Meaning |
 |---|---|
-| 2 | Not signed in (`no_session`, `unauthorized`, `forbidden`): tell the user to run `hoard login`; do not attempt it yourself. A command that goes through the sync service gets `no_session` when the service has no session to act with |
+| 2 | Not signed in (`no_session`, `unauthorized`, `forbidden`): tell the user to run `hoard login`; do not attempt it yourself. A command that goes through the sync service gets `no_session` only when the service has no session, or it expired |
 | 3 | It isn't there (`not_found`, `not_tracked`, `not_watched`): re-read `hoard saves --json`, do not retry with a guessed id |
 | 4 | `rate_limited`, or `throttled` from the sync service: `rate_limited` carries `retry_after_seconds`, `throttled` names the wait in its message; wait that long, exactly once, and don't loop |
 | 5 | Storage limit (`quota_exceeded`, `quota_full`, `too_large`, `archived`): will fail identically until the user frees space or upgrades |
 | 6 | Network (`network`, `storage_unreachable`): may work later |
 | 1 | `no_service`: the sync service isn't running, and groups, sharing and leases have nobody to ask without it: tell the user to run `hoard sync start` |
 | 1 | A shared save refused (`held`, `stale`, `lease_required`, `not_shared`, `conflict`): see below; retrying unchanged gets the same answer |
+| 1 | `engine_down`: the sync service is running but its engine is not ready (starting, shutting down, failing, or the keyring will not hand over the session); the message says which. Wait and retry once if it is starting; otherwise tell the user what the message says, and do not tell them to sign in |
 | 1 | `bad_request`: the request itself is wrong (a world name that is not one, an expiry past a year); change it, don't retry |
 | 1 | `needs_input`, `needs_choice`: see below |
 | 1 | Anything else |
