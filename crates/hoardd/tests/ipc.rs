@@ -319,6 +319,28 @@ async fn the_world_and_group_verbs_round_trip_and_want_an_engine() {
     assert_eq!(pid, std::process::id());
 }
 
+/// `GetLease` is answered, and promptly: with no engine it is an error the user
+/// can read, never a reply the client waits out its timeout for.
+#[tokio::test]
+async fn asking_who_hosts_without_an_engine_answers_promptly() {
+    let fx = Fixture::start();
+    let mut client = fx.client().await;
+
+    let answered = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        client.request(Request::GetLease {
+            save_id: "w1".into(),
+        }),
+    )
+    .await
+    .expect("the lease query hung");
+    let text = answered.expect_err("no engine, no lease").to_string();
+    assert!(text.contains("no engine"), "{text}");
+
+    let (_, pid) = client.ping().await.unwrap();
+    assert_eq!(pid, std::process::id());
+}
+
 /// Asking for an engine restart is **not** answered with `EngineDown` when there is
 /// no engine: it is precisely the request that can bring it back (the keeper
 /// resolves the session again). Answering "I cannot because it is broken" would

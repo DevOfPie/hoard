@@ -1,12 +1,13 @@
 //! `hoard world`: who hosts a shared world. The verbs are engine commands: the
 //! service refuses one for a save that is not a shared world here, and
-//! otherwise answers once the engine has taken it. What the server makes of the
-//! lease arrives as events, which `hoard sync logs` shows and `hoard world
-//! lease` reads back from the server.
+//! otherwise answers once the engine has taken it. `claim` and `force` then wait
+//! a few seconds for the lease to settle; the rest, and a verdict that does not
+//! arrive in time, show in `hoard sync logs` and `hoard world lease`.
 //! The tables (`hoard saves`, `hoard status`) read who hosts from the engine
 //! instead, see [`Hosts`].
 
 use std::collections::HashMap;
+use std::time::Duration;
 
 use anyhow::Result;
 use clap::Subcommand;
@@ -24,7 +25,7 @@ use crate::output;
 pub enum WorldCommand {
     /// Take a role on a shared world: host it (acquire the lease, your changes
     /// upload), which is the default, or only view it with `--view` (pull,
-    /// never push)
+    /// never push). Hosting waits up to 10 seconds for the server's answer.
     Claim {
         /// Save id (UUID), see `hoard saves`
         save_id: String,
@@ -39,7 +40,8 @@ pub enum WorldCommand {
         save_id: String,
     },
     /// Take the lease off its holder and host. Refused once the holder has
-    /// pushed under it: only an idle lease can be taken.
+    /// pushed under it: only an idle lease can be taken. Waits up to 10 seconds
+    /// for the server's answer.
     Force {
         /// Save id (UUID), see `hoard saves`
         save_id: String,
@@ -83,6 +85,31 @@ pub struct LeaseDetail {
     pub pushed_since: bool,
 }
 
+/// What a world verb came to, as agents and scripts see it. A refusal is the
+/// error envelope instead (`held`, `pushed`).
+#[derive(Serialize)]
+pub struct WorldOut {
+    pub save_id: String,
+    pub outcome: Outcome,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Outcome {
+    /// This machine holds the lease.
+    Hosting,
+    /// The service took the request and no verdict arrived within the wait.
+    Pending,
+    /// `claim --view`, `release` and `dismiss`: asked, with nothing to wait on.
+    Viewing,
+    Releasing,
+    Dismissed,
+}
+
+/// How long `claim` and `force` wait for the verdict, and how often they look.
+const VERDICT_WAIT: Duration = Duration::from_secs(10);
+const POLL_EVERY: Duration = Duration::from_millis(500);
+
 pub async fn run(cmd: WorldCommand) -> Result<()> {
     let mut client = link::require("world").await?;
     match cmd {
@@ -100,12 +127,14 @@ pub async fn run(cmd: WorldCommand) -> Result<()> {
                 },
             )
             .await?;
-            let verb = match role {
-                WorldRole::Host => "host",
-                WorldRole::View => "view",
+            let outcome = match role {
+                WorldRole::View => Outcome::Viewing,
+                WorldRole::Host => {
+                    let verdict = wait_for_verdict(&mut client, &save_id).await;
+                    outcome_of(&save_id, verdict, false)?
+                }
             };
-            println!("asked to {verb} {save_id}; the outcome shows in `hoard sync logs` and `hoard world lease {save_id}`");
-            Ok(())
+            emit(save_id, outcome, false)
         }
         WorldCommand::Release { save_id } => {
             link::ask(
@@ -115,8 +144,7 @@ pub async fn run(cmd: WorldCommand) -> Result<()> {
                 },
             )
             .await?;
-            println!("releasing the lease on {save_id}");
-            Ok(())
+            emit(save_id, Outcome::Releasing, false)
         }
         WorldCommand::Force { save_id } => {
             link::ask(
@@ -126,8 +154,9 @@ pub async fn run(cmd: WorldCommand) -> Result<()> {
                 },
             )
             .await?;
-            println!("taking the lease on {save_id}; the outcome shows in `hoard sync logs`");
-            Ok(())
+            let verdict = wait_for_verdict(&mut client, &save_id).await;
+            let outcome = outcome_of(&save_id, verdict, true)?;
+            emit(save_id, outcome, true)
         }
         WorldCommand::Dismiss { save_id } => {
             link::ask(
@@ -137,8 +166,7 @@ pub async fn run(cmd: WorldCommand) -> Result<()> {
                 },
             )
             .await?;
-            println!("dismissed {save_id}: no role this session");
-            Ok(())
+            emit(save_id, Outcome::Dismissed, false)
         }
         WorldCommand::Lease { save_id } => {
             let lease = lease(&mut client, &save_id).await?;
@@ -172,6 +200,169 @@ pub async fn run(cmd: WorldCommand) -> Result<()> {
     }
 }
 
+fn emit(save_id: String, outcome: Outcome, force: bool) -> Result<()> {
+    let out = WorldOut { save_id, outcome };
+    output::emit(&out, |o| {
+        println!("{}", human_line(&o.save_id, o.outcome, force));
+    })
+}
+
+/// The one line a world verb prints.
+fn human_line(save_id: &str, outcome: Outcome, force: bool) -> String {
+    match outcome {
+        Outcome::Hosting => format!("hosting {save_id}"),
+        Outcome::Pending if force => {
+            format!("taking the lease on {save_id}; the outcome shows in `hoard sync logs`")
+        }
+        Outcome::Pending => format!(
+            "asked to host {save_id}; the outcome shows in `hoard sync logs` and `hoard world lease {save_id}`"
+        ),
+        Outcome::Viewing => format!(
+            "asked to view {save_id}; the outcome shows in `hoard sync logs` and `hoard world lease {save_id}`"
+        ),
+        Outcome::Releasing => format!("releasing the lease on {save_id}"),
+        Outcome::Dismissed => format!("dismissed {save_id}: no role this session"),
+    }
+}
+
+/// The lease as one look at it saw it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Seen {
+    /// The service could not say.
+    Unknown,
+    /// Nobody holds it, or the holder's lease has gone quiet.
+    Free,
+    Mine,
+    Other {
+        holder: String,
+        pushed: bool,
+    },
+}
+
+/// Where a wait for the verdict ended.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Verdict {
+    Hosting,
+    Held {
+        holder: String,
+        pushed: bool,
+    },
+    /// Nothing settled before the deadline.
+    Undecided,
+}
+
+/// Reads the looks of one wait in order. `Mine` settles it at once. `Other`
+/// settles it only when two looks in a row agree: right after a takeover the
+/// server still names the old holder until the engine's call lands, and one
+/// look cannot tell that from a refusal.
+#[derive(Default)]
+struct Wait {
+    other: Option<(String, bool)>,
+}
+
+impl Wait {
+    fn see(&mut self, seen: Seen) -> Option<Verdict> {
+        match seen {
+            Seen::Mine => Some(Verdict::Hosting),
+            Seen::Other { holder, pushed } => {
+                let key = (holder, pushed);
+                if self.other.as_ref() == Some(&key) {
+                    let (holder, pushed) = key;
+                    return Some(Verdict::Held { holder, pushed });
+                }
+                self.other = Some(key);
+                None
+            }
+            Seen::Unknown | Seen::Free => {
+                self.other = None;
+                None
+            }
+        }
+    }
+}
+
+/// The verdict a sequence of looks reaches; `Undecided` when it runs out
+/// first. The deadline is the caller's: it decides how many looks there are.
+/// [`wait_for_verdict`] feeds [`Wait`] the same way, one look at a time.
+#[cfg(test)]
+fn verdict(looks: impl IntoIterator<Item = Seen>) -> Verdict {
+    let mut wait = Wait::default();
+    looks
+        .into_iter()
+        .find_map(|seen| wait.see(seen))
+        .unwrap_or(Verdict::Undecided)
+}
+
+/// Look at the lease every [`POLL_EVERY`] until a verdict or [`VERDICT_WAIT`].
+async fn wait_for_verdict(client: &mut Client, save_id: &str) -> Verdict {
+    let my_fp = this_device();
+    let mut wait = Wait::default();
+    let polls = async {
+        loop {
+            tokio::time::sleep(POLL_EVERY).await;
+            // The engine's word on whose lease it is, when it has one; the
+            // server's row for who holds it and whether they pushed.
+            let engine = match link::ask(client, Request::Status).await {
+                Ok(Payload::Status(status)) => Hosts::from_status(&status).lease(save_id),
+                _ => None,
+            };
+            let seen = match lease(client, save_id).await {
+                Ok(lease) => seen(lease.as_ref(), engine, &my_fp),
+                Err(err) => {
+                    tracing::debug!(error = %format!("{err:#}"), "cli: couldn't read the lease on {save_id}");
+                    Seen::Unknown
+                }
+            };
+            if let Some(verdict) = wait.see(seen) {
+                return verdict;
+            }
+        }
+    };
+    tokio::time::timeout(VERDICT_WAIT, polls)
+        .await
+        .unwrap_or(Verdict::Undecided)
+}
+
+/// One lease read as a look: a quiet lease is as good as free, and whose it is
+/// is the engine's word when it has one (see [`held_here`]).
+fn seen(lease: Option<&Lease>, engine: Option<WorldLease>, my_fp: &str) -> Seen {
+    match lease {
+        None => Seen::Free,
+        Some(l) if !l.live => Seen::Free,
+        Some(l) if held_here(l, engine, my_fp) => Seen::Mine,
+        Some(l) => Seen::Other {
+            holder: l.holder_username.to_string(),
+            pushed: l.pushed_since,
+        },
+    }
+}
+
+/// A verdict as the command's answer. Held is a refusal, and for a takeover a
+/// lease the holder has pushed under is its own one.
+fn outcome_of(save_id: &str, verdict: Verdict, force: bool) -> Result<Outcome> {
+    match verdict {
+        Verdict::Hosting => Ok(Outcome::Hosting),
+        Verdict::Undecided => Ok(Outcome::Pending),
+        Verdict::Held {
+            holder,
+            pushed: true,
+        } if force => Err(output::err(
+            "pushed",
+            format!(
+                "{holder} has pushed to {save_id} under their lease, so it cannot be taken; \
+                 ask them to release it"
+            ),
+        )),
+        Verdict::Held { holder, .. } => Err(output::err(
+            "held",
+            format!(
+                "{holder} is hosting {save_id}; view it with `hoard world claim {save_id} --view`, \
+                 or ask them to release it"
+            ),
+        )),
+    }
+}
+
 /// The lease on `save_id`, or `None` when nobody holds one.
 pub async fn lease(client: &mut Client, save_id: &str) -> Result<Option<Lease>> {
     match link::ask(
@@ -182,7 +373,7 @@ pub async fn lease(client: &mut Client, save_id: &str) -> Result<Option<Lease>> 
     )
     .await?
     {
-        Payload::Lease(lease) => Ok(lease.map(|l| *l)),
+        Payload::Lease { lease } => Ok(lease.map(|l| *l)),
         other => anyhow::bail!("unexpected answer to a lease request: {other:?}"),
     }
 }
@@ -250,12 +441,14 @@ fn this_device() -> String {
     hoard_agent::logship::device_identity().fingerprint
 }
 
-/// Whether the lease is held here. The engine decides by account when it has a
-/// slot for the save; only without one does the fingerprint on the lease say.
+/// Whether the lease is held here. The engine decides by account once it knows
+/// who holds the lease; while its slot reads unknown or free (just restarted),
+/// or it has no slot, the fingerprint on the lease says.
 fn held_here(lease: &Lease, engine: Option<WorldLease>, my_fp: &str) -> bool {
     match engine {
-        Some(verdict) => verdict == WorldLease::Mine,
-        None => lease.holder_device_fp.as_deref() == Some(my_fp),
+        Some(WorldLease::Mine) => true,
+        Some(WorldLease::Other) => false,
+        _ => lease.holder_device_fp.as_deref() == Some(my_fp),
     }
 }
 
@@ -319,6 +512,11 @@ mod tests {
         assert!(!held_here(&l, Some(WorldLease::Other), "fp-me"));
         // With no slot the fingerprint decides.
         assert!(held_here(&l, None, "fp-me"));
+        // Just restarted, the engine has not heard who holds it: the
+        // fingerprint still says, either way.
+        assert!(held_here(&l, Some(WorldLease::Unknown), "fp-me"));
+        assert!(held_here(&l, Some(WorldLease::Free), "fp-me"));
+        assert!(!held_here(&l, Some(WorldLease::Unknown), "fp-other"));
     }
 
     #[test]
@@ -403,5 +601,147 @@ mod tests {
                 lease: "free"
             }
         );
+    }
+
+    fn other(holder: &str, pushed: bool) -> Seen {
+        Seen::Other {
+            holder: holder.into(),
+            pushed,
+        }
+    }
+
+    #[test]
+    fn a_lease_of_ours_settles_the_wait_at_once() {
+        assert_eq!(
+            verdict([Seen::Unknown, Seen::Free, Seen::Mine]),
+            Verdict::Hosting
+        );
+        // The old holder seen once, then ours: a takeover that landed.
+        assert_eq!(verdict([other("bob", false), Seen::Mine]), Verdict::Hosting);
+    }
+
+    #[test]
+    fn a_holder_seen_twice_in_a_row_is_held() {
+        assert_eq!(
+            verdict([other("bob", false), other("bob", false)]),
+            Verdict::Held {
+                holder: "bob".into(),
+                pushed: false
+            }
+        );
+        assert_eq!(
+            verdict([
+                Seen::Free,
+                other("bob", true),
+                other("bob", true),
+                Seen::Mine
+            ]),
+            Verdict::Held {
+                holder: "bob".into(),
+                pushed: true
+            }
+        );
+    }
+
+    /// One look at the old holder is not a verdict, nor two that disagree.
+    #[test]
+    fn a_holder_seen_once_is_not_a_verdict() {
+        assert_eq!(verdict([other("bob", false)]), Verdict::Undecided);
+        assert_eq!(
+            verdict([other("bob", false), Seen::Free, other("bob", false)]),
+            Verdict::Undecided
+        );
+        assert_eq!(
+            verdict([other("bob", false), other("carol", false)]),
+            Verdict::Undecided
+        );
+    }
+
+    #[test]
+    fn nothing_heard_by_the_deadline_is_undecided() {
+        assert_eq!(verdict([]), Verdict::Undecided);
+        assert_eq!(verdict(vec![Seen::Unknown; 20]), Verdict::Undecided);
+        assert_eq!(verdict(vec![Seen::Free; 20]), Verdict::Undecided);
+    }
+
+    #[test]
+    fn a_lease_reads_as_a_look() {
+        assert_eq!(seen(None, None, "fp-me"), Seen::Free);
+        assert_eq!(
+            seen(Some(&lease(Some("fp-me"), false)), None, "fp-me"),
+            Seen::Free
+        );
+        assert_eq!(
+            seen(Some(&lease(Some("fp-me"), true)), None, "fp-me"),
+            Seen::Mine
+        );
+        assert_eq!(
+            seen(Some(&lease(Some("fp-them"), true)), None, "fp-me"),
+            other("alice", false)
+        );
+    }
+
+    fn code(r: Result<Outcome>) -> String {
+        output::classify(&r.unwrap_err()).code.into_owned()
+    }
+
+    #[test]
+    fn a_verdict_becomes_the_answer() {
+        assert_eq!(
+            outcome_of("s1", Verdict::Hosting, false).unwrap(),
+            Outcome::Hosting
+        );
+        assert_eq!(
+            outcome_of("s1", Verdict::Undecided, true).unwrap(),
+            Outcome::Pending
+        );
+        let held = |pushed| Verdict::Held {
+            holder: "bob".into(),
+            pushed,
+        };
+        assert_eq!(code(outcome_of("s1", held(false), false)), "held");
+        assert_eq!(code(outcome_of("s1", held(false), true)), "held");
+        // Pushed is the takeover's refusal; a claim is simply held.
+        assert_eq!(code(outcome_of("s1", held(true), true)), "pushed");
+        assert_eq!(code(outcome_of("s1", held(true), false)), "held");
+        let err = outcome_of("s1", held(false), false).unwrap_err();
+        assert!(format!("{err:#}").contains("bob"), "{err:#}");
+        assert_eq!(output::classify(&err).exit, 1);
+    }
+
+    #[test]
+    fn the_outcome_is_one_line_and_one_word() {
+        assert_eq!(human_line("s1", Outcome::Hosting, true), "hosting s1");
+        assert!(human_line("s1", Outcome::Pending, false).contains("hoard world lease s1"));
+        assert!(human_line("s1", Outcome::Pending, true).starts_with("taking the lease"));
+        let v = serde_json::to_value(WorldOut {
+            save_id: "s1".into(),
+            outcome: Outcome::Pending,
+        })
+        .unwrap();
+        assert_eq!(
+            v,
+            serde_json::json!({"save_id": "s1", "outcome": "pending"})
+        );
+    }
+
+    /// A look takes the engine's word on whose lease it is, and the
+    /// fingerprint only while the engine reads unknown or free.
+    #[test]
+    fn a_look_takes_the_engines_word_on_whose_lease_it_is() {
+        let theirs_by_fp = lease(Some("fp-them"), true);
+        assert!(matches!(
+            seen(Some(&theirs_by_fp), Some(WorldLease::Mine), "fp-me"),
+            Seen::Mine
+        ));
+        let mine_by_fp = lease(Some("fp-me"), true);
+        assert!(matches!(
+            seen(Some(&mine_by_fp), Some(WorldLease::Other), "fp-me"),
+            Seen::Other { .. }
+        ));
+        assert!(matches!(
+            seen(Some(&mine_by_fp), Some(WorldLease::Unknown), "fp-me"),
+            Seen::Mine
+        ));
     }
 }

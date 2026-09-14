@@ -413,7 +413,9 @@ pub(crate) fn pretty_error(err: anyhow::Error) -> String {
             ApiError::LeaseHeld(d) | ApiError::LeaseRequired(d) => d.human(),
             ApiError::LeaseStale(d) => d.human(),
             ApiError::NotShared => "This save isn't shared with a group.".into(),
-            ApiError::Conflict(msg) | ApiError::BadRequest(msg) => msg.clone(),
+            ApiError::LeasePushed(msg) | ApiError::Conflict(msg) | ApiError::BadRequest(msg) => {
+                msg.clone()
+            }
         };
     }
     if let Some(req) = err.downcast_ref::<reqwest::Error>() {

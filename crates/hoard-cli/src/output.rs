@@ -149,7 +149,7 @@ pub fn classify(e: &anyhow::Error) -> Classified {
 
     // Refusals relayed by the service keep the server's tag: a 409 arrives
     // with the code the daemon names (`held`, `stale`, `lease_required`,
-    // `not_shared`, `conflict`), still exit 1, and a request the user has to
+    // `not_shared`, `pushed`, `conflict`), still exit 1, and a request the user has to
     // change is `bad_request`. Any other refusal is relayed with its code and
     // grouped as the HTTP road groups the same answer. A service with no
     // session to act with is the sign-in group. Every other service failure
@@ -176,11 +176,20 @@ pub fn classify(e: &anyhow::Error) -> Classified {
             };
         }
         Some(hoard_core::ipc::IpcError::Invalid { .. }) => return plain("bad_request", 1),
+        // Only a missing or expired session is the sign-in group; an engine
+        // still starting, shutting down, failing, or whose keyring will not
+        // answer is not fixed by signing in.
         Some(
-            hoard_core::ipc::IpcError::EngineDown { .. }
+            hoard_core::ipc::IpcError::EngineDown {
+                kind:
+                    hoard_core::ipc::EngineDownReason::NoSession
+                    | hoard_core::ipc::EngineDownReason::SessionExpired,
+                ..
+            }
             | hoard_core::ipc::IpcError::NoServerSession { .. }
             | hoard_core::ipc::IpcError::CloudSessionExpired { .. },
         ) => return plain("no_session", 2),
+        Some(hoard_core::ipc::IpcError::EngineDown { .. }) => return plain("engine_down", 1),
         _ => {}
     }
 
@@ -210,6 +219,7 @@ pub fn classify(e: &anyhow::Error) -> Classified {
         Some(ApiError::LeaseHeld(_))
         | Some(ApiError::LeaseStale(_))
         | Some(ApiError::LeaseRequired(_))
+        | Some(ApiError::LeasePushed(_))
         | Some(ApiError::NotShared) => plain("conflict", 1),
         Some(ApiError::Conflict(_)) => plain("conflict", 1),
         Some(ApiError::BadRequest(_)) => plain("bad_request", 1),
@@ -314,7 +324,13 @@ mod tests {
         });
         assert_eq!(classify(&e).code, "held");
         assert_eq!(classify(&e).exit, 1);
-        for code in ["stale", "lease_required", "not_shared", "conflict"] {
+        for code in [
+            "stale",
+            "lease_required",
+            "not_shared",
+            "pushed",
+            "conflict",
+        ] {
             let e = anyhow::Error::new(IpcError::Conflict {
                 code: code.into(),
                 message: "no".into(),
@@ -364,6 +380,7 @@ mod tests {
         for e in [
             IpcError::EngineDown {
                 reason: "no session".into(),
+                kind: hoard_core::ipc::EngineDownReason::NoSession,
             },
             IpcError::NoServerSession {
                 reason: "none".into(),
@@ -374,6 +391,18 @@ mod tests {
         ] {
             let c = classify(&anyhow::Error::new(e));
             assert_eq!((c.code.as_ref(), c.exit), ("no_session", 2));
+        }
+        // Starting, stopping, failing or a mute keyring: not a sign-in.
+        for kind in [
+            hoard_core::ipc::EngineDownReason::Unknown,
+            hoard_core::ipc::EngineDownReason::Other,
+            hoard_core::ipc::EngineDownReason::KeyringUnreadable,
+        ] {
+            let c = classify(&anyhow::Error::new(IpcError::EngineDown {
+                reason: "the engine is still starting".into(),
+                kind,
+            }));
+            assert_eq!((c.code.as_ref(), c.exit), ("engine_down", 1), "{kind:?}");
         }
     }
 

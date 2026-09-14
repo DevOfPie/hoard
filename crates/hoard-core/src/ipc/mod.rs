@@ -491,8 +491,12 @@ pub enum Payload {
     /// not grow to the size of a `Save` for it.
     Group(Box<crate::wire::Group>),
     Invite(crate::wire::InviteOut),
-    /// `None` when nobody is hosting.
-    Lease(Option<Box<crate::wire::Lease>>),
+    /// `None` when nobody is hosting. A struct variant, not a newtype: serde
+    /// cannot put an `Option` inside an internally tagged newtype variant, and
+    /// it refuses at runtime, not at compile time.
+    Lease {
+        lease: Option<Box<crate::wire::Lease>>,
+    },
     Save(Box<crate::wire::Save>),
     /// The worlds of a save (answer to [`Request::ListWorlds`]). A struct
     /// variant for the same reason as `Groups`.
@@ -693,7 +697,14 @@ pub enum IpcError {
     /// session, another agent holds the engine, a failing start). A client that
     /// only saw "error" would retry forever with nothing to tell the user.
     #[error("the Hoard service has no engine: {reason}")]
-    EngineDown { reason: String },
+    EngineDown {
+        reason: String,
+        /// The same reason classified, so a client can tell "sign in" from
+        /// "wait for it to start". `Unknown` from a service older than this
+        /// field (append only, the protocol does not go up).
+        #[serde(default)]
+        kind: EngineDownReason,
+    },
     /// There is no Cloud session to lend and rotating will not fix it: either
     /// there is no session on disk, or GoTrue revoked the whole token family
     /// (reuse detection). Only a fresh login gets it back.
@@ -1483,5 +1494,219 @@ mod tests {
         let back: IpcError = serde_json::from_value(json).unwrap();
         assert!(matches!(back, IpcError::Refused { ref code, .. } if code == "not_found"));
         assert_eq!(back.to_string(), "not found (404)");
+    }
+
+    fn at() -> OffsetDateTime {
+        OffsetDateTime::from_unix_timestamp(1_800_000_000).unwrap()
+    }
+
+    fn lease() -> crate::wire::Lease {
+        crate::wire::Lease {
+            save_id: "w1".into(),
+            holder_user_id: "u1".into(),
+            holder_username: crate::ids::Username::parse("alice").unwrap(),
+            holder_device_fp: None,
+            acquired_at: at(),
+            renewed_at: at(),
+            base_version: 4,
+            pushed_since: true,
+            live: true,
+        }
+    }
+
+    /// Who hosts, both ways: nobody and somebody. The newtype this replaced
+    /// (`Lease(Option<..>)`) compiled and could not be encoded at all, so
+    /// `hoard world lease` never got an answer. The bytes are contract.
+    #[test]
+    fn the_lease_payload_is_frozen() {
+        let nobody = Payload::Lease { lease: None };
+        let json = serde_json::to_string(&nobody).unwrap();
+        assert_eq!(json, r#"{"payload":"lease","lease":null}"#);
+        let back: Payload = serde_json::from_str(&json).unwrap();
+        assert!(matches!(back, Payload::Lease { lease: None }));
+
+        let somebody = Payload::Lease {
+            lease: Some(Box::new(lease())),
+        };
+        let json = serde_json::to_string(&somebody).unwrap();
+        assert_eq!(
+            json,
+            concat!(
+                r#"{"payload":"lease","lease":{"save_id":"w1","holder_user_id":"u1","#,
+                r#""holder_username":"alice","acquired_at":"2027-01-15T08:00:00Z","#,
+                r#""renewed_at":"2027-01-15T08:00:00Z","base_version":4,"#,
+                r#""pushed_since":true,"live":true}}"#
+            )
+        );
+        let back: Payload = serde_json::from_str(&json).unwrap();
+        match back {
+            Payload::Lease { lease: Some(l) } => assert_eq!(*l, lease()),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// Every payload crosses the wire as a reply frame and comes back the same.
+    /// Serde checks an internally tagged enum's shapes at runtime, so a variant it
+    /// cannot encode compiles and fails only on a live connection; this is where
+    /// it fails instead. Adding a variant breaks the `match` in `index` until it
+    /// has a case, and a case with no sample fails the coverage check.
+    #[test]
+    fn every_payload_round_trips_through_a_frame() {
+        use crate::ids::{GameSlug, SaveId, Username};
+        use crate::wire::{Group, GroupMember, InviteOut, Save, SharedInfo};
+
+        const VARIANTS: usize = 14;
+        fn index(p: &Payload) -> usize {
+            match p {
+                Payload::Ack => 0,
+                Payload::Pong { .. } => 1,
+                Payload::Status(_) => 2,
+                Payload::Backlog(_) => 3,
+                Payload::CloudToken(_) => 4,
+                Payload::ServerSession(_) => 5,
+                Payload::Update(_) => 6,
+                Payload::Groups { .. } => 7,
+                Payload::Group(_) => 8,
+                Payload::Invite(_) => 9,
+                Payload::Lease { lease: None } => 10,
+                Payload::Lease { lease: Some(_) } => 11,
+                Payload::Save(_) => 12,
+                Payload::Worlds { .. } => 13,
+            }
+        }
+
+        let group = Group {
+            id: "g1".into(),
+            name: "friends".into(),
+            owner_user_id: "u1".into(),
+            created_at: at(),
+            members: vec![GroupMember {
+                user_id: "u2".into(),
+                username: Username::parse("bob").unwrap(),
+                role: "member".into(),
+                joined_at: at(),
+            }],
+        };
+        let samples = vec![
+            Payload::Ack,
+            Payload::Pong {
+                daemon_version: "7.7.16".into(),
+                pid: 42,
+            },
+            Payload::Status(DaemonStatus {
+                daemon_version: "7.7.16".into(),
+                protocol: PROTOCOL_VERSION,
+                pid: 42,
+                epoch: "e".into(),
+                uptime_secs: 3,
+                cursor: 7,
+                notifications: true,
+                engine: EngineStatus {
+                    running: false,
+                    reason: EngineDownReason::KeyringUnreadable,
+                    keyring: Some(KeyringFault::Locked),
+                    since: Some(at()),
+                    ..EngineStatus::default()
+                },
+                slots: vec![],
+            }),
+            Payload::Backlog(Backlog {
+                entries: vec![],
+                cursor: 7,
+                gap: true,
+            }),
+            Payload::CloudToken(CloudToken {
+                access_token: "jwt".into(),
+                server_url: "https://api.hoard.services".into(),
+                expires_at: Some(1_800_000_000),
+                rotated: false,
+            }),
+            Payload::ServerSession(ServerSession {
+                server_url: "https://hoard.example".into(),
+                token: "hoard_v1_dead".into(),
+                user: Some(ServerUser {
+                    user_id: "u1".into(),
+                    username: "alice".into(),
+                    is_admin: false,
+                }),
+            }),
+            Payload::Update(UpdateState {
+                current: "1.0.0".into(),
+                latest: Some("1.0.1".into()),
+                staged: Some("1.0.1".into()),
+                phase: UpdatePhase::Waiting {
+                    hold: UpdateHold::GameRunning,
+                },
+                deadline: Some(at()),
+                mandatory: false,
+                unattended: true,
+                last_error: None,
+            }),
+            Payload::Groups {
+                groups: vec![group.clone()],
+            },
+            Payload::Group(Box::new(group)),
+            Payload::Invite(InviteOut {
+                invite_id: "i1".into(),
+                token: "invite-token".into(),
+                expires_at: at(),
+            }),
+            Payload::Lease { lease: None },
+            Payload::Lease {
+                lease: Some(Box::new(lease())),
+            },
+            Payload::Save(Box::new(Save {
+                id: SaveId::parse("0b9c7c7e-8f3a-4d2b-9c1e-5a6b7c8d9e0f").unwrap(),
+                user_id: None,
+                game_slug: GameSlug::parse("valheim").unwrap(),
+                label: "World".into(),
+                local_path_hint: Some("/saves/world".into()),
+                client_os: Some("linux".into()),
+                latest_version_num: Some(4),
+                snapshot_count: Some(4),
+                total_size_bytes: Some(1024),
+                created_at: at(),
+                updated_at: at(),
+                shared: Some(SharedInfo {
+                    group_id: "g1".into(),
+                    group_name: "friends".into(),
+                    owner_user_id: "u1".into(),
+                    owner_username: Username::parse("alice").unwrap(),
+                    include: Vec::new(),
+                }),
+            })),
+            Payload::Worlds {
+                worlds: vec![WorldFiles {
+                    name: "Alpha".into(),
+                    include: vec!["worlds_local/Alpha.fwl".into()],
+                }],
+            },
+        ];
+
+        let mut seen = [false; VARIANTS];
+        for payload in samples {
+            seen[index(&payload)] = true;
+            let sent = serde_json::to_value(&payload)
+                .unwrap_or_else(|e| panic!("{payload:?} cannot be encoded: {e}"));
+            let bytes = encode_frame(&ServerFrame::Reply {
+                id: 1,
+                reply: Reply::Ok(payload),
+            })
+            .expect("a reply frame encodes");
+            let frame: ServerFrame = decode_frame(&bytes[HEADER_BYTES..]).expect("and decodes");
+            let ServerFrame::Reply {
+                id: 1,
+                reply: Reply::Ok(back),
+            } = frame
+            else {
+                panic!("came back as another frame: {sent}");
+            };
+            assert_eq!(serde_json::to_value(&back).unwrap(), sent);
+        }
+        let missing: Vec<usize> = (0..VARIANTS).filter(|i| !seen[*i]).collect();
+        assert!(
+            missing.is_empty(),
+            "payload cases with no sample: {missing:?}"
+        );
     }
 }
