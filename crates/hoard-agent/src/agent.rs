@@ -514,21 +514,27 @@ enum AgentCommand {
         verdict: bool,
     },
     /// The user takes a role on a shared world. `Host` asks for the lease.
+    /// Each world verb answers on `reply`: refused when the save is not a
+    /// shared world here, `Ok` once the engine has acted on it.
     ClaimWorld {
         save_id: String,
         role: WorldRole,
+        reply: WorldReply,
     },
     ReleaseWorld {
         save_id: String,
+        reply: WorldReply,
     },
     /// Take the lease off its holder, then acquire it.
     ForceWorld {
         save_id: String,
+        reply: WorldReply,
     },
     /// "Not playing" on a shared world: no auto-host, no second prompt this
     /// session (`claim::on_dismiss`).
     DismissWorld {
         save_id: String,
+        reply: WorldReply,
     },
     /// A session's local-only writes were moved aside (`claim::move_world_aside`)
     /// so the folder can take the head back. `Err` carries why they could not
@@ -549,6 +555,43 @@ enum AgentCommand {
     /// for the daemon's status.
     QueryPrompts(oneshot::Sender<Vec<WorldPrompt>>),
     Shutdown,
+}
+
+/// Where a world verb's answer goes. See [`AgentCommand::ClaimWorld`].
+pub type WorldReply = oneshot::Sender<std::result::Result<(), WorldCommandError>>;
+
+/// Why the engine would not act on a world verb. Without it a claim on a save
+/// the engine does not know was dropped and the client was told it worked.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum WorldCommandError {
+    #[error("save {0} is not watched on this machine")]
+    NotWatched(String),
+    #[error("save {0} is not shared with a group")]
+    NotShared(String),
+}
+
+impl WorldCommandError {
+    /// Stable tag for the wire (`IpcError::Refused::code`).
+    pub fn code(&self) -> &'static str {
+        match self {
+            Self::NotWatched(_) => "not_watched",
+            Self::NotShared(_) => "not_shared",
+        }
+    }
+}
+
+/// The slot a world verb acts on: watched here, and shared.
+fn shared_world_slot<'a>(
+    slots: &'a mut HashMap<String, SaveSlot>,
+    save_id: &str,
+) -> std::result::Result<&'a mut SaveSlot, WorldCommandError> {
+    let slot = slots
+        .get_mut(save_id)
+        .ok_or_else(|| WorldCommandError::NotWatched(save_id.to_string()))?;
+    if slot.save.shared.is_none() {
+        return Err(WorldCommandError::NotShared(save_id.to_string()));
+    }
+    Ok(slot)
 }
 
 /// Handle returned by `spawn`. Cheap to clone (channel-cloning).
@@ -702,26 +745,37 @@ impl AgentHandle {
     }
 
     /// Take a role on a shared world. See [`AgentCommand::ClaimWorld`].
+    /// A save that is not a shared world here fails with a
+    /// [`WorldCommandError`] inside the error; a gone engine, as every command.
     pub async fn claim_world(&self, save_id: String, role: WorldRole) -> Result<()> {
-        self.tx
-            .send(AgentCommand::ClaimWorld { save_id, role })
-            .await?;
-        Ok(())
+        self.world_command(|reply| AgentCommand::ClaimWorld {
+            save_id,
+            role,
+            reply,
+        })
+        .await
     }
 
     pub async fn release_world(&self, save_id: String) -> Result<()> {
-        self.tx.send(AgentCommand::ReleaseWorld { save_id }).await?;
-        Ok(())
+        self.world_command(|reply| AgentCommand::ReleaseWorld { save_id, reply })
+            .await
     }
 
     pub async fn force_world(&self, save_id: String) -> Result<()> {
-        self.tx.send(AgentCommand::ForceWorld { save_id }).await?;
-        Ok(())
+        self.world_command(|reply| AgentCommand::ForceWorld { save_id, reply })
+            .await
     }
 
     /// Not playing this world. See [`AgentCommand::DismissWorld`].
     pub async fn dismiss_world(&self, save_id: String) -> Result<()> {
-        self.tx.send(AgentCommand::DismissWorld { save_id }).await?;
+        self.world_command(|reply| AgentCommand::DismissWorld { save_id, reply })
+            .await
+    }
+
+    async fn world_command(&self, command: impl FnOnce(WorldReply) -> AgentCommand) -> Result<()> {
+        let (resp_tx, resp_rx) = oneshot::channel();
+        self.tx.send(command(resp_tx)).await?;
+        resp_rx.await??;
         Ok(())
     }
 
@@ -2507,26 +2561,44 @@ async fn run_agent(
                             );
                         }
                     }
-                    Some(AgentCommand::ClaimWorld { save_id, role }) => {
-                        if let Some(slot) = slots.get_mut(&save_id) {
-                            crate::claim::on_claim_world(slot, role, &events_tx, lease_task.as_ref());
-                            crate::claim::dismiss_siblings(&mut slots, &save_id);
-                        }
-                    }
-                    Some(AgentCommand::ReleaseWorld { save_id }) => {
-                        if let Some(slot) = slots.get(&save_id) {
-                            if let Some(lease) = lease_task.as_ref() {
-                                lease.release(save_id.clone());
+                    Some(AgentCommand::ClaimWorld { save_id, role, reply }) => {
+                        match shared_world_slot(&mut slots, &save_id) {
+                            Ok(slot) => {
+                                crate::claim::on_claim_world(slot, role, &events_tx, lease_task.as_ref());
+                                crate::claim::dismiss_siblings(&mut slots, &save_id);
+                                let _ = reply.send(Ok(()));
                             }
-                            let _ = events_tx.try_send(AgentEvent::WorldReleased {
-                                save_id: save_id.clone(),
-                                game_slug: slot.save.game_slug.clone(),
-                            });
+                            Err(refused) => {
+                                let _ = reply.send(Err(refused));
+                            }
                         }
                     }
-                    Some(AgentCommand::DismissWorld { save_id }) => {
-                        if let Some(slot) = slots.get_mut(&save_id) {
-                            crate::claim::on_dismiss(slot);
+                    Some(AgentCommand::ReleaseWorld { save_id, reply }) => {
+                        match shared_world_slot(&mut slots, &save_id) {
+                            Ok(slot) => {
+                                if let Some(lease) = lease_task.as_ref() {
+                                    lease.release(save_id.clone());
+                                }
+                                let _ = events_tx.try_send(AgentEvent::WorldReleased {
+                                    save_id: save_id.clone(),
+                                    game_slug: slot.save.game_slug.clone(),
+                                });
+                                let _ = reply.send(Ok(()));
+                            }
+                            Err(refused) => {
+                                let _ = reply.send(Err(refused));
+                            }
+                        }
+                    }
+                    Some(AgentCommand::DismissWorld { save_id, reply }) => {
+                        match shared_world_slot(&mut slots, &save_id) {
+                            Ok(slot) => {
+                                crate::claim::on_dismiss(slot);
+                                let _ = reply.send(Ok(()));
+                            }
+                            Err(refused) => {
+                                let _ = reply.send(Err(refused));
+                            }
                         }
                     }
                     Some(AgentCommand::SideCopied { save_id, dir, moved }) => {
@@ -2559,18 +2631,24 @@ async fn run_agent(
                     Some(AgentCommand::SessionStarted { save_id }) => {
                         crate::claim::on_game_started(&mut slots, &save_id, TokioInstant::now(), &events_tx);
                     }
-                    Some(AgentCommand::ForceWorld { save_id }) => {
-                        if let Some(slot) = slots.get_mut(&save_id) {
-                            slot.role = WorldRole::Host;
-                            crate::claim::on_claim(slot);
-                            if let Some(lease) = lease_task.as_ref() {
-                                // The task runs them in order: the takeover,
-                                // then the acquire with this machine's head.
-                                slot.lease_requested = true;
-                                lease.force(save_id.clone());
-                                lease.acquire(save_id.clone(), slot.known_version.unwrap_or(0));
+                    Some(AgentCommand::ForceWorld { save_id, reply }) => {
+                        match shared_world_slot(&mut slots, &save_id) {
+                            Ok(slot) => {
+                                slot.role = WorldRole::Host;
+                                crate::claim::on_claim(slot);
+                                if let Some(lease) = lease_task.as_ref() {
+                                    // The task runs them in order: the takeover,
+                                    // then the acquire with this machine's head.
+                                    slot.lease_requested = true;
+                                    lease.force(save_id.clone());
+                                    lease.acquire(save_id.clone(), slot.known_version.unwrap_or(0));
+                                }
+                                crate::claim::dismiss_siblings(&mut slots, &save_id);
+                                let _ = reply.send(Ok(()));
                             }
-                            crate::claim::dismiss_siblings(&mut slots, &save_id);
+                            Err(refused) => {
+                                let _ = reply.send(Err(refused));
+                            }
                         }
                     }
                     Some(AgentCommand::QueryStatus(resp)) => {
@@ -6767,6 +6845,127 @@ mod tests {
             }),
             include: Vec::new(),
         }
+    }
+
+    fn world_refusal(err: anyhow::Error) -> WorldCommandError {
+        err.downcast::<WorldCommandError>()
+            .expect("a typed world refusal")
+    }
+
+    /// Every world verb on a save the engine does not track is refused as
+    /// `not_watched`, and on a tracked save with no group as `not_shared`;
+    /// neither emits a world event.
+    #[tokio::test(start_paused = true)]
+    async fn world_verbs_refuse_a_save_that_is_not_a_shared_world_here() {
+        let tmp = tempfile::tempdir().expect("create tempdir");
+        let api = ApiClient::new("http://127.0.0.1:1", "fake").expect("fake api client");
+        let (events_tx, mut events_rx) = mpsc::channel::<AgentEvent>(64);
+        let mut plain = shared_world("plain-1", tmp.path());
+        plain.shared = None;
+
+        let (handle, task) = spawn(api, claim_config(), vec![plain], events_tx);
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        for (id, want) in [
+            ("ghost", WorldCommandError::NotWatched("ghost".into())),
+            ("plain-1", WorldCommandError::NotShared("plain-1".into())),
+        ] {
+            let refused = [
+                handle.claim_world(id.into(), WorldRole::Host).await,
+                handle.release_world(id.into()).await,
+                handle.force_world(id.into()).await,
+                handle.dismiss_world(id.into()).await,
+            ];
+            for result in refused {
+                assert_eq!(world_refusal(result.unwrap_err()), want);
+            }
+        }
+        assert_eq!(
+            WorldCommandError::NotWatched("ghost".into()).code(),
+            "not_watched"
+        );
+        assert_eq!(
+            WorldCommandError::NotShared("plain-1".into()).code(),
+            "not_shared"
+        );
+
+        let _ = handle.shutdown().await;
+        let _ = tokio::time::timeout(Duration::from_secs(2), task).await;
+        while let Ok(evt) = events_rx.try_recv() {
+            assert!(
+                !matches!(
+                    evt,
+                    AgentEvent::WorldClaimed { .. } | AgentEvent::WorldReleased { .. }
+                ),
+                "a refused verb acted: {evt:?}"
+            );
+        }
+    }
+
+    /// On a shared world each verb answers `Ok` and does what it did before
+    /// the answer existed: a claim and a release still announce themselves.
+    #[tokio::test(start_paused = true)]
+    async fn world_verbs_on_a_shared_world_answer_ok() {
+        let tmp = tempfile::tempdir().expect("create tempdir");
+        let api = ApiClient::new("http://127.0.0.1:1", "fake").expect("fake api client");
+        let (events_tx, mut events_rx) = mpsc::channel::<AgentEvent>(64);
+        let (lease, mut seen) = crate::lease::LeaseHandle::probe();
+
+        let (handle, task) = spawn(
+            api,
+            claim_config(),
+            vec![shared_world("world-1", tmp.path())],
+            events_tx,
+        );
+        handle.attach_lease(lease).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        handle
+            .claim_world("world-1".into(), WorldRole::Host)
+            .await
+            .expect("a claim on a shared world");
+        handle
+            .release_world("world-1".into())
+            .await
+            .expect("a release on a shared world");
+        handle
+            .force_world("world-1".into())
+            .await
+            .expect("a force on a shared world");
+        handle
+            .dismiss_world("world-1".into())
+            .await
+            .expect("a dismiss on a shared world");
+
+        let mut claimed = false;
+        let mut released = false;
+        while let Ok(evt) = events_rx.try_recv() {
+            match evt {
+                AgentEvent::WorldClaimed { save_id, .. } if save_id == "world-1" => claimed = true,
+                AgentEvent::WorldReleased { save_id, .. } if save_id == "world-1" => {
+                    released = true
+                }
+                _ => {}
+            }
+        }
+        assert!(claimed, "the claim was not announced");
+        assert!(released, "the release was not announced");
+
+        // The probe forwards from its own task: let it run before draining.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let mut asked = Vec::new();
+        while let Ok(msg) = seen.try_recv() {
+            asked.push(msg);
+        }
+        for want in ["acquire world-1", "release world-1", "force world-1"] {
+            assert!(
+                asked.iter().any(|a| a == want),
+                "the lease task was not asked to {want}: {asked:?}"
+            );
+        }
+
+        let _ = handle.shutdown().await;
+        let _ = tokio::time::timeout(Duration::from_secs(2), task).await;
     }
 
     fn claim_config() -> AgentConfig {
