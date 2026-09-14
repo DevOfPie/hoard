@@ -33,7 +33,7 @@ use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use hoard_agent::agent::{self, AgentConfig, AgentEvent, AgentHandle, WatchedSave};
+use hoard_agent::agent::{self, AgentConfig, AgentEvent, AgentHandle};
 use hoard_agent::api::ApiClient;
 use hoard_agent::config::CliConfig;
 use hoard_agent::lease::LeaseHandle;
@@ -935,16 +935,27 @@ pub async fn reload(engine: &Engine) -> anyhow::Result<usize> {
     Ok(watched)
 }
 
-/// Re-seats one save the way [`reload`] would if its row were new: out and back
-/// in, so the slot picks up what changed on the row (a share's include list, a
-/// cleared one). `reload` only diffs by id and would leave the old slot.
-pub async fn reseat(engine: &Engine, save: WatchedSave) -> anyhow::Result<()> {
+/// Applies what a settings change asks of the live engine: a `Reseat` is out
+/// and back in, so the slot picks up what changed on the row (a share's
+/// include list, a cleared one), where [`reload`] only diffs by id and would
+/// leave the old slot. The row is already written, so a slot that cannot be
+/// touched is logged, not reported: the next `Reload` or restart seats it.
+pub async fn apply_reseat(engine: &Engine, reseat: library::LiveReseat) {
     let Some(handle) = engine.handle() else {
-        anyhow::bail!("the engine isn't running");
+        return;
     };
-    handle.remove_save(save.save_id.clone()).await?;
-    handle.add_save(save).await?;
-    Ok(())
+    let applied = match reseat {
+        library::LiveReseat::Noop => Ok(()),
+        library::LiveReseat::Detach(id) => handle.remove_save(id).await,
+        library::LiveReseat::Attach(save) => handle.add_save(*save).await,
+        library::LiveReseat::Reseat(id, save) => match handle.remove_save(id).await {
+            Ok(()) => handle.add_save(*save).await,
+            Err(e) => Err(e),
+        },
+    };
+    if let Err(err) = applied {
+        tracing::warn!(error = %format!("{err:#}"), "hoardd: couldn't re-seat the save");
+    }
 }
 
 #[cfg(test)]

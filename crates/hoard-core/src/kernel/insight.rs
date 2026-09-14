@@ -294,15 +294,7 @@ pub fn pick_protagonist(files: &[FileFacts], shields: &[String]) -> Option<Prota
     // already filtered through it.
     let saves: Vec<&FileFacts> = files
         .iter()
-        .filter(|f| {
-            classify(
-                &f.relative_path,
-                Scope {
-                    shields,
-                    include: &[],
-                },
-            ) == FileClass::SaveData
-        })
+        .filter(|f| classify(&f.relative_path, Scope::shields_only(shields)) == FileClass::SaveData)
         .collect();
     if saves.is_empty() {
         return None;
@@ -347,14 +339,7 @@ fn rank(f: &FileFacts) -> (bool, i64, i64) {
 fn count_entries(files: &[FileFacts], shields: &[String]) -> u32 {
     let mut seen: Vec<&str> = Vec::new();
     for f in files {
-        if classify(
-            &f.relative_path,
-            Scope {
-                shields,
-                include: &[],
-            },
-        ) != FileClass::SaveData
-        {
+        if classify(&f.relative_path, Scope::shields_only(shields)) != FileClass::SaveData {
             continue;
         }
         let head = f.relative_path.split('/').next().unwrap_or("");

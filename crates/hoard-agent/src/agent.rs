@@ -263,9 +263,10 @@ pub struct WatchedSave {
     #[serde(default)]
     pub track_only: bool,
     /// The save lives in a group namespace: a push needs the hosting lease,
-    /// which the reducer holds for until the lease task says it is ours.
+    /// which the reducer holds for until the lease task says it is ours. The
+    /// row's [`crate::state::SharedRef`], names and include list alike.
     #[serde(default)]
-    pub shared: bool,
+    pub shared: Option<crate::state::SharedRef>,
     /// What the shared save consists of (`SaveState::include`): every walk of
     /// the folder on this slot, backup, fingerprint, restore and merge, goes
     /// through the same list, or the fingerprint never settles.
@@ -1008,7 +1009,7 @@ fn observe_local_fingerprint(path: &Path, game_slug: &str, include: &[String]) -
 fn state_from_slot(slot: &SaveSlot, config: &AgentConfig, now: OffsetDateTime) -> kernel::State {
     kernel::State {
         track_only: slot.save.track_only,
-        shared: slot.save.shared,
+        shared: slot.save.shared.is_some(),
         restore_enabled: slot
             .save
             .policy
@@ -1631,7 +1632,7 @@ fn request_lease(
     let Some(slot) = slots.get_mut(id) else {
         return;
     };
-    if !slot.save.shared
+    if slot.save.shared.is_none()
         || !slot.has_pending
         || slot.role != WorldRole::Host
         || slot.lease_requested
@@ -3356,6 +3357,12 @@ async fn run_auto_restore(
         .await
         .with_context(|| format!("creating staging dir {}", staging.display()))?;
 
+    // Auto-restore: gate shut unless the user opened it for this game. Writing
+    // the config of the PC that uploaded the snapshot over this one with nobody
+    // watching is exactly the crash to avoid, so the default stays no; but in
+    // some games the config and the save are the same file, and there keeping
+    // it shut restores half a save. The merge below walks the same lists.
+    let gate = save.gate(save.allow_device_local.unwrap_or(false));
     let download_result = crate::restore::download_snapshot(
         api,
         // The cloud's id for this row, which is what the manifest and blob
@@ -3373,16 +3380,7 @@ async fn run_auto_restore(
             // from R2, and the merge below treats them exactly like downloaded
             // ones (ADR 0021 D.13).
             reuse_from: Some(save.local_path.clone()),
-            // Auto-restore: gate shut unless the user opened it for this game.
-            // Writing the config of the PC that uploaded the snapshot over this
-            // one with nobody watching is exactly the crash to avoid, so the
-            // default stays no; but in some games the config and the save are
-            // the same file, and there keeping it shut restores half a save.
-            gate: hoard_core::kernel::fileclass::RestoreGate {
-                shields: crate::savefilter::shields_for_slug(&save.game_slug),
-                include: save.include.clone(),
-                allow_device_local: save.allow_device_local.unwrap_or(false),
-            },
+            gate: gate.clone(),
         },
         |_, _| {},
     )
@@ -3410,16 +3408,11 @@ async fn run_auto_restore(
         root.join(&save.save_id).join(ts)
     });
 
-    let shields = crate::savefilter::shields_for_slug(&save.game_slug);
-    let scope = Scope {
-        shields: &shields,
-        include: &save.include,
-    };
     let copy_result = restore_files_into(
         &save.local_path,
         &staging,
         conflict_backup_dir.as_deref(),
-        scope,
+        gate.scope(),
     )
     .await;
     cleanup_staging(&staging).await;
@@ -3448,7 +3441,7 @@ async fn run_auto_restore(
     // content half is fine because the fast-path skip only compares the cheap
     // half. Best-effort: a walk error just drops the redundant-upload
     // optimisation, never blocks the restore.
-    let disk_set_hash = crate::backup::walk_source(&save.local_path, scope)
+    let disk_set_hash = crate::backup::walk_source(&save.local_path, gate.scope())
         .ok()
         .map(|files| format!("{}:", crate::backup::compute_set_signature(&files)));
 
@@ -6110,7 +6103,7 @@ mod tests {
             known_version: None,
             set_hash: None,
             track_only: false,
-            shared: false,
+            shared: None,
             include: Vec::new(),
         }
     }
@@ -6235,7 +6228,7 @@ mod tests {
             known_version: None,
             set_hash: None,
             track_only: false,
-            shared: false,
+            shared: None,
             include: Vec::new(),
         };
         let mut slots = HashMap::new();
@@ -6277,7 +6270,7 @@ mod tests {
             known_version: None,
             set_hash: None,
             track_only: false,
-            shared: false,
+            shared: None,
             include: Vec::new(),
         };
         let mut slots = HashMap::new();
@@ -6401,7 +6394,7 @@ mod tests {
             known_version: None,
             set_hash: None,
             track_only: false,
-            shared: false,
+            shared: None,
             include: Vec::new(),
         };
 
@@ -6478,7 +6471,13 @@ mod tests {
             known_version: None,
             set_hash: None,
             track_only: false,
-            shared: true,
+            shared: Some(crate::state::SharedRef {
+                group_id: "g1".into(),
+                group_name: "the boys".into(),
+                owner_user_id: "u-owner".into(),
+                owner_username: "jacka".into(),
+                include: Vec::new(),
+            }),
             include: Vec::new(),
         };
         let config = AgentConfig {
@@ -6581,7 +6580,7 @@ mod tests {
             known_version: None,
             set_hash: None,
             track_only: false,
-            shared: false,
+            shared: None,
             include: Vec::new(),
         };
 

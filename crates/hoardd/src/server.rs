@@ -426,39 +426,22 @@ impl Daemon {
                 group_id,
                 world,
             } => {
-                let Some(client) = self.engine.client() else {
-                    return Reply::Error(IpcError::EngineDown {
-                        reason: self.engine.down_reason(),
-                    });
-                };
-                match hoard_agent::library::share_save(
-                    &client,
-                    &save_id,
-                    &group_id,
-                    world.as_deref(),
-                )
+                self.with_client(|c| async move {
+                    let (save, reseat) =
+                        hoard_agent::library::share_save(&c, &save_id, &group_id, world.as_deref())
+                            .await?;
+                    engine::apply_reseat(&self.engine, reseat).await;
+                    Ok(Payload::Save(Box::new(save)))
+                })
                 .await
-                {
-                    Ok((save, watched)) => {
-                        self.reseat(watched).await;
-                        Reply::Ok(Payload::Save(Box::new(save)))
-                    }
-                    Err(err) => self.share_error(err),
-                }
             }
             Request::UnshareSave { save_id } => {
-                let Some(client) = self.engine.client() else {
-                    return Reply::Error(IpcError::EngineDown {
-                        reason: self.engine.down_reason(),
-                    });
-                };
-                match hoard_agent::library::unshare_save(&client, &save_id).await {
-                    Ok(watched) => {
-                        self.reseat(watched).await;
-                        Reply::Ok(Payload::Ack)
-                    }
-                    Err(err) => self.share_error(err),
-                }
+                self.with_client(|c| async move {
+                    let reseat = hoard_agent::library::unshare_save(&c, &save_id).await?;
+                    engine::apply_reseat(&self.engine, reseat).await;
+                    Ok(Payload::Ack)
+                })
+                .await
             }
             Request::GetLease { save_id } => {
                 self.with_client(|c| async move {
@@ -536,20 +519,13 @@ impl Daemon {
         }
     }
 
-    /// The slot picks up its rewritten row. The share already happened on the
-    /// server, so a slot that cannot be re-seated is logged, not reported: the
-    /// next `Reload` or restart seats it from the row.
-    async fn reseat(&self, watched: Option<hoard_agent::agent::WatchedSave>) {
-        let Some(watched) = watched else { return };
-        if let Err(err) = engine::reseat(&self.engine, watched).await {
-            tracing::warn!(error = %format!("{err:#}"), "hoardd: couldn't re-seat the shared save");
-        }
-    }
-
-    /// A share refused before the server was asked (a world name that is not a
-    /// stem, a game with no template) is the caller's to fix, so it is
-    /// `Invalid`; the rest is the server's answer.
-    fn share_error(&self, err: anyhow::Error) -> Reply {
+    /// A 409 keeps its code: the client branches on `held`, `stale`, `pushed`
+    /// and the rest rather than on the sentence. A share refused before the
+    /// server was asked (a world name that is not a stem, a game with no
+    /// template) is the caller's to fix, so it is `Invalid`. Everything else is
+    /// `Internal`.
+    fn api_error(&self, err: anyhow::Error) -> Reply {
+        use hoard_agent::api::ApiError;
         if err
             .downcast_ref::<hoard_agent::library::ShareError>()
             .is_some()
@@ -558,13 +534,6 @@ impl Daemon {
                 message: format!("{err:#}"),
             });
         }
-        self.api_error(err)
-    }
-
-    /// A 409 keeps its code: the client branches on `held`, `stale`, `pushed`
-    /// and the rest rather than on the sentence. Everything else is `Internal`.
-    fn api_error(&self, err: anyhow::Error) -> Reply {
-        use hoard_agent::api::ApiError;
         let code = match err.downcast_ref::<ApiError>() {
             Some(ApiError::LeaseHeld(_)) => Some("held"),
             Some(ApiError::LeaseStale(_)) => Some("stale"),
