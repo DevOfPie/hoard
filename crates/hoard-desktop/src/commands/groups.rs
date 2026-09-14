@@ -6,7 +6,7 @@
 //! answer. The 409 codes the server uses (`held`, `stale`, `pushed`...) reach the
 //! UI as i18n keys so the dialog reads as a sentence, not as a tag.
 
-use hoard_core::ipc::{IpcError, Payload, Request, WorldFiles, WorldRole};
+use hoard_core::ipc::{IpcError, Payload, Request, WorldFiles, WorldLease, WorldRole};
 use hoard_core::wire::{Group, InviteOut, Lease, Save};
 use tauri::State;
 
@@ -199,13 +199,33 @@ pub async fn dismiss_world(save_id: String, state: State<'_, AppState>) -> Resul
 
 #[tauri::command]
 pub async fn get_lease(save_id: String, state: State<'_, AppState>) -> Result<LeaseView, AppError> {
-    match ask(&state, Request::GetLease { save_id }).await? {
+    match ask(
+        &state,
+        Request::GetLease {
+            save_id: save_id.clone(),
+        },
+    )
+    .await?
+    {
         Payload::Lease(lease) => {
             let lease = lease.map(|l| *l);
-            let my_fp = hoard_agent::logship::device_identity().fingerprint;
-            let here = lease
-                .as_ref()
-                .is_some_and(|l| l.holder_device_fp.as_deref() == Some(my_fp.as_str()));
+            // The engine decides by account when it has a slot for the save;
+            // only without one does the fingerprint on the lease say.
+            let engine = match ask(&state, Request::Status).await {
+                Ok(Payload::Status(status)) => status
+                    .slots
+                    .iter()
+                    .find(|s| s.save_id == save_id)
+                    .and_then(|s| s.lease),
+                _ => None,
+            };
+            let here = lease.as_ref().is_some_and(|l| match engine {
+                Some(verdict) => verdict == WorldLease::Mine,
+                None => {
+                    l.holder_device_fp.as_deref()
+                        == Some(hoard_agent::logship::device_identity().fingerprint.as_str())
+                }
+            });
             Ok(LeaseView { lease, here })
         }
         other => Err(unexpected("get_lease", other)),

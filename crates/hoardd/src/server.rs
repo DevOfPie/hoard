@@ -561,20 +561,11 @@ impl Daemon {
         }
     }
 
-    /// A share refused before the server was asked (a world name that is not a
-    /// stem, a game with no template, a template game with no world named) is
-    /// the caller's to fix, so it is `Invalid`. Server refusals keep a code; see
-    /// [`server_refusal`]. Everything else is `Internal`.
+    /// A share refused before the server was asked is the caller's to fix; see
+    /// [`share_refusal`]. Server refusals keep a code; see [`server_refusal`].
+    /// Everything else is `Internal`.
     fn api_error(&self, err: anyhow::Error) -> Reply {
-        if err
-            .downcast_ref::<hoard_agent::library::ShareError>()
-            .is_some()
-        {
-            return Reply::Error(IpcError::Invalid {
-                message: format!("{err:#}"),
-            });
-        }
-        if let Some(refusal) = server_refusal(&err) {
+        if let Some(refusal) = share_refusal(&err).or_else(|| server_refusal(&err)) {
             return Reply::Error(refusal);
         }
         tracing::warn!(error = %format!("{err:#}"), "hoardd: a server call failed");
@@ -875,6 +866,22 @@ fn server_refusal(err: &anyhow::Error) -> Option<IpcError> {
     })
 }
 
+/// A share the engine refused before asking the server. A template game with
+/// no world named is `Refused` with `needs_input` and the worlds it found, so
+/// the caller can ask for one; the rest (a world name that is not a stem, a
+/// game with no template) are `Invalid`.
+fn share_refusal(err: &anyhow::Error) -> Option<IpcError> {
+    use hoard_agent::library::ShareError;
+    let message = format!("{err:#}");
+    Some(match err.downcast_ref::<ShareError>()? {
+        ShareError::NeedsWorld { .. } => IpcError::Refused {
+            code: "needs_input".to_string(),
+            message,
+        },
+        _ => IpcError::Invalid { message },
+    })
+}
+
 /// The engine's refusal of a world verb (a save it does not watch, or does not
 /// share), as a `Refused` naming the save.
 fn world_refusal(err: &anyhow::Error) -> Option<IpcError> {
@@ -887,9 +894,10 @@ fn world_refusal(err: &anyhow::Error) -> Option<IpcError> {
 
 #[cfg(test)]
 mod tests {
-    use super::{server_refusal, world_refusal};
+    use super::{server_refusal, share_refusal, world_refusal};
     use hoard_agent::agent::WorldCommandError;
     use hoard_agent::api::{ApiError, RateLimitKind};
+    use hoard_agent::library::ShareError;
     use hoard_core::ipc::IpcError;
 
     /// An engine refusal crosses as `Refused` with its code and the save id.
@@ -908,6 +916,29 @@ mod tests {
             }
         }
         assert!(world_refusal(&anyhow::anyhow!("channel closed")).is_none());
+    }
+
+    /// A template game shared with no world is `needs_input` with the worlds;
+    /// the other share refusals stay `Invalid`, and anything else is not one.
+    #[test]
+    fn a_share_that_needs_a_world_asks_for_one() {
+        let needs = ShareError::NeedsWorld {
+            worlds: vec!["Alpha".into(), "Beta".into()],
+        };
+        match share_refusal(&anyhow::Error::new(needs)) {
+            Some(IpcError::Refused { code, message }) => {
+                assert_eq!(code, "needs_input");
+                assert!(message.ends_with("Alpha, Beta"), "{message}");
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        assert!(matches!(
+            share_refusal(&anyhow::Error::new(ShareError::NoTemplate(
+                "stardew".into()
+            ))),
+            Some(IpcError::Invalid { .. })
+        ));
+        assert!(share_refusal(&anyhow::Error::new(ApiError::NotFound)).is_none());
     }
 
     fn code_of(err: ApiError) -> Option<(&'static str, String)> {

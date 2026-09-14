@@ -150,8 +150,10 @@ pub fn classify(e: &anyhow::Error) -> Classified {
     // Refusals relayed by the service keep the server's tag: a 409 arrives
     // with the code the daemon names (`held`, `stale`, `lease_required`,
     // `not_shared`, `conflict`), still exit 1, and a request the user has to
-    // change is `bad_request`. Every other service failure stays generic; its
-    // message already says what happened.
+    // change is `bad_request`. Any other refusal is relayed with its code and
+    // grouped as the HTTP road groups the same answer. A service with no
+    // session to act with is the sign-in group. Every other service failure
+    // stays generic; its message already says what happened.
     match e.downcast_ref::<hoard_core::ipc::IpcError>() {
         Some(hoard_core::ipc::IpcError::Conflict { code, .. }) => {
             // An untagged 409 is still a conflict, never an empty code.
@@ -166,7 +168,19 @@ pub fn classify(e: &anyhow::Error) -> Classified {
                 retry_after_seconds: None,
             };
         }
+        Some(hoard_core::ipc::IpcError::Refused { code, .. }) => {
+            return Classified {
+                code: Cow::Owned(code.clone()),
+                exit: refused_exit(code),
+                retry_after_seconds: None,
+            };
+        }
         Some(hoard_core::ipc::IpcError::Invalid { .. }) => return plain("bad_request", 1),
+        Some(
+            hoard_core::ipc::IpcError::EngineDown { .. }
+            | hoard_core::ipc::IpcError::NoServerSession { .. }
+            | hoard_core::ipc::IpcError::CloudSessionExpired { .. },
+        ) => return plain("no_session", 2),
         _ => {}
     }
 
@@ -201,6 +215,20 @@ pub fn classify(e: &anyhow::Error) -> Classified {
         Some(ApiError::BadRequest(_)) => plain("bad_request", 1),
         Some(ApiError::Server { .. }) => plain("server", 1),
         None => plain("error", 1),
+    }
+}
+
+/// The exit group of a refusal the service relays, by its code: the same group
+/// the matching `ApiError` gets. A throttle's wait is in its message only.
+fn refused_exit(code: &str) -> i32 {
+    match code {
+        "unauthorized" | "forbidden" => 2,
+        "not_found" | "not_watched" => 3,
+        "throttled" => 4,
+        "quota_full" => 5,
+        // `bad_request`, `not_shared`, `needs_input` and whatever a newer
+        // service sends.
+        _ => 1,
     }
 }
 
@@ -305,6 +333,48 @@ mod tests {
         });
         assert_eq!(classify(&e).code, "bad_request");
         assert_eq!(format!("{e:#}"), "`a/b` is not a world name");
+    }
+
+    /// Every code the service relays lands in the group its HTTP twin does,
+    /// keeps its own name, and prints as the service's message.
+    #[test]
+    fn relayed_refusals_keep_their_code_and_group() {
+        use hoard_core::ipc::IpcError;
+        for (code, exit) in [
+            ("unauthorized", 2),
+            ("forbidden", 2),
+            ("not_found", 3),
+            ("not_watched", 3),
+            ("throttled", 4),
+            ("quota_full", 5),
+            ("bad_request", 1),
+            ("not_shared", 1),
+            ("needs_input", 1),
+            ("something_newer", 1),
+        ] {
+            let e = anyhow::Error::new(IpcError::Refused {
+                code: code.into(),
+                message: format!("refused: {code}"),
+            });
+            let c = classify(&e);
+            assert_eq!((c.code.as_ref(), c.exit), (code, exit), "{code}");
+            assert_eq!(c.retry_after_seconds, None);
+            assert_eq!(format!("{e:#}"), format!("refused: {code}"));
+        }
+        for e in [
+            IpcError::EngineDown {
+                reason: "no session".into(),
+            },
+            IpcError::NoServerSession {
+                reason: "none".into(),
+            },
+            IpcError::CloudSessionExpired {
+                reason: "revoked".into(),
+            },
+        ] {
+            let c = classify(&anyhow::Error::new(e));
+            assert_eq!((c.code.as_ref(), c.exit), ("no_session", 2));
+        }
     }
 
     #[test]

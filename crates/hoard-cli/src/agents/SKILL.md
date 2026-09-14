@@ -81,10 +81,10 @@ exit status grouped by what to do about it:
 
 | Exit | Meaning |
 |---|---|
-| 2 | Not signed in (`no_session`, `unauthorized`): tell the user to run `hoard login`; do not attempt it yourself |
-| 3 | It isn't there (`not_found`, `not_tracked`): re-read `hoard saves --json`, do not retry with a guessed id |
-| 4 | `rate_limited`: the envelope carries `retry_after_seconds`; wait that long, exactly once, and don't loop |
-| 5 | Storage limit (`quota_exceeded`, `too_large`, `archived`): will fail identically until the user frees space or upgrades |
+| 2 | Not signed in (`no_session`, `unauthorized`, `forbidden`): tell the user to run `hoard login`; do not attempt it yourself. A command that goes through the sync service gets `no_session` when the service has no session to act with |
+| 3 | It isn't there (`not_found`, `not_tracked`, `not_watched`): re-read `hoard saves --json`, do not retry with a guessed id |
+| 4 | `rate_limited`, or `throttled` from the sync service: `rate_limited` carries `retry_after_seconds`, `throttled` names the wait in its message; wait that long, exactly once, and don't loop |
+| 5 | Storage limit (`quota_exceeded`, `quota_full`, `too_large`, `archived`): will fail identically until the user frees space or upgrades |
 | 6 | Network (`network`, `storage_unreachable`): may work later |
 | 1 | `no_service`: the sync service isn't running, and groups, sharing and leases have nobody to ask without it: tell the user to run `hoard sync start` |
 | 1 | A shared save refused (`held`, `stale`, `lease_required`, `not_shared`, `conflict`): see below; retrying unchanged gets the same answer |
@@ -94,7 +94,9 @@ exit status grouped by what to do about it:
 
 Two codes are about you rather than the user's account: `needs_choice` and
 `needs_input` mean the command wanted to ask a question and found no terminal:
-re-run it with the flags the message names, never by feeding it input.
+re-run it with the flags the message names, never by feeding it input. `hoard
+share` answers `needs_input` for a game that shares one world at a time
+(Valheim) when `--world` is missing, and the message lists the worlds found.
 `needs_confirmation` means the command destroys something and nobody is there to
 say yes: bring it to the user and let them decide, and only pass `--yes` when
 they have said so about that exact command.
@@ -103,7 +105,8 @@ The shared-save codes name who is in the way. `held`: another member hosts the
 world, so this machine can only view it until they release. `stale`: the save
 moved past this machine's copy; it has to pull before it can host.
 `lease_required`: a push to a shared save without hosting it. `not_shared`: the
-save is not in a group. `conflict`: any other refusal; the message says which.
+save is not in a group. `hoard world` on a save this machine does not watch is
+`not_watched`, exit 3. `conflict`: any other refusal; the message says which.
 Tell the user; taking the lease with `hoard world force` takes it off a person,
 so only on their word.
 
@@ -130,18 +133,23 @@ Other things worth knowing before you act:
 These fields only appear on a self-hosted server with groups, so read them when
 present and do not expect them otherwise:
 
-- `hoard saves --json`: each row has `group` (null when not shared) and, while
-  somebody holds a live lease, `hosted`: `"hosted here"` or `"hosted by
-  <name>"`. No `hosted` means nobody hosts, or there was no service to ask.
+- `hoard saves --json`: each row has `group` (null when not shared). A shared
+  row also has `lease`, one of `"mine"`, `"other"`, `"free"` or `"unknown"`,
+  and `hosted`, the same as text: `"hosted here"`, `"hosted by <name>"`,
+  `"hosted elsewhere"`, `"nobody"` or `"unknown"`. Branch on `lease`, not on
+  `hosted`. Both are the sync service's last word on the lease, and both are
+  absent when there was no service to ask.
 - `hoard status --json`: `shared` lists this machine's shared saves, each with
-  `save_id`, `game_slug`, `label`, `group` and the same optional `hosted`. An
-  empty list is also what you get when local state could not be read.
+  `save_id`, `game_slug`, `label`, `group` and the same optional `hosted` and
+  `lease`. An empty list is also what you get when local state could not be
+  read.
 - `hoard group list --json`: `groups`, each with `id`, `name`, `owner` and
   `members` (a count).
 - `hoard share --json`: the save as shared, with `group_id`, `group_name`,
   `owner` and `include`, the files members pull (empty for the whole folder).
 - `hoard world lease <save_id> --json`: `save_id` and `lease`, null when nobody
-  holds it, otherwise `holder`, `here` (this machine holds it), `acquired_at`,
+  holds it, otherwise `holder`, `here` (held by this machine's account, as the
+  sync service sees it), `acquired_at`,
   `renewed_at`, `base_version`, `live` and `pushed_since`.
 
 ## Safety rules

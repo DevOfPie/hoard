@@ -29,9 +29,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   is refused until `--world` names one, with the worlds it found. `hoard world`
   claims a shared world to host or only view, releases it, forces an idle lease
   off its holder, and shows who holds it. `hoard saves` gains a HOST column and
-  `hoard status` lists the shared saves, both saying who hosts each. Every one
-  of these asks the sync service, which holds the session, so they need it
-  running (`hoard sync start`).
+  `hoard status` lists the shared saves, both saying who hosts each as the
+  sync service last heard it. The group, share and world commands go through
+  the service, which holds the session, so they need it running (`hoard sync
+  start`); without it the tables print as before, with no HOST column.
 
 ## [1.1.7] - 2026-09-13
 

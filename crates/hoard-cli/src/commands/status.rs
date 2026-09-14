@@ -6,7 +6,7 @@ use hoard_agent::config::CliConfig;
 use hoard_agent::session;
 use hoard_agent::state::CliState;
 
-use super::{link, world};
+use super::world;
 use crate::output;
 
 #[derive(Serialize)]
@@ -27,10 +27,12 @@ pub struct SharedRow {
     pub game_slug: String,
     pub label: String,
     pub group: String,
-    /// "hosted here" or "hosted by <name>" while a live lease is held. Absent
-    /// when nobody hosts, or with no service to ask.
+    /// Who hosts it, as in `hoard saves`. Absent with no service to ask.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub hosted: Option<String>,
+    /// "mine", "other", "free" or "unknown"; present exactly when `hosted` is.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lease: Option<&'static str>,
 }
 
 pub async fn run() -> Result<()> {
@@ -66,21 +68,20 @@ pub async fn run() -> Result<()> {
     })
 }
 
-/// This machine's shared saves, with the holder from the service when there is
-/// one to ask. Local state otherwise: the list is still right, only the holder
-/// is unknown.
+/// This machine's shared saves, with who hosts each from one status read of
+/// the service when there is one. Local state otherwise: the list is still
+/// right, only the host is left out.
 async fn shared_saves() -> Vec<SharedRow> {
     session::set_context_offline();
     let mut rows = shared_in(CliState::load_default().map(|(state, _)| state));
-    let mut service = if rows.is_empty() {
-        None
-    } else {
-        link::attached("status").await
-    };
-    let my_fp = world::this_device();
-    if let Some(client) = service.as_mut() {
+    if rows.is_empty() {
+        return rows;
+    }
+    if let Some(hosts) = world::Hosts::read().await {
         for row in &mut rows {
-            row.hosted = world::hosted(client, &row.save_id, &my_fp).await;
+            let host = hosts.of(&row.save_id);
+            row.hosted = Some(host.cell);
+            row.lease = Some(host.lease);
         }
     }
     rows
@@ -107,6 +108,7 @@ fn shared_in(loaded: Result<CliState>) -> Vec<SharedRow> {
                 label: s.label.clone(),
                 group: g.group_name.clone(),
                 hosted: None,
+                lease: None,
             })
         })
         .collect();
