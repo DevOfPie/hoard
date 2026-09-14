@@ -72,7 +72,8 @@ pub struct LeaseOut {
 pub struct LeaseDetail {
     pub holder: String,
     /// The lease is held here: the engine's verdict when it watches the save,
-    /// otherwise this machine's fingerprint against the one on the lease.
+    /// otherwise this machine's fingerprint against the one on the lease, for a
+    /// lease this account holds.
     pub here: bool,
     /// RFC3339.
     pub acquired_at: String,
@@ -176,9 +177,12 @@ pub async fn run(cmd: WorldCommand) -> Result<()> {
                 Ok(Payload::Status(status)) => Hosts::from_status(&status).lease(&save_id),
                 _ => None,
             };
+            let me = this_account();
             let out = LeaseOut {
                 save_id: save_id.clone(),
-                lease: lease.as_ref().map(|l| detail(l, engine, &this_device())),
+                lease: lease
+                    .as_ref()
+                    .map(|l| detail(l, engine, &this_device(), me.as_deref())),
             };
             output::emit(&out, |o| {
                 let Some(l) = &o.lease else {
@@ -249,6 +253,9 @@ pub enum Verdict {
     },
     /// Nothing settled before the deadline.
     Undecided,
+    /// Nothing settled, and the engine says the world is behind the head: the
+    /// acquire was refused as stale and a pull runs first.
+    Behind,
 }
 
 /// Reads the looks of one wait in order. `Mine` settles it at once. `Other`
@@ -296,18 +303,28 @@ fn verdict(looks: impl IntoIterator<Item = Seen>) -> Verdict {
 /// Look at the lease every [`POLL_EVERY`] until a verdict or [`VERDICT_WAIT`].
 async fn wait_for_verdict(client: &mut Client, save_id: &str) -> Verdict {
     let my_fp = this_device();
+    let me = this_account();
     let mut wait = Wait::default();
+    let behind = std::cell::Cell::new(false);
     let polls = async {
         loop {
             tokio::time::sleep(POLL_EVERY).await;
             // The engine's word on whose lease it is, when it has one; the
             // server's row for who holds it and whether they pushed.
             let engine = match link::ask(client, Request::Status).await {
-                Ok(Payload::Status(status)) => Hosts::from_status(&status).lease(save_id),
+                Ok(Payload::Status(status)) => {
+                    behind.set(
+                        status
+                            .slots
+                            .iter()
+                            .any(|s| s.save_id == save_id && s.lease_behind),
+                    );
+                    Hosts::from_status(&status).lease(save_id)
+                }
                 _ => None,
             };
             let seen = match lease(client, save_id).await {
-                Ok(lease) => seen(lease.as_ref(), engine, &my_fp),
+                Ok(lease) => seen(lease.as_ref(), engine, &my_fp, me.as_deref()),
                 Err(err) => {
                     tracing::debug!(error = %format!("{err:#}"), "cli: couldn't read the lease on {save_id}");
                     Seen::Unknown
@@ -318,18 +335,20 @@ async fn wait_for_verdict(client: &mut Client, save_id: &str) -> Verdict {
             }
         }
     };
-    tokio::time::timeout(VERDICT_WAIT, polls)
-        .await
-        .unwrap_or(Verdict::Undecided)
+    match tokio::time::timeout(VERDICT_WAIT, polls).await {
+        Ok(verdict) => verdict,
+        Err(_) if behind.get() => Verdict::Behind,
+        Err(_) => Verdict::Undecided,
+    }
 }
 
 /// One lease read as a look: a quiet lease is as good as free, and whose it is
 /// is the engine's word when it has one (see [`held_here`]).
-fn seen(lease: Option<&Lease>, engine: Option<WorldLease>, my_fp: &str) -> Seen {
+fn seen(lease: Option<&Lease>, engine: Option<WorldLease>, my_fp: &str, me: Option<&str>) -> Seen {
     match lease {
         None => Seen::Free,
         Some(l) if !l.live => Seen::Free,
-        Some(l) if held_here(l, engine, my_fp) => Seen::Mine,
+        Some(l) if held_here(l, engine, my_fp, me) => Seen::Mine,
         Some(l) => Seen::Other {
             holder: l.holder_username.to_string(),
             pushed: l.pushed_since,
@@ -343,6 +362,12 @@ fn outcome_of(save_id: &str, verdict: Verdict, force: bool) -> Result<Outcome> {
     match verdict {
         Verdict::Hosting => Ok(Outcome::Hosting),
         Verdict::Undecided => Ok(Outcome::Pending),
+        Verdict::Behind => Err(output::err(
+            "stale",
+            format!(
+                "{save_id} is behind the latest version; Hoard is pulling it, then claim again"
+            ),
+        )),
         Verdict::Held {
             holder,
             pushed: true,
@@ -441,21 +466,37 @@ fn this_device() -> String {
     hoard_agent::logship::device_identity().fingerprint
 }
 
+/// This account's id as the self-hosted session caches it (`session.toml`), with
+/// no server call and no keyring. `None` when there is no session, or it was
+/// written from `config.toml` alone and never cached the whoami.
+pub fn this_account() -> Option<String> {
+    hoard_agent::credentials::load_public()
+        .ok()
+        .flatten()
+        .and_then(|(_, user)| user)
+        .map(|u| u.user_id)
+}
+
 /// Whether the lease is held here. The engine decides by account once it knows
 /// who holds the lease; while its slot reads unknown or free (just restarted),
-/// or it has no slot, the fingerprint on the lease says.
-fn held_here(lease: &Lease, engine: Option<WorldLease>, my_fp: &str) -> bool {
+/// or it has no slot, the fingerprint on the lease says, and only for a lease
+/// this account holds: two accounts on one computer share the fingerprint. An
+/// account that cannot be known here is not the holder.
+fn held_here(lease: &Lease, engine: Option<WorldLease>, my_fp: &str, me: Option<&str>) -> bool {
     match engine {
         Some(WorldLease::Mine) => true,
         Some(WorldLease::Other) => false,
-        _ => lease.holder_device_fp.as_deref() == Some(my_fp),
+        _ => {
+            lease.holder_device_fp.as_deref() == Some(my_fp)
+                && me == Some(lease.holder_user_id.as_str())
+        }
     }
 }
 
-fn detail(lease: &Lease, engine: Option<WorldLease>, my_fp: &str) -> LeaseDetail {
+fn detail(lease: &Lease, engine: Option<WorldLease>, my_fp: &str, me: Option<&str>) -> LeaseDetail {
     LeaseDetail {
         holder: lease.holder_username.to_string(),
-        here: held_here(lease, engine, my_fp),
+        here: held_here(lease, engine, my_fp, me),
         acquired_at: rfc3339(lease.acquired_at),
         renewed_at: rfc3339(lease.renewed_at),
         base_version: lease.base_version,
@@ -507,16 +548,49 @@ mod tests {
         );
         // The engine's verdict wins over the fingerprint, both ways.
         let l = lease(Some("fp-them"), true);
-        assert!(held_here(&l, Some(WorldLease::Mine), "fp-me"));
+        assert!(held_here(&l, Some(WorldLease::Mine), "fp-me", Some("u2")));
         let l = lease(Some("fp-me"), true);
-        assert!(!held_here(&l, Some(WorldLease::Other), "fp-me"));
+        assert!(!held_here(&l, Some(WorldLease::Other), "fp-me", Some("u2")));
         // With no slot the fingerprint decides.
-        assert!(held_here(&l, None, "fp-me"));
+        assert!(held_here(&l, None, "fp-me", Some("u2")));
         // Just restarted, the engine has not heard who holds it: the
         // fingerprint still says, either way.
-        assert!(held_here(&l, Some(WorldLease::Unknown), "fp-me"));
-        assert!(held_here(&l, Some(WorldLease::Free), "fp-me"));
-        assert!(!held_here(&l, Some(WorldLease::Unknown), "fp-other"));
+        assert!(held_here(
+            &l,
+            Some(WorldLease::Unknown),
+            "fp-me",
+            Some("u2")
+        ));
+        assert!(held_here(&l, Some(WorldLease::Free), "fp-me", Some("u2")));
+        assert!(!held_here(
+            &l,
+            Some(WorldLease::Unknown),
+            "fp-other",
+            Some("u2")
+        ));
+    }
+
+    /// Two accounts on one computer share its fingerprint: the fallback also
+    /// needs the lease to be this account's, and an account it cannot know is
+    /// not the holder. The engine's verdict still wins.
+    #[test]
+    fn a_lease_of_another_account_on_this_machine_is_not_hosted_here() {
+        let l = lease(Some("fp-me"), true);
+        assert!(!held_here(&l, None, "fp-me", Some("u3")));
+        assert!(!held_here(
+            &l,
+            Some(WorldLease::Unknown),
+            "fp-me",
+            Some("u3")
+        ));
+        assert!(!held_here(&l, Some(WorldLease::Free), "fp-me", Some("u3")));
+        assert!(!held_here(&l, None, "fp-me", None));
+        assert!(held_here(&l, Some(WorldLease::Mine), "fp-me", None));
+        assert_eq!(
+            seen(Some(&l), None, "fp-me", Some("u3")),
+            other("alice", false)
+        );
+        assert!(!detail(&l, None, "fp-me", Some("u3")).here);
     }
 
     #[test]
@@ -528,7 +602,7 @@ mod tests {
         assert_eq!(host(WorldLease::Other, None).cell, "hosted elsewhere");
         assert_eq!(host(WorldLease::Other, None).lease, "other");
         // A server that kept no fingerprint is not held here.
-        assert!(!held_here(&lease(None, true), None, "fp-me"));
+        assert!(!held_here(&lease(None, true), None, "fp-me", Some("u2")));
     }
 
     /// Every shared save gets a cell: a slot the engine has no lease for, or
@@ -547,6 +621,7 @@ mod tests {
             shared: lease.is_some(),
             lease,
             lease_holder: holder.map(String::from),
+            lease_behind: false,
         };
         let mut status: DaemonStatus = serde_json::from_value(serde_json::json!({
             "daemon_version": "0", "protocol": 1, "pid": 1, "epoch": "e",
@@ -582,7 +657,12 @@ mod tests {
         );
         let some = LeaseOut {
             save_id: "s1".into(),
-            lease: Some(detail(&lease(Some("fp-me"), true), None, "fp-me")),
+            lease: Some(detail(
+                &lease(Some("fp-me"), true),
+                None,
+                "fp-me",
+                Some("u2"),
+            )),
         };
         let v = serde_json::to_value(&some).unwrap();
         assert_eq!(v["lease"]["holder"], "alice");
@@ -666,17 +746,27 @@ mod tests {
 
     #[test]
     fn a_lease_reads_as_a_look() {
-        assert_eq!(seen(None, None, "fp-me"), Seen::Free);
+        assert_eq!(seen(None, None, "fp-me", Some("u2")), Seen::Free);
         assert_eq!(
-            seen(Some(&lease(Some("fp-me"), false)), None, "fp-me"),
+            seen(
+                Some(&lease(Some("fp-me"), false)),
+                None,
+                "fp-me",
+                Some("u2")
+            ),
             Seen::Free
         );
         assert_eq!(
-            seen(Some(&lease(Some("fp-me"), true)), None, "fp-me"),
+            seen(Some(&lease(Some("fp-me"), true)), None, "fp-me", Some("u2")),
             Seen::Mine
         );
         assert_eq!(
-            seen(Some(&lease(Some("fp-them"), true)), None, "fp-me"),
+            seen(
+                Some(&lease(Some("fp-them"), true)),
+                None,
+                "fp-me",
+                Some("u2")
+            ),
             other("alice", false)
         );
     }
@@ -731,17 +821,42 @@ mod tests {
     fn a_look_takes_the_engines_word_on_whose_lease_it_is() {
         let theirs_by_fp = lease(Some("fp-them"), true);
         assert!(matches!(
-            seen(Some(&theirs_by_fp), Some(WorldLease::Mine), "fp-me"),
+            seen(
+                Some(&theirs_by_fp),
+                Some(WorldLease::Mine),
+                "fp-me",
+                Some("u2")
+            ),
             Seen::Mine
         ));
         let mine_by_fp = lease(Some("fp-me"), true);
         assert!(matches!(
-            seen(Some(&mine_by_fp), Some(WorldLease::Other), "fp-me"),
+            seen(
+                Some(&mine_by_fp),
+                Some(WorldLease::Other),
+                "fp-me",
+                Some("u2")
+            ),
             Seen::Other { .. }
         ));
         assert!(matches!(
-            seen(Some(&mine_by_fp), Some(WorldLease::Unknown), "fp-me"),
+            seen(
+                Some(&mine_by_fp),
+                Some(WorldLease::Unknown),
+                "fp-me",
+                Some("u2")
+            ),
             Seen::Mine
         ));
+    }
+
+    /// A claim that runs out of time while the engine pulls the head answers
+    /// `stale`, not a success-shaped pending.
+    #[test]
+    fn a_world_behind_the_head_answers_stale() {
+        let err = outcome_of("s-1", Verdict::Behind, false).unwrap_err();
+        let c = output::classify(&err);
+        assert_eq!((c.code.as_ref(), c.exit), ("stale", 1));
+        assert!(err.to_string().contains("behind"), "{err}");
     }
 }

@@ -509,4 +509,9 @@ pub struct AgentSlotStatus {
     /// Who hosts it, when the lease is somebody else's.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lease_holder: Option<String>,
+    /// A shared world whose acquire was refused as stale: Hoard is pulling the
+    /// head before it can host. Absent from an older service, which reads as
+    /// `false`.
+    #[serde(default)]
+    pub lease_behind: bool,
 }

@@ -618,6 +618,9 @@ export type AgentSlotStatus = {
   lease?: WorldLease | null;
   /** Who hosts it, when the lease is somebody else's. */
   lease_holder?: string | null;
+  /** The acquire was refused as behind the head: the service is pulling the
+   *  latest version before it can host. Absent from an older service. */
+  lease_behind?: boolean;
 };
 
 export type BackupReason = "filesystem_settled" | "game_stopped" | "manual";

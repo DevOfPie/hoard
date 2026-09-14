@@ -191,6 +191,9 @@ trait LeaseSink: Send + Sync + 'static {
         holder: Option<String>,
         verdict: bool,
     ) -> impl Future<Output = ()> + Send;
+    /// The verdict on an acquire refused as stale at `base_version`: the lease
+    /// is free and this machine has to pull before it can hold it.
+    fn stale(&self, save_id: String, base_version: i64) -> impl Future<Output = ()> + Send;
 }
 
 impl LeaseSink for AgentHandle {
@@ -207,6 +210,12 @@ impl LeaseSink for AgentHandle {
             AgentHandle::set_lease(self, save_id, lease, holder).await
         };
         if let Err(e) = sent {
+            tracing::debug!(error = %e, "lease: the engine is gone");
+        }
+    }
+
+    async fn stale(&self, save_id: String, base_version: i64) {
+        if let Err(e) = self.lease_stale(save_id, base_version).await {
             tracing::debug!(error = %e, "lease: the engine is gone");
         }
     }
@@ -380,13 +389,14 @@ async fn acquire<A: LeaseApi, S: LeaseSink>(
                 sink.set_lease(save_id, LeaseObs::Other, holder, true).await;
             }
             Some(ApiError::LeaseStale(st)) => {
-                // Nobody holds it; this machine is behind. The pull is the
-                // reducer's business, and it asks again once its head moved.
+                // Nobody holds it; this machine is behind. The engine is told
+                // it is stale, not only free, so it brings the head down; it
+                // asks again once its head moved.
                 tracing::info!(save_id = %save_id, head = ?st.head(), "lease: refused, pull first");
                 wanted.remove(&save_id);
                 held.remove(&save_id);
                 stale.insert(save_id.clone(), base_version);
-                sink.set_lease(save_id, LeaseObs::Free, None, true).await;
+                sink.stale(save_id, base_version).await;
             }
             _ if refusal(&e).is_some() => {
                 // A verdict with nothing to hold: not shared, not found, not
@@ -537,7 +547,11 @@ mod tests {
 
     /// What the engine was told, and beside it whether each was a verdict.
     #[derive(Clone, Default)]
-    struct Recorder(Arc<Mutex<Seen>>, Arc<Mutex<Vec<bool>>>);
+    struct Recorder(
+        Arc<Mutex<Seen>>,
+        Arc<Mutex<Vec<bool>>>,
+        Arc<Mutex<Vec<(String, i64)>>>,
+    );
 
     impl LeaseSink for Recorder {
         fn set_lease(
@@ -549,6 +563,16 @@ mod tests {
         ) -> impl Future<Output = ()> + Send {
             self.0.lock().unwrap().push((save_id, lease, holder));
             self.1.lock().unwrap().push(verdict);
+            async {}
+        }
+        fn stale(&self, save_id: String, base_version: i64) -> impl Future<Output = ()> + Send {
+            // Recorded as the free verdict it carries, and apart as stale.
+            self.0
+                .lock()
+                .unwrap()
+                .push((save_id.clone(), LeaseObs::Free, None));
+            self.1.lock().unwrap().push(true);
+            self.2.lock().unwrap().push((save_id, base_version));
             async {}
         }
     }
@@ -779,6 +803,23 @@ mod tests {
         assert_eq!(
             sink.0.lock().unwrap().last(),
             Some(&("w1".to_string(), LeaseObs::Mine, Some("me".to_string())))
+        );
+    }
+
+    /// A stale refusal reaches the engine as stale, with the base it refused,
+    /// and as the verdict it is, so the engine pulls instead of waiting.
+    #[tokio::test(start_paused = true)]
+    async fn a_stale_refusal_is_reported_to_the_engine() {
+        let fake = Fake::default();
+        fake.0.acquire.lock().unwrap().push(Err(stale(4, 1)));
+        let (h, sink, _task) = start(fake.clone());
+        h.acquire("w1", 1);
+        settle().await;
+        assert_eq!(*sink.2.lock().unwrap(), vec![("w1".to_string(), 1)]);
+        assert_eq!(*sink.1.lock().unwrap(), vec![true]);
+        assert_eq!(
+            sink.0.lock().unwrap().last(),
+            Some(&("w1".to_string(), LeaseObs::Free, None))
         );
     }
 

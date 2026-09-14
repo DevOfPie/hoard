@@ -1489,6 +1489,10 @@ pub struct HomeForRestore {
     /// What the save consists of when it is shared, from the same server row:
     /// the safety copy and the gate walk it before the row exists here.
     pub include: Vec<String>,
+    /// The share behind `include`, from the same row: whose save it is decides
+    /// whether an explicit restore narrows to it
+    /// ([`crate::savefilter::restore_include`]).
+    pub shared: Option<crate::state::SharedRef>,
 }
 
 /// Checks `local_path` as the folder `save_id` will live in on this machine,
@@ -1527,10 +1531,15 @@ pub async fn plan_home_for_restore(
             game_slug: row.game_slug.clone(),
             label: row.label.clone(),
             include: row.include.clone(),
+            shared: row.shared.clone(),
         });
     }
 
-    let (game_slug, label, include) = server_name_of(client, save_id).await?;
+    let (game_slug, label, shared) = server_name_of(client, save_id).await?;
+    let include = shared
+        .as_ref()
+        .map(|s| s.include.clone())
+        .unwrap_or_default();
     reject_degenerate_slug(&game_slug)?;
     restore_twin(&state, save_id, &game_slug, &label, local_path)?;
     Ok(HomeForRestore {
@@ -1545,6 +1554,7 @@ pub async fn plan_home_for_restore(
         game_slug,
         label,
         include,
+        shared,
     })
 }
 
@@ -1562,13 +1572,13 @@ impl HomeForRestore {
     }
 }
 
-/// The `(game_slug, label, include)` the server files a save under. Cloud
+/// The `(game_slug, label, share)` the server files a save under. Cloud
 /// mounts no `GET /v1/saves/:id` and has no groups, so there it comes out of
-/// the sync manifest with an empty list.
+/// the sync manifest with no share.
 async fn server_name_of(
     client: &ApiClient,
     save_id: &str,
-) -> Result<(String, String, Vec<String>)> {
+) -> Result<(String, String, Option<crate::state::SharedRef>)> {
     if client.is_cloud().await {
         let manifest = client.cloud_sync().await?;
         let entry = manifest
@@ -1576,11 +1586,11 @@ async fn server_name_of(
             .into_iter()
             .find(|e| e.save_id == save_id)
             .with_context(|| format!("the cloud has no save {save_id}"))?;
-        return Ok((entry.game_slug, entry.label, Vec::new()));
+        return Ok((entry.game_slug, entry.label, None));
     }
     let save = client.get_save(save_id).await?;
-    let include = save.shared.map(|s| s.include).unwrap_or_default();
-    Ok((save.game_slug.into_inner(), save.label, include))
+    let shared = save.shared.as_ref().map(crate::state::SharedRef::from);
+    Ok((save.game_slug.into_inner(), save.label, shared))
 }
 
 fn format_optional_time(t: Option<OffsetDateTime>) -> Option<String> {
