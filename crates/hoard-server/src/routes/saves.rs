@@ -139,7 +139,8 @@ pub async fn list(
     let rows = if let Some(slug) = q.game_slug {
         sqlx::query_as!(
             SaveRow,
-            r#"SELECT s.id, s.game_slug, s.label, s.local_path_hint, s.client_os,
+            r#"SELECT s.id, s.user_id as owner_user_id, s.game_slug, s.label,
+                      s.local_path_hint, s.client_os,
                       s.latest_version_num, s.created_at, s.updated_at,
                       COALESCE(COUNT(sn.id), 0) as "snapshot_count: i64",
                       COALESCE(SUM(sn.total_size_bytes), 0) as "total_size_bytes: i64",
@@ -163,7 +164,8 @@ pub async fn list(
     } else {
         sqlx::query_as!(
             SaveRow,
-            r#"SELECT s.id, s.game_slug, s.label, s.local_path_hint, s.client_os,
+            r#"SELECT s.id, s.user_id as owner_user_id, s.game_slug, s.label,
+                      s.local_path_hint, s.client_os,
                       s.latest_version_num, s.created_at, s.updated_at,
                       COALESCE(COUNT(sn.id), 0) as "snapshot_count: i64",
                       COALESCE(SUM(sn.total_size_bytes), 0) as "total_size_bytes: i64",
@@ -186,9 +188,17 @@ pub async fn list(
     }
     .map_err(|e| internal_logged_status("listing rows", e))?;
 
-    Ok(Json(
-        rows.into_iter().filter_map(SaveRow::into_wire).collect(),
-    ))
+    let mut out = Vec::with_capacity(rows.len());
+    for row in rows {
+        if let Some(save) = row
+            .into_visible(&state.pool, &user_id)
+            .await
+            .map_err(|e| internal_logged_status("reading a member's totals", e))?
+        {
+            out.push(save);
+        }
+    }
+    Ok(Json(out))
 }
 
 /// One save by id, for its owner or a member of the group it is shared into.
@@ -415,6 +425,7 @@ pub async fn delete(
 /// columns from every query so one conversion serves them all.
 struct SaveRow {
     id: String,
+    owner_user_id: String,
     game_slug: String,
     label: String,
     local_path_hint: Option<String>,
@@ -432,6 +443,39 @@ struct SaveRow {
 }
 
 impl SaveRow {
+    /// [`Self::into_wire`] as `user_id` may see it. The row's size sums every
+    /// file of every live version; a member of a share that names its files
+    /// reads only those, so for that caller alone the size is recomputed from
+    /// the live versions' manifests, matched the way the snapshot list matches
+    /// them. The owner and a member of an unfiltered share cost no query.
+    async fn into_visible(
+        self,
+        pool: &sqlx::SqlitePool,
+        user_id: &str,
+    ) -> Result<Option<Save>, sqlx::Error> {
+        let is_owner = self.owner_user_id == user_id;
+        let save_id = self.id.clone();
+        let Some(mut save) = self.into_wire() else {
+            return Ok(None);
+        };
+        let include = match &save.shared {
+            Some(shared) if !is_owner && !shared.include.is_empty() => &shared.include,
+            _ => return Ok(Some(save)),
+        };
+        let files: Vec<(String, i64)> = sqlx::query_as(
+            "SELECT sf.relative_path, sf.size_bytes
+             FROM snapshot_files sf
+             JOIN snapshots sn ON sn.id = sf.snapshot_id
+             WHERE sn.save_id = ? AND sn.deleted_at IS NULL",
+        )
+        .bind(&save_id)
+        .fetch_all(pool)
+        .await?;
+        let (_, size) = crate::routes::snapshots::included_totals(include, &files);
+        save.total_size_bytes = Some(size);
+        Ok(Some(save))
+    }
+
     /// `None` only for a row whose id is not a UUID (see [`parse_save_id`]).
     fn into_wire(self) -> Option<Save> {
         let shared = match (
@@ -483,9 +527,10 @@ pub(crate) async fn fetch_save(
     save_id: &str,
     user_id: &str,
 ) -> Result<Option<Save>, sqlx::Error> {
-    sqlx::query_as!(
+    let row = sqlx::query_as!(
         SaveRow,
-        r#"SELECT s.id, s.game_slug, s.label, s.local_path_hint, s.client_os,
+        r#"SELECT s.id, s.user_id as owner_user_id, s.game_slug, s.label,
+                  s.local_path_hint, s.client_os,
                   s.latest_version_num, s.created_at, s.updated_at,
                   COALESCE(COUNT(sn.id), 0) as "snapshot_count: i64",
                   COALESCE(SUM(sn.total_size_bytes), 0) as "total_size_bytes: i64",
@@ -505,8 +550,11 @@ pub(crate) async fn fetch_save(
         user_id
     )
     .fetch_optional(pool)
-    .await
-    .map(|opt| opt.and_then(SaveRow::into_wire))
+    .await?;
+    match row {
+        Some(row) => row.into_visible(pool, user_id).await,
+        None => Ok(None),
+    }
 }
 
 fn internal_err() -> (StatusCode, Json<serde_json::Value>) {

@@ -2349,7 +2349,9 @@ fn watched_from_snapshot(save_id: String, s: &SaveState) -> WatchedSave {
         processes,
         shared_processes: s.shared_processes,
         policy: resolve_policy(&s.game_slug, s.preset.as_deref()),
-        known_version: None,
+        // The row's cursor, as the hydrate carries it. `None` here sent the next
+        // acquire out at base 0 after a share, refused as stale against head.
+        known_version: s.last_version_num,
         set_hash: None,
         track_only: false,
         shared: s.shared.clone(),
@@ -2612,6 +2614,9 @@ pub fn world_files(game_slug: &str, root: &Path) -> Result<Vec<hoard_core::ipc::
 /// server's `shared` and `include`, and the [`LiveReseat`] that comes back
 /// puts the owner's next push over the world's files alone. `Noop` when the
 /// save is not tracked here (the server row is still shared) or is paused.
+///
+/// The row read and the world scan are blocking, so they run off the caller's
+/// task, as [`record_sharing`] does.
 pub async fn share_save(
     client: &ApiClient,
     save_id: &str,
@@ -2620,17 +2625,25 @@ pub async fn share_save(
 ) -> Result<(hoard_core::wire::Save, LiveReseat)> {
     // The template goes by game, and the row is the cheapest place to read it;
     // a save not tracked here still has a game on the server, and no folder.
-    let local = CliState::load_default().ok().and_then(|(state, _)| {
-        state
-            .saves
-            .get(save_id)
-            .map(|st| (st.game_slug.clone(), st.local_path.clone()))
-    });
-    let (slug, root) = match local {
-        Some((slug, root)) => (slug, Some(root)),
-        None => (client.get_save(save_id).await?.game_slug.into_inner(), None),
+    let id = save_id.to_string();
+    let named = world.map(str::to_string);
+    let local = tokio::task::spawn_blocking(move || {
+        let (slug, root) = CliState::load_default().ok().and_then(|(state, _)| {
+            state
+                .saves
+                .get(&id)
+                .map(|st| (st.game_slug.clone(), st.local_path.clone()))
+        })?;
+        Some(include_for_share(&slug, named.as_deref(), Some(&root)))
+    })
+    .await?;
+    let include = match local {
+        Some(include) => include?,
+        None => {
+            let slug = client.get_save(save_id).await?.game_slug.into_inner();
+            include_for_share(&slug, world, None)?
+        }
     };
-    let include = include_for_share(&slug, world, root.as_deref())?;
     hoard_core::wire::validate_include(&include).map_err(|m| anyhow::anyhow!(m))?;
     let save = client.share_save(save_id, group_id, &include).await?;
     let reseat = record_sharing(save_id.to_string(), save.shared.clone()).await?;
@@ -2695,7 +2708,7 @@ mod tests {
         apply_excluded_paths, auto_track_decision, conflicting_save, detected_paths_in, folder_key,
         local_detection, manual_override_conflict, occupied_slot, prune_poisoned_rows,
         reconcile_plan, resolve_processes, restore_twin, row_for_same_folder, rows_one_per_folder,
-        rows_unknown_to_server, spread_allow_device_local, superseded_rows,
+        rows_unknown_to_server, spread_allow_device_local, superseded_rows, watched_from_snapshot,
         watched_saves_from_state, AutoTrack, CachedDetection, ServerRow, ERR_SLOT_OCCUPIED,
     };
     use crate::detection::{
@@ -2721,6 +2734,17 @@ mod tests {
             processes: Vec::new(),
             shared_processes: false,
         }
+    }
+
+    /// A re-seat (a share, an unshare, a settings change) keeps the row's version
+    /// cursor. Without it the slot restarted at no version, and a shared save's
+    /// next lease went out at base 0 against a head of 1.
+    #[test]
+    fn a_reseat_carries_the_rows_version() {
+        let mut row = save_state("valheim", "/home/u/.config/unity3d/IronGate/Valheim");
+        row.last_version_num = Some(1);
+        let watched = watched_from_snapshot("sv".into(), &row);
+        assert_eq!(watched.known_version, Some(1));
     }
 
     /// A restore pointed at a folder another game tracks must be refused, not
