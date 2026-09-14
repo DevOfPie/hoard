@@ -1072,6 +1072,11 @@ pub(crate) struct SaveSlot {
     /// by the acquire's verdict (`SetLease { verdict: true }`), so a hold that
     /// repeats every tick asks once.
     pub(crate) lease_requested: bool,
+    /// This machine gave the lease back, or cancelled its acquire, and the
+    /// answer has not landed: the lease going is not a loss, and a `Mine`
+    /// verdict landing meanwhile is given back (`claim::on_lease`). Cleared
+    /// when the lease reads anything but `Mine`, and by the next acquire.
+    pub(crate) release_requested: bool,
     /// `WorldHostedElsewhere` has gone out for the current hold. Cleared when
     /// the lease stops being somebody else's.
     pub(crate) hosted_elsewhere_notified: bool,
@@ -1833,8 +1838,7 @@ fn request_lease(
     let Some(lease) = lease else {
         return;
     };
-    slot.lease_requested = true;
-    lease.acquire(id.to_string(), slot.known_version.unwrap_or(0));
+    crate::claim::request_acquire(slot, lease);
 }
 
 /// The reducer held a push because another member hosts the world: say so
@@ -2541,7 +2545,7 @@ async fn run_agent(
                     }
                     Some(AgentCommand::SetLease { save_id, lease: obs, holder, verdict }) => {
                         if let Some(slot) = slots.get_mut(&save_id) {
-                            crate::claim::on_lease(slot, obs, holder, verdict, &events_tx);
+                            crate::claim::on_lease(slot, obs, holder, verdict, &events_tx, lease_task.as_ref());
                             reconcile_all(
                                 &mut slots, &api, &events_tx, &cmd_tx, &config, &done_tx,
                                 &cloud_heads, lease_task.as_ref(),
@@ -2562,13 +2566,7 @@ async fn run_agent(
                     Some(AgentCommand::ReleaseWorld { save_id, reply }) => {
                         match shared_world_slot(&mut slots, &save_id) {
                             Ok(slot) => {
-                                if let Some(lease) = lease_task.as_ref() {
-                                    lease.release(save_id.clone());
-                                }
-                                let _ = events_tx.try_send(AgentEvent::WorldReleased {
-                                    save_id: save_id.clone(),
-                                    game_slug: slot.save.game_slug.clone(),
-                                });
+                                crate::claim::on_release_world(slot, &events_tx, lease_task.as_ref());
                                 let _ = reply.send(Ok(()));
                             }
                             Err(refused) => {
@@ -2625,9 +2623,8 @@ async fn run_agent(
                                 if let Some(lease) = lease_task.as_ref() {
                                     // The task runs them in order: the takeover,
                                     // then the acquire with this machine's head.
-                                    slot.lease_requested = true;
                                     lease.force(save_id.clone());
-                                    lease.acquire(save_id.clone(), slot.known_version.unwrap_or(0));
+                                    crate::claim::request_acquire(slot, lease);
                                 }
                                 let _ = reply.send(Ok(()));
                             }
@@ -3005,6 +3002,7 @@ fn handle_add(
         relaunch_pending: false,
         side_copy_landed_at: None,
         lease_requested: false,
+        release_requested: false,
         hosted_elsewhere_notified: false,
         session: None,
     };
@@ -6032,6 +6030,7 @@ pub(crate) fn test_slot(save: WatchedSave) -> SaveSlot {
         relaunch_pending: false,
         side_copy_landed_at: None,
         lease_requested: false,
+        release_requested: false,
         hosted_elsewhere_notified: false,
         session: None,
     }

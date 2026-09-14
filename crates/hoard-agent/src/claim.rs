@@ -161,16 +161,18 @@ pub(crate) fn on_game_started(
         }
         open.push(id.clone());
     }
-    open_sessions(slots, &game_slug, &open, ids.len(), now, events_tx);
+    open_sessions(slots, &game_slug, &open, ids.len(), false, now, events_tx);
 }
 
 /// Opens a session on each of `open` (shared worlds of `game_slug`, `total`
-/// of them on this machine) and asks about the ones with no role yet.
+/// of them on this machine) and asks about the ones with no role yet. With
+/// `dismissed`, those open as "not playing" instead, and nothing is asked.
 fn open_sessions(
     slots: &mut HashMap<String, SaveSlot>,
     game_slug: &str,
     open: &[String],
     total: usize,
+    dismissed: bool,
     now: Instant,
     events_tx: &mpsc::Sender<AgentEvent>,
 ) {
@@ -192,6 +194,10 @@ fn open_sessions(
         // released, a restart) is a role already taken, not one to ask about.
         session.claimed = pinned || slot.lease == LeaseObs::Mine;
         session.prompted = !session.claimed;
+        if dismissed && !session.claimed {
+            session.dismissed = true;
+            session.prompted = false;
+        }
         let ask = session.prompted;
         slot.session = Some(session);
         if !ask {
@@ -265,8 +271,10 @@ pub(crate) fn on_game_stopped(slot: &mut SaveSlot) {
 
 /// The user answered `ClaimWorld`. `Host` asks for the lease; `View` on a
 /// lease this machine still holds gives it back, or the reducer, which reads
-/// the lease and not the role, would go on pushing the viewer's writes. An
-/// answer with no session running is kept for the next one.
+/// the lease and not the role, would go on pushing the viewer's writes, and
+/// `View` with an acquire still out cancels it. An answer with no session at
+/// all is kept for the next one; one given to a session that stopped and
+/// still owes its flush or side copy ends with that session.
 pub(crate) fn on_claim_world(
     slot: &mut SaveSlot,
     role: WorldRole,
@@ -274,24 +282,22 @@ pub(crate) fn on_claim_world(
     lease: Option<&LeaseHandle>,
 ) {
     let id = slot.save.save_id.clone();
-    let in_session = slot.session.as_ref().is_some_and(|w| w.live());
     slot.role = role;
-    slot.role_pinned = !in_session;
+    slot.role_pinned = slot.session.is_none();
     on_claim(slot);
     match role {
         WorldRole::Host => {
             if let Some(lease) = lease {
-                slot.lease_requested = true;
-                lease.acquire(id.clone(), slot.known_version.unwrap_or(0));
+                request_acquire(slot, lease);
             }
         }
-        WorldRole::View if slot.lease == LeaseObs::Mine => {
-            tracing::info!(save_id = %id, "agent: viewing a world this machine hosts; giving the lease back");
-            if let Some(lease) = lease {
-                lease.release(id.clone());
+        WorldRole::View => {
+            let holds = slot.lease == LeaseObs::Mine;
+            if holds {
+                tracing::info!(save_id = %id, "agent: viewing a world this machine hosts; giving the lease back");
             }
+            give_back(slot, lease, holds);
         }
-        WorldRole::View => {}
     }
     let _ = events_tx.try_send(AgentEvent::WorldClaimed {
         save_id: id,
@@ -309,30 +315,95 @@ pub(crate) fn on_claim(slot: &mut SaveSlot) {
     }
 }
 
+/// Asks for the lease. The verdict clears `lease_requested`; a release asked
+/// for before is overtaken, so the verdict's `Mine` is kept.
+pub(crate) fn request_acquire(slot: &mut SaveSlot, lease: &LeaseHandle) {
+    slot.lease_requested = true;
+    slot.release_requested = false;
+    lease.acquire(slot.save.save_id.clone(), slot.known_version.unwrap_or(0));
+}
+
+/// Stops wanting the lease: an acquire still out is cancelled, and with
+/// `release` the lease is given back. Either way `release_requested` marks
+/// what comes back as asked for, not lost, and a `Mine` verdict the cancel
+/// was too late for is given back when it lands (`on_lease`).
+fn give_back(slot: &mut SaveSlot, lease: Option<&LeaseHandle>, release: bool) {
+    let Some(lease) = lease else {
+        return;
+    };
+    let id = slot.save.save_id.clone();
+    if slot.lease_requested {
+        // No verdict is owed any more: a retry the task still queued is
+        // dropped, and one already on the wire is released on arrival.
+        lease.cancel(id.clone());
+        slot.lease_requested = false;
+        slot.release_requested = true;
+    }
+    if release {
+        lease.release(id);
+        slot.release_requested = true;
+    }
+}
+
+/// The user gave the world back (`ReleaseWorld`): the lease goes, an acquire
+/// still out is cancelled, and the answer is not a lost lease.
+pub(crate) fn on_release_world(
+    slot: &mut SaveSlot,
+    events_tx: &mpsc::Sender<AgentEvent>,
+    lease: Option<&LeaseHandle>,
+) {
+    give_back(slot, lease, true);
+    let _ = events_tx.try_send(AgentEvent::WorldReleased {
+        save_id: slot.save.save_id.clone(),
+        game_slug: slot.save.game_slug.clone(),
+    });
+}
+
 /// The server's word on the lease, from the lease task or the live stream.
 /// A `verdict` answers an acquire and clears `lease_requested`; an
 /// observation (a refresh, a frame) leaves the flag to the answer still
 /// owed, or a stop in between would end the session and the acquire's
 /// `Mine` would land on nobody.
+///
+/// A `Mine` verdict on a viewer's slot, or on one that asked to give the
+/// lease back meanwhile, is released at once and never read as ours: the
+/// reducer, which reads the lease and not the role, would push under it.
 pub(crate) fn on_lease(
     slot: &mut SaveSlot,
     obs: LeaseObs,
     holder: Option<String>,
     verdict: bool,
     events_tx: &mpsc::Sender<AgentEvent>,
+    lease: Option<&LeaseHandle>,
 ) {
     let was = slot.lease;
-    slot.lease = obs;
-    slot.lease_holder = holder;
+    let asked = slot.release_requested;
+    let unwanted = obs == LeaseObs::Mine && verdict && (slot.role == WorldRole::View || asked);
+    if unwanted {
+        tracing::info!(save_id = %slot.save.save_id, "agent: an acquire nobody wants any more landed; giving the lease back");
+        if let Some(lease) = lease {
+            slot.release_requested = true;
+            lease.release(slot.save.save_id.clone());
+        }
+        // Held only for as long as the release takes: nothing pushes under it.
+        slot.lease = LeaseObs::Unknown;
+        slot.lease_holder = None;
+    } else {
+        slot.lease = obs;
+        slot.lease_holder = holder;
+    }
+    if obs != LeaseObs::Mine {
+        slot.release_requested = false;
+    }
     if verdict {
         slot.lease_requested = false;
     }
     if obs != LeaseObs::Other {
         slot.hosted_elsewhere_notified = false;
     }
-    // The lease this machine held is gone: forced, or expired while the
-    // renew could not get through.
-    if was == LeaseObs::Mine && obs != LeaseObs::Mine {
+    // The lease this machine held is gone and nobody here gave it back:
+    // forced, or expired while the renew could not get through.
+    if was == LeaseObs::Mine && obs != LeaseObs::Mine && !asked {
         tracing::warn!(save_id = %slot.save.save_id, ?obs, "agent: hosting lease lost");
         let _ = events_tx.try_send(AgentEvent::WorldLeaseLost {
             save_id: slot.save.save_id.clone(),
@@ -444,8 +515,7 @@ fn acquire_auto(
     let id = slot.save.save_id.clone();
     tracing::info!(save_id = %id, why, "agent: hosting the shared world on our own");
     if let Some(lease) = lease {
-        slot.lease_requested = true;
-        lease.acquire(id.clone(), slot.known_version.unwrap_or(0));
+        request_acquire(slot, lease);
     }
     let _ = events_tx.try_send(AgentEvent::WorldClaimed {
         save_id: id,
@@ -616,9 +686,7 @@ pub(crate) fn maybe_release_after_stop(
     let id = slot.save.save_id.clone();
     let session_secs = session.started_at.elapsed().as_secs();
     tracing::info!(save_id = %id, session_secs, "agent: session over and flushed; releasing the hosting lease");
-    if let Some(lease) = lease {
-        lease.release(id.clone());
-    }
+    give_back(slot, lease, true);
     let _ = events_tx.try_send(AgentEvent::WorldReleased {
         save_id: id,
         game_slug: slot.save.game_slug.clone(),
@@ -737,7 +805,9 @@ pub(crate) fn on_side_copy_failed(
 
 /// The game relaunched while the copy was on its way (`on_game_started`
 /// skipped this world): now that the old session is over, the new one
-/// opens, and is asked about, as the launch would have.
+/// opens, and is asked about, as the launch would have. Unless the user
+/// already chose a sibling world from the launch's prompt: that answer was
+/// for this game, and the landing world opens as "not playing".
 fn after_side_copy(
     slots: &mut HashMap<String, SaveSlot>,
     save_id: &str,
@@ -751,13 +821,21 @@ fn after_side_copy(
         return;
     }
     let game_slug = slot.save.game_slug.clone();
-    let total = shared_of(slots, &game_slug).len();
-    tracing::info!(save_id = %save_id, "agent: side copy landed with the game running; opening its session now");
+    let ids = shared_of(slots, &game_slug);
+    let sibling_chosen = ids.iter().any(|id| {
+        id != save_id
+            && slots
+                .get(id)
+                .and_then(|s| s.session.as_ref())
+                .is_some_and(|w| w.live() && w.claimed)
+    });
+    tracing::info!(save_id = %save_id, sibling_chosen, "agent: side copy landed with the game running; opening its session now");
     open_sessions(
         slots,
         &game_slug,
         &[save_id.to_string()],
-        total,
+        ids.len(),
+        sibling_chosen,
         now,
         events_tx,
     );
@@ -1238,7 +1316,7 @@ mod tests {
             !may_request_lease(slot),
             "the hold acquired around the prompt"
         );
-        on_lease(slot, LeaseObs::Free, None, false, &tx);
+        on_lease(slot, LeaseObs::Free, None, false, &tx, None);
         assert!(!may_request_lease(slot));
         assert_eq!(
             on_reconciled(slot, now, &tx, Some(&lease)),
@@ -1278,7 +1356,7 @@ mod tests {
         slot.has_pending = true;
         on_game_stopped(slot);
         slot.in_flight = Some(kernel::Op::Backup);
-        on_lease(slot, LeaseObs::Other, Some("bob".into()), false, &tx);
+        on_lease(slot, LeaseObs::Other, Some("bob".into()), false, &tx, None);
         assert_eq!(on_reconciled(slot, now, &tx, None), Followup::Nothing);
         assert!(slot.session.is_some());
         assert!(!slot.session.as_ref().unwrap().side_copy_started);
@@ -1331,7 +1409,7 @@ mod tests {
         drain(&mut rx);
         assert!(slot.lease_requested);
         // The refresh queued before the click answers first.
-        on_lease(slot, LeaseObs::Free, None, false, &tx);
+        on_lease(slot, LeaseObs::Free, None, false, &tx, None);
         assert!(slot.lease_requested, "an observation answers no acquire");
         on_game_stopped(slot);
         assert_eq!(
@@ -1343,13 +1421,13 @@ mod tests {
             "the acquire is still owed an answer"
         );
         // A frame reading mine before the verdict changes nothing either.
-        on_lease(slot, LeaseObs::Mine, Some("me".into()), false, &tx);
+        on_lease(slot, LeaseObs::Mine, Some("me".into()), false, &tx, None);
         assert_eq!(
             on_reconciled(slot, now, &tx, Some(&lease)),
             Followup::Nothing
         );
         assert!(slot.session.is_some());
-        on_lease(slot, LeaseObs::Mine, Some("me".into()), true, &tx);
+        on_lease(slot, LeaseObs::Mine, Some("me".into()), true, &tx, None);
         assert!(!slot.lease_requested);
         assert_eq!(
             on_reconciled(slot, now, &tx, Some(&lease)),
@@ -1524,6 +1602,229 @@ mod tests {
             "{events:?}"
         );
         assert!(slot.session.as_ref().unwrap().claimed);
+    }
+
+    /// Every release this machine asks for (after the final flush,
+    /// `ReleaseWorld`, viewing a world it hosts) answers with the lease free:
+    /// none of them is a lost lease.
+    #[tokio::test(start_paused = true)]
+    async fn a_release_this_machine_asked_for_is_not_a_lost_lease() {
+        let (tx, mut rx) = mpsc::channel(8);
+        let (lease, mut seen) = LeaseHandle::probe();
+        let now = Instant::now();
+        for path in ["after the flush", "release", "view"] {
+            let mut s = slots(vec![world("w1", "valheim")]);
+            s.get_mut("w1").unwrap().lease = LeaseObs::Mine;
+            on_game_started(&mut s, "w1", now, &tx);
+            let slot = s.get_mut("w1").unwrap();
+            match path {
+                "after the flush" => {
+                    on_game_stopped(slot);
+                    assert_eq!(
+                        on_reconciled(slot, now, &tx, Some(&lease)),
+                        Followup::Nothing
+                    );
+                }
+                "release" => on_release_world(slot, &tx, Some(&lease)),
+                "view" => on_claim_world(slot, WorldRole::View, &tx, Some(&lease)),
+                _ => unreachable!(),
+            }
+            tokio::task::yield_now().await;
+            assert_eq!(seen.try_recv().unwrap(), "release w1", "{path}");
+            assert!(slot.release_requested, "{path}");
+            drain(&mut rx);
+            // The task's answer to the release.
+            on_lease(slot, LeaseObs::Free, None, false, &tx, Some(&lease));
+            assert!(!slot.release_requested, "{path}");
+            assert!(drain(&mut rx).is_empty(), "{path}: told as a lost lease");
+        }
+    }
+
+    /// A lease taken off this machine, or gone while the renew could not get
+    /// through, is lost, and still is after an earlier release was answered.
+    #[tokio::test(start_paused = true)]
+    async fn a_forced_or_expired_lease_is_still_lost() {
+        let (tx, mut rx) = mpsc::channel(8);
+        let (lease, mut seen) = LeaseHandle::probe();
+        for (obs, holder) in [(LeaseObs::Other, Some("bob")), (LeaseObs::Free, None)] {
+            let mut s = slots(vec![world("w1", "valheim")]);
+            let slot = s.get_mut("w1").unwrap();
+            slot.lease = LeaseObs::Mine;
+            on_release_world(slot, &tx, Some(&lease));
+            on_lease(slot, LeaseObs::Free, None, false, &tx, Some(&lease));
+            // Hosting again.
+            on_claim_world(slot, WorldRole::Host, &tx, Some(&lease));
+            on_lease(
+                slot,
+                LeaseObs::Mine,
+                Some("me".into()),
+                true,
+                &tx,
+                Some(&lease),
+            );
+            assert_eq!(slot.lease, LeaseObs::Mine);
+            drain(&mut rx);
+            on_lease(
+                slot,
+                obs,
+                holder.map(String::from),
+                false,
+                &tx,
+                Some(&lease),
+            );
+            let events = drain(&mut rx);
+            assert!(
+                matches!(events.as_slice(), [AgentEvent::WorldLeaseLost { .. }]),
+                "{obs:?}: {events:?}"
+            );
+        }
+        tokio::task::yield_now().await;
+        let mut lines = Vec::new();
+        while let Ok(l) = seen.try_recv() {
+            lines.push(l);
+        }
+        assert_eq!(
+            lines,
+            ["release w1", "acquire w1", "release w1", "acquire w1"],
+            "a loss is not given back again"
+        );
+    }
+
+    /// Viewing while the acquire is still out: the task's queued retry is
+    /// cancelled, and a verdict that lands `Mine` anyway is given back at once
+    /// and never read as ours, whether the session still runs or ended
+    /// meanwhile. Nothing of it is a lost lease.
+    #[tokio::test(start_paused = true)]
+    async fn viewing_while_the_acquire_is_out_ends_with_no_lease() {
+        let (tx, mut rx) = mpsc::channel(8);
+        let now = Instant::now();
+        for stop_first in [false, true] {
+            let (lease, mut seen) = LeaseHandle::probe();
+            let mut s = slots(vec![world("w1", "valheim")]);
+            s.get_mut("w1").unwrap().lease = LeaseObs::Free;
+            on_game_started(&mut s, "w1", now, &tx);
+            let slot = s.get_mut("w1").unwrap();
+            on_claim_world(slot, WorldRole::Host, &tx, Some(&lease));
+            on_claim_world(slot, WorldRole::View, &tx, Some(&lease));
+            assert!(!slot.lease_requested, "{stop_first}");
+            slot.has_pending = true;
+            assert!(!may_request_lease(slot), "{stop_first}");
+            slot.has_pending = false;
+            if stop_first {
+                on_game_stopped(slot);
+                assert_eq!(
+                    on_reconciled(slot, now, &tx, Some(&lease)),
+                    Followup::Nothing
+                );
+                assert!(slot.session.is_none());
+                assert_eq!(slot.role, WorldRole::Host);
+            }
+            drain(&mut rx);
+            // The acquire that was already on the wire.
+            on_lease(
+                slot,
+                LeaseObs::Mine,
+                Some("me".into()),
+                true,
+                &tx,
+                Some(&lease),
+            );
+            assert_ne!(slot.lease, LeaseObs::Mine, "{stop_first}: read as ours");
+            // The release's answer.
+            on_lease(slot, LeaseObs::Free, None, false, &tx, Some(&lease));
+            assert_eq!(slot.lease, LeaseObs::Free, "{stop_first}");
+            assert!(!slot.release_requested, "{stop_first}");
+            assert!(drain(&mut rx).is_empty(), "{stop_first}: told as a loss");
+            tokio::task::yield_now().await;
+            let mut lines = Vec::new();
+            while let Ok(l) = seen.try_recv() {
+                lines.push(l);
+            }
+            assert_eq!(
+                lines,
+                ["acquire w1", "cancel w1", "release w1"],
+                "{stop_first}"
+            );
+        }
+    }
+
+    /// The relaunch asked about the other world while this one's side copy
+    /// landed, and the user chose it: the landing world opens as "not
+    /// playing", with no second prompt and no clock.
+    #[tokio::test(start_paused = true)]
+    async fn a_landing_world_is_not_asked_about_once_a_sibling_was_chosen() {
+        let (tx, mut rx) = mpsc::channel(8);
+        let mut s = slots(vec![world("w1", "valheim"), world("w2", "valheim")]);
+        s.get_mut("w1").unwrap().lease = LeaseObs::Other;
+        s.get_mut("w2").unwrap().lease = LeaseObs::Free;
+        let now = Instant::now();
+        on_game_started(&mut s, "w1", now, &tx);
+        drain(&mut rx);
+        {
+            let slot = s.get_mut("w1").unwrap();
+            slot.role = WorldRole::View;
+            on_claim(slot);
+            slot.has_pending = true;
+        }
+        on_game_stopped_all(&mut s, "w1");
+        assert_eq!(
+            on_reconciled(s.get_mut("w1").unwrap(), now, &tx, None),
+            Followup::SideCopy
+        );
+        assert_eq!(
+            on_reconciled(s.get_mut("w2").unwrap(), now, &tx, None),
+            Followup::Nothing
+        );
+        on_game_started(&mut s, "w2", now, &tx);
+        let events = drain(&mut rx);
+        let [AgentEvent::WorldClaimWanted { worlds, .. }] = events.as_slice() else {
+            panic!("{events:?}");
+        };
+        assert_eq!(worlds.len(), 1);
+        assert_eq!(worlds[0].save_id, "w2");
+        on_claim_world(s.get_mut("w2").unwrap(), WorldRole::Host, &tx, None);
+        drain(&mut rx);
+        on_side_copied(&mut s, "w1", 2, now, &tx);
+        assert!(drain(&mut rx).is_empty(), "asked again after the choice");
+        let session = s["w1"].session.as_ref().unwrap();
+        assert!(session.live() && session.dismissed && !session.prompted);
+        assert!(session.auto_host_deadline.is_none());
+    }
+
+    /// An answer given after the game closed, while its session still owes
+    /// the final flush, is that session's: the next launch asks again.
+    #[tokio::test(start_paused = true)]
+    async fn an_answer_to_a_stopped_session_does_not_decide_the_next_launch() {
+        let (tx, mut rx) = mpsc::channel(8);
+        let (lease, _seen) = LeaseHandle::probe();
+        let mut s = slots(vec![world("w1", "valheim")]);
+        s.get_mut("w1").unwrap().lease = LeaseObs::Mine;
+        let now = Instant::now();
+        on_game_started(&mut s, "w1", now, &tx);
+        {
+            let slot = s.get_mut("w1").unwrap();
+            slot.has_pending = true;
+            on_game_stopped(slot);
+            assert_eq!(
+                on_reconciled(slot, now, &tx, Some(&lease)),
+                Followup::Nothing
+            );
+            assert!(slot.session.is_some(), "the flush is owed");
+            on_claim_world(slot, WorldRole::Host, &tx, None);
+            assert!(!slot.role_pinned, "pinned for the next launch");
+            slot.has_pending = false;
+            assert_eq!(
+                on_reconciled(slot, now, &tx, Some(&lease)),
+                Followup::Nothing
+            );
+            assert!(slot.session.is_none());
+            on_lease(slot, LeaseObs::Free, None, false, &tx, Some(&lease));
+        }
+        drain(&mut rx);
+        on_game_started(&mut s, "w1", now, &tx);
+        assert_eq!(drain(&mut rx).len(), 1, "the next launch asks");
+        let session = s["w1"].session.as_ref().unwrap();
+        assert!(session.prompted && !session.claimed);
     }
 
     #[tokio::test]
