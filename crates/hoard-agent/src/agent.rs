@@ -2471,6 +2471,7 @@ async fn run_agent(
                                 let _ = events_tx.try_send(AgentEvent::WorldLeaseLost {
                                     save_id: save_id.clone(),
                                     game_slug: slot.save.game_slug.clone(),
+                                    holder: slot.lease_holder.clone(),
                                 });
                             }
                             reconcile_all(

@@ -205,13 +205,13 @@ pub fn notice_for(event: &AgentEvent, prefs: &Prefs) -> Option<Notice> {
                 holder: holder.clone(),
             },
         }),
-        AgentEvent::WorldLeaseLost { save_id, game_slug } => {
-            prefs.notify_on_failure.then(|| Notice {
-                name: Some(game_slug.clone()),
-                save_id: save_id.clone(),
-                kind: Kind::WorldLeaseLost,
-            })
-        }
+        AgentEvent::WorldLeaseLost {
+            save_id, game_slug, ..
+        } => prefs.notify_on_failure.then(|| Notice {
+            name: Some(game_slug.clone()),
+            save_id: save_id.clone(),
+            kind: Kind::WorldLeaseLost,
+        }),
         // The prompt is a question, not a problem, and it is answered in the
         // app: the notice only says the app is waiting. It skips the failure
         // preference the way a deliberate backup does, because silence here

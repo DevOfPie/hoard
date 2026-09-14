@@ -101,14 +101,12 @@ export function applyWorldEvent(ev: AgentEvent, at: string = new Date().toISOStr
     case "world_hosted_elsewhere":
       patch(ev.save_id, { state: "other", holder: ev.holder, since: at });
       break;
-    case "world_lease_lost": {
-      // Forced by a member or expired: not ours any more, and who holds it
-      // now is the server's to say. Unknown until asked.
-      patch(ev.save_id, { state: "unknown" });
-      // The event carries no holder; the server knows who has it now.
-      void refreshLease(ev.save_id).catch(() => {});
+    case "world_lease_lost":
+      patch(
+        ev.save_id,
+        ev.holder ? { state: "other", holder: ev.holder, since: at } : { state: "free" },
+      );
       break;
-    }
     case "game_stopped":
       dropPrompt(ev.game_slug);
       break;
@@ -242,12 +240,13 @@ async function noticeWorldEvent(ev: AgentEvent): Promise<void> {
     }
     case "world_lease_lost": {
       const world = prettifySlug(ev.game_slug);
-      pushNotification({
-        id: `world-lease-lost-${ev.save_id}-${Date.now()}`,
-        title: tr("claim.notice_lease_lost_title", { world }),
-        body: tr("claim.notice_lease_lost_body"),
-        priority: "high",
-      });
+      // One row per world, refreshed rather than stacked: the bell persists
+      // across launches and a high row never expires on its own.
+      const id = `world-lease-lost-${ev.save_id}`;
+      const title = tr("claim.notice_lease_lost_title", { world });
+      const body = tr("claim.notice_lease_lost_body");
+      pushNotification({ id, title, body, priority: "high" });
+      updateNotification(id, { title, body });
       if (await mainWindowFocused()) {
         toastInfo(tr("claim.toast_lease_lost", { world }));
       }
@@ -311,9 +310,7 @@ export async function subscribeWorldEvents(): Promise<void> {
       ...topics.map((t) =>
         listen<AgentEvent>(t, (event) => {
           applyWorldEvent(event.payload);
-          // The backlog replays silently by contract (stores/agent.ts): a
-          // notice is for what happens now, not for what the journal kept.
-          if (!isReplaying()) void noticeWorldEvent(event.payload);
+          void noticeWorldEvent(event.payload);
         }),
       ),
       listen<AgentEvent>("agent://world-claim-wanted", (event) => {
