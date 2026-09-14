@@ -17,14 +17,13 @@ use crate::output;
 #[derive(Subcommand)]
 pub enum WorldCommand {
     /// Take a role on a shared world: host it (acquire the lease, your changes
-    /// upload) or only view it (pull, never push)
+    /// upload), which is the default, or only view it with `--view` (pull,
+    /// never push)
     Claim {
         /// Save id (UUID), see `hoard saves`
         save_id: String,
-        /// Host the world: the default
-        #[arg(long, conflicts_with = "view")]
-        host: bool,
-        /// View the world only: your writes to it stay on this machine
+        /// View the world instead of hosting it: your writes to it stay on this
+        /// machine
         #[arg(long)]
         view: bool,
     },
@@ -57,20 +56,30 @@ pub enum WorldCommand {
 pub struct LeaseOut {
     pub save_id: String,
     /// Null when nobody holds the lease.
-    pub holder: Option<String>,
+    pub lease: Option<LeaseDetail>,
+}
+
+/// A held lease.
+#[derive(Serialize)]
+pub struct LeaseDetail {
+    pub holder: String,
     /// The lease is held by this machine.
     pub here: bool,
-    pub acquired_at: Option<String>,
-    pub renewed_at: Option<String>,
-    pub base_version: Option<i64>,
+    /// RFC3339.
+    pub acquired_at: String,
+    /// RFC3339: the last heartbeat.
+    pub renewed_at: String,
+    pub base_version: i64,
+    /// Heartbeats are arriving; a quiet lease is free to take.
     pub live: bool,
+    /// The holder has pushed under it, so it can no longer be forced.
     pub pushed_since: bool,
 }
 
 pub async fn run(cmd: WorldCommand) -> Result<()> {
     let mut client = link::require("world").await?;
     match cmd {
-        WorldCommand::Claim { save_id, view, .. } => {
+        WorldCommand::Claim { save_id, view } => {
             let role = if view {
                 WorldRole::View
             } else {
@@ -129,28 +138,22 @@ pub async fn run(cmd: WorldCommand) -> Result<()> {
             let my_fp = this_device();
             let out = LeaseOut {
                 save_id: save_id.clone(),
-                holder: lease.as_ref().map(|l| l.holder_username.to_string()),
-                here: lease.as_ref().is_some_and(|l| held_here(l, &my_fp)),
-                acquired_at: lease.as_ref().map(|l| rfc3339(l.acquired_at)),
-                renewed_at: lease.as_ref().map(|l| rfc3339(l.renewed_at)),
-                base_version: lease.as_ref().map(|l| l.base_version),
-                live: lease.as_ref().is_some_and(|l| l.live),
-                pushed_since: lease.as_ref().is_some_and(|l| l.pushed_since),
+                lease: lease.as_ref().map(|l| detail(l, &my_fp)),
             };
             output::emit(&out, |o| {
-                let Some(holder) = &o.holder else {
+                let Some(l) = &o.lease else {
                     println!("{}: nobody is hosting", o.save_id);
                     return;
                 };
                 println!(
                     "holder:  {}{}\nsince:   {}\nrenewed: {}\nbase:    v{}\nlive:    {}\npushed:  {}",
-                    holder,
-                    if o.here { " (this machine)" } else { "" },
-                    o.acquired_at.as_deref().unwrap_or("—"),
-                    o.renewed_at.as_deref().unwrap_or("—"),
-                    o.base_version.unwrap_or(0),
-                    yes_no(o.live),
-                    yes_no(o.pushed_since),
+                    l.holder,
+                    if l.here { " (this machine)" } else { "" },
+                    l.acquired_at,
+                    l.renewed_at,
+                    l.base_version,
+                    yes_no(l.live),
+                    yes_no(l.pushed_since),
                 );
             })
         }
@@ -193,6 +196,18 @@ pub fn this_device() -> String {
 
 fn held_here(lease: &Lease, my_fp: &str) -> bool {
     lease.holder_device_fp.as_deref() == Some(my_fp)
+}
+
+fn detail(lease: &Lease, my_fp: &str) -> LeaseDetail {
+    LeaseDetail {
+        holder: lease.holder_username.to_string(),
+        here: held_here(lease, my_fp),
+        acquired_at: rfc3339(lease.acquired_at),
+        renewed_at: rfc3339(lease.renewed_at),
+        base_version: lease.base_version,
+        live: lease.live,
+        pushed_since: lease.pushed_since,
+    }
 }
 
 /// The label a table shows for a lease: only a live one names a holder.
@@ -258,6 +273,28 @@ mod tests {
             hosted_label(&lease(None, true), "fp-me").as_deref(),
             Some("hosted by alice")
         );
+    }
+
+    /// No lease is one `null`, not a row of `false`s that reads as a lease.
+    #[test]
+    fn no_lease_is_null_and_a_lease_is_whole() {
+        let none = LeaseOut {
+            save_id: "s1".into(),
+            lease: None,
+        };
+        assert_eq!(
+            serde_json::to_value(&none).unwrap(),
+            serde_json::json!({"save_id": "s1", "lease": null})
+        );
+        let some = LeaseOut {
+            save_id: "s1".into(),
+            lease: Some(detail(&lease(Some("fp-me"), true), "fp-me")),
+        };
+        let v = serde_json::to_value(&some).unwrap();
+        assert_eq!(v["lease"]["holder"], "alice");
+        assert_eq!(v["lease"]["here"], true);
+        assert_eq!(v["lease"]["base_version"], 4);
+        assert_eq!(v["lease"]["acquired_at"], "1970-01-01T00:00:00Z");
     }
 
     #[test]

@@ -22,6 +22,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   world (`worlds_local/<name>` and its backups), never the characters, and every
   member's backup, restore and fingerprint honour the same list. A world shared
   with you appears in `hoard saves` with its group, ready to adopt into a folder.
+- **The CLI shares saves and hosts worlds.** `hoard group` creates a group,
+  lists yours, mints an invite token and joins or leaves with one. `hoard share
+  <save_id> --group <group>` moves a save into a group and `hoard unshare` takes
+  it back; a game that keeps several worlds in one folder, Valheim among them,
+  is refused until `--world` names one, with the worlds it found. `hoard world`
+  claims a shared world to host or only view, releases it, forces an idle lease
+  off its holder, and shows who holds it. `hoard saves` gains a HOST column and
+  `hoard status` lists the shared saves, both saying who hosts each. Every one
+  of these asks the sync service, which holds the session, so they need it
+  running (`hoard sync start`).
 
 ## [1.1.7] - 2026-09-13
 
