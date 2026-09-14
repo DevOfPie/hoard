@@ -989,11 +989,13 @@ pub async fn reload(engine: &Engine) -> anyhow::Result<usize> {
     Ok(watched)
 }
 
-/// Applies what a settings change asks of the live engine: a `Reseat` is out
-/// and back in, so the slot picks up what changed on the row (a share's
-/// include list, a cleared one), where [`reload`] only diffs by id and would
-/// leave the old slot. The row is already written, so a slot that cannot be
-/// touched is logged, not reported: the next `Reload` or restart seats it.
+/// Applies what a settings change asks of the live engine: a `Reseat` seats
+/// the slot again, so it picks up what changed on the row (a share's include
+/// list, a cleared one), where [`reload`] only diffs by id and would leave the
+/// old slot. The slot keeps what it knows is synced: re-learning it made a
+/// share push the folder again under the lease. The row is already written, so
+/// a slot that cannot be touched is logged, not reported: the next `Reload` or
+/// restart seats it.
 pub async fn apply_reseat(engine: &Engine, reseat: library::LiveReseat) {
     let Some(handle) = engine.handle() else {
         return;
@@ -1002,6 +1004,9 @@ pub async fn apply_reseat(engine: &Engine, reseat: library::LiveReseat) {
         library::LiveReseat::Noop => Ok(()),
         library::LiveReseat::Detach(id) => handle.remove_save(id).await,
         library::LiveReseat::Attach(save) => handle.add_save(*save).await,
+        library::LiveReseat::Reseat(id, save) if id == save.save_id => {
+            handle.reseat_save(*save).await
+        }
         library::LiveReseat::Reseat(id, save) => match handle.remove_save(id).await {
             Ok(()) => handle.add_save(*save).await,
             Err(e) => Err(e),

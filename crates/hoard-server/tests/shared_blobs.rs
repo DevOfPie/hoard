@@ -1998,6 +1998,186 @@ async fn a_member_based_before_an_owner_backup_lands_on_top_of_it() {
     assert_eq!(err.1 .0["code"], "non_fast_forward");
 }
 
+/// The folder with Beta's database replaced by `beta_db`.
+fn with_beta<'a>(
+    files: &[(&'static str, &'a [u8])],
+    beta_db: &'a [u8],
+) -> Vec<(&'static str, &'a [u8])> {
+    files
+        .iter()
+        .map(|(p, b)| {
+            (
+                *p,
+                if *p == "worlds_local/Beta.db" {
+                    beta_db
+                } else {
+                    b
+                },
+            )
+        })
+        .collect()
+}
+
+/// The owner synced at v2, a member hosting pushes Alpha as v3, and the owner,
+/// behind, changes Beta. Its world is still v2's: the push goes up without the
+/// lease on base 2, and v4 holds the member's Alpha beside the owner's Beta
+/// and character, with the member's lease untouched.
+async fn an_owner_behind_a_member_push(multipart: bool) {
+    let h = harness().await;
+    let f = Folder::new();
+    folder_shared_as_alpha(&h, &f).await;
+    let character = b"alice levelled up".to_vec();
+    let v2 = with_beta(&f.files(), &f.beta_db)
+        .into_iter()
+        .map(|(p, b)| {
+            (
+                p,
+                if p == "characters_local/x.fch" {
+                    &character[..]
+                } else {
+                    b
+                },
+            )
+        })
+        .collect::<Vec<_>>();
+    backup_as(&h, &h.owner, &v2, Some(1)).await;
+    acquire_as(&h, &h.member, 2).await.expect("hosting");
+    let alpha3 = vec![9u8; 7_000];
+    let (_, snap) = backup_as(&h, &h.member, &alpha_only(&f, &alpha3), Some(2)).await;
+    assert_eq!(snap.version_num, 3);
+
+    let beta = vec![17u8; 9_100];
+    let files = with_beta(&v2, &beta);
+    let snap = if multipart {
+        multipart_as(&h, &h.owner, &files, Some(2))
+            .await
+            .expect("multipart push")
+    } else {
+        backup_as(&h, &h.owner, &files, Some(2)).await.1
+    };
+    assert_eq!(snap.version_num, 4);
+    let v4 = detail_files_as(&h, &h.owner, 4).await;
+    assert_eq!(v4.len(), 5, "{v4:?}");
+    assert!(v4.contains(&("worlds_local/Alpha.db".into(), sha_of(&alpha3))));
+    assert!(v4.contains(&("worlds_local/Beta.db".into(), sha_of(&beta))));
+    assert!(v4.contains(&("characters_local/x.fch".into(), sha_of(&character))));
+    let v = versions_as(&h, &h.owner).await;
+    let all =
+        (character.len() + alpha3.len() + f.alpha_fwl.len() + beta.len() + f.beta_fwl.len()) as i64;
+    assert_eq!((v[0].file_count, v[0].total_size_bytes), (5, all));
+    let mut want: Vec<(String, Vec<u8>)> = with_alpha(&f, &alpha3)
+        .into_iter()
+        .map(|(p, b)| {
+            let b = match p {
+                "worlds_local/Beta.db" => &beta[..],
+                "characters_local/x.fch" => &character[..],
+                _ => b,
+            };
+            (p.to_string(), b.to_vec())
+        })
+        .collect();
+    want.sort_by(|x, y| x.0.cmp(&y.0));
+    assert_eq!(download_as(&h, &h.owner, 4).await, want);
+    let lease = lease_as(&h, &h.owner).await.expect("still hosted");
+    assert_eq!(lease.holder_user_id, MEMBER);
+    assert!(lease.pushed_since, "the member's push, not the owner's");
+    assert_eq!(
+        count(
+            &h.state.pool,
+            "SELECT COUNT(*) FROM snapshots WHERE save_id=?",
+            SAVE
+        )
+        .await,
+        4
+    );
+}
+
+#[tokio::test]
+async fn an_owner_behind_a_member_push_backs_up_without_the_lease() {
+    an_owner_behind_a_member_push(false).await;
+}
+
+#[tokio::test]
+async fn an_owner_behind_a_member_push_backs_up_through_the_multipart_too() {
+    an_owner_behind_a_member_push(true).await;
+}
+
+/// Behind a member's push, an owner who changed the world still needs the
+/// lease; and one whose other files moved on the server since its base (a
+/// second machine's backup) gets the plain divergence, not a carried world.
+#[tokio::test]
+async fn an_owner_behind_a_member_push_who_moved_more_is_refused() {
+    let h = harness().await;
+    let f = Folder::new();
+    folder_shared_as_alpha(&h, &f).await;
+    acquire_as(&h, &h.member, 1).await.expect("hosting");
+    let alpha2 = vec![9u8; 7_000];
+    backup_as(&h, &h.member, &alpha_only(&f, &alpha2), Some(1)).await;
+
+    let init = |files: Vec<(&'static str, Vec<u8>)>, base: i64| {
+        let h = &h;
+        async move {
+            let refs: Vec<(&str, &[u8])> = files.iter().map(|(p, b)| (*p, &b[..])).collect();
+            match cas::init(
+                st(h),
+                Extension(h.owner.clone()),
+                Path(SAVE.to_string()),
+                Json(CasInit {
+                    base_version: Some(base),
+                    files: manifest(&refs),
+                }),
+            )
+            .await
+            {
+                Err(e) => (e.0, e.1 .0["code"].as_str().unwrap_or_default().to_string()),
+                Ok(_) => panic!("accepted"),
+            }
+        }
+    };
+    fn owned(files: Vec<(&'static str, &[u8])>) -> Vec<(&'static str, Vec<u8>)> {
+        files.into_iter().map(|(p, b)| (p, b.to_vec())).collect()
+    }
+
+    let changed = vec![18u8; 7_000];
+    assert_eq!(
+        init(owned(with_alpha(&f, &changed)), 1).await,
+        (StatusCode::CONFLICT, "lease_required".to_string())
+    );
+
+    // Another machine of the owner's backs up Beta on top of the member's v2;
+    // this one, still on v1, changes the character.
+    let beta = vec![17u8; 9_100];
+    let v3 = with_beta(&with_alpha(&f, &alpha2), &beta);
+    let (_, snap) = backup_as(&h, &h.owner, &v3, Some(2)).await;
+    assert_eq!(snap.version_num, 3);
+    let character = b"alice on the laptop".to_vec();
+    let laptop: Vec<(&'static str, Vec<u8>)> = owned(f.files())
+        .into_iter()
+        .map(|(p, b)| {
+            if p == "characters_local/x.fch" {
+                (p, character.clone())
+            } else {
+                (p, b)
+            }
+        })
+        .collect();
+    assert_eq!(
+        init(laptop, 1).await,
+        (StatusCode::CONFLICT, "non_fast_forward".to_string())
+    );
+    assert_eq!(
+        count(
+            &h.state.pool,
+            "SELECT COUNT(*) FROM snapshots WHERE save_id=?",
+            SAVE
+        )
+        .await,
+        3
+    );
+    let lease = lease_as(&h, &h.owner).await.expect("still hosted");
+    assert_eq!(lease.holder_user_id, MEMBER);
+}
+
 /// Only the save's owner reads `caller_owns`, in the list and on its own.
 #[tokio::test]
 async fn caller_owns_is_set_only_on_the_owners_row() {

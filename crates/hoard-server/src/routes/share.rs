@@ -124,6 +124,26 @@ pub async fn included_rows(
     version: i64,
     include: &[String],
 ) -> Result<Rows, sqlx::Error> {
+    rows_on_side(conn, save_id, version, include, true).await
+}
+
+/// The rows of `version` the include list leaves out: the owner's other files.
+pub async fn excluded_rows(
+    conn: &mut SqliteConnection,
+    save_id: &str,
+    version: i64,
+    include: &[String],
+) -> Result<Rows, sqlx::Error> {
+    rows_on_side(conn, save_id, version, include, false).await
+}
+
+async fn rows_on_side(
+    conn: &mut SqliteConnection,
+    save_id: &str,
+    version: i64,
+    include: &[String],
+    world: bool,
+) -> Result<Rows, sqlx::Error> {
     let rows: Vec<(String, String)> = sqlx::query_as(
         "SELECT sf.relative_path, sf.sha256
            FROM snapshot_files sf
@@ -136,7 +156,7 @@ pub async fn included_rows(
     .await?;
     Ok(rows
         .into_iter()
-        .filter(|(path, _)| hoard_core::kernel::fileclass::included(include, path))
+        .filter(|(path, _)| hoard_core::kernel::fileclass::included(include, path) == world)
         .collect())
 }
 
@@ -171,11 +191,17 @@ pub async fn world_unchanged(
 pub struct PushGate {
     /// The push went through the lease: record it and announce it.
     pub hosted: bool,
-    /// A member pushing a list-shaped save: the list, to carry the rest.
-    member_include: Vec<String>,
+    /// The share's list when the push takes rows of the head forward: a
+    /// member's list-shaped push, or an owner's fast-forward on the world.
+    carry_include: Vec<String>,
+    /// Which rows come forward: the world (an owner whose world moved on the
+    /// server since the base) or the rest (a member).
+    carry_world: bool,
+    /// The owner's base behind the head that only the world moved past.
+    world_base: Option<i64>,
 }
 
-/// A row of the head a member's push does not carry, taken forward as is.
+/// A row of the head a push does not carry, taken forward as is.
 pub struct CarriedRow {
     file_id: String,
     path: String,
@@ -194,9 +220,17 @@ impl CarriedRow {
 /// head it read. `files` is the manifest as `(path, sha)`.
 ///
 /// A private save is not gated. On a shared one a member must hold the lease
-/// and push only the include list. The owner may push anything; the lease is
-/// needed unless the list is non-empty and the manifest's listed files equal
-/// the head's, which is a push that cannot bury anybody's world.
+/// and push only the include list. The owner may push anything, and needs the
+/// lease only to change the world, with a non-empty list:
+///
+/// - the manifest's listed files equal the head's: no lease, and the base must
+///   be the head, as for any push;
+/// - they differ from the head's but equal the base's: the world moved on the
+///   server, not here. No lease. When nothing else moved from the base to the
+///   head the base is accepted and the new version takes the head's world with
+///   the manifest's other files; otherwise the base must be the head;
+/// - otherwise the owner changed the world, and holds the lease for it.
+#[allow(clippy::too_many_arguments)]
 pub async fn push_gate(
     conn: &mut SqliteConnection,
     ns: &Namespace,
@@ -204,6 +238,7 @@ pub async fn push_gate(
     save_id: &str,
     user_id: &str,
     head: i64,
+    base: Option<i64>,
     files: &[(&str, &str)],
 ) -> Result<PushGate, ApiError> {
     if let Namespace::User(_) = ns {
@@ -219,28 +254,59 @@ pub async fn push_gate(
         }
         return Ok(PushGate {
             hosted: true,
-            member_include: include,
+            carry_include: include,
+            ..PushGate::default()
         });
     }
     if !include.is_empty() {
-        let head_world = included_rows(conn, save_id, head, &include)
-            .await
-            .map_err(|e| internal_logged("reading the head's world", e))?;
-        if manifest_included(&include, files) == head_world {
+        let read = |e: sqlx::Error| internal_logged("reading the world across versions", e);
+        let manifest_world = manifest_included(&include, files);
+        if manifest_world
+            == included_rows(conn, save_id, head, &include)
+                .await
+                .map_err(read)?
+        {
             return Ok(PushGate::default());
+        }
+        if let Some(base) = base.filter(|b| *b < head) {
+            if manifest_world
+                == included_rows(conn, save_id, base, &include)
+                    .await
+                    .map_err(read)?
+            {
+                // The world is the base's: this owner did not touch it. Other
+                // files that moved since the base are a plain divergence for
+                // the base check, not a reason to want the lease.
+                let rest_unmoved = excluded_rows(conn, save_id, base, &include)
+                    .await
+                    .map_err(read)?
+                    == excluded_rows(conn, save_id, head, &include)
+                        .await
+                        .map_err(read)?;
+                if !rest_unmoved {
+                    return Ok(PushGate::default());
+                }
+                return Ok(PushGate {
+                    hosted: false,
+                    carry_include: include,
+                    carry_world: true,
+                    world_base: Some(base),
+                });
+            }
         }
     }
     leases::require_host(&mut *conn, save_id, user_id).await?;
     Ok(PushGate {
         hosted: true,
-        member_include: Vec::new(),
+        ..PushGate::default()
     })
 }
 
 impl PushGate {
     /// May a push based on `base` land on `head`? Always when they match. A
     /// member of a list-shaped save also when the list's files did not change
-    /// in between: whatever else moved is carried forward, not buried.
+    /// in between: whatever else moved is carried forward, not buried. The
+    /// owner's base the gate found only the world moved past, too.
     pub async fn base_accepted(
         &self,
         conn: &mut SqliteConnection,
@@ -248,23 +314,33 @@ impl PushGate {
         base: i64,
         head: i64,
     ) -> Result<bool, ApiError> {
-        if base == head {
+        if base == head || self.world_base == Some(base) {
             return Ok(true);
         }
-        world_unchanged(conn, save_id, &self.member_include, base, head)
+        if self.carry_world {
+            return Ok(false);
+        }
+        world_unchanged(conn, save_id, &self.carry_include, base, head)
             .await
             .map_err(|e| internal_logged("comparing the world across versions", e))
     }
 
-    /// The head's rows the list leaves out, for a member's push to take
-    /// forward. Empty for the owner, a private save, or an unfiltered share.
+    /// Does the head's carried row stand in for this manifest path? Only the
+    /// owner's fast-forward replaces what it pushed: its world is the base's,
+    /// older than the head's.
+    pub fn replaces(&self, path: &str) -> bool {
+        self.carry_world && hoard_core::kernel::fileclass::included(&self.carry_include, path)
+    }
+
+    /// The head's rows the push takes forward: the ones the list leaves out
+    /// for a member, the world for an owner's fast-forward. Empty otherwise.
     pub async fn carried(
         &self,
         conn: &mut SqliteConnection,
         save_id: &str,
         head: i64,
     ) -> Result<Vec<CarriedRow>, sqlx::Error> {
-        if self.member_include.is_empty() {
+        if self.carry_include.is_empty() {
             return Ok(Vec::new());
         }
         let rows: Vec<(String, String, i64, String, Option<i64>)> = sqlx::query_as(
@@ -280,7 +356,8 @@ impl PushGate {
         Ok(rows
             .into_iter()
             .filter(|(_, path, ..)| {
-                !hoard_core::kernel::fileclass::included(&self.member_include, path)
+                hoard_core::kernel::fileclass::included(&self.carry_include, path)
+                    == self.carry_world
             })
             .map(|(file_id, path, size_bytes, sha, modified_at)| CarriedRow {
                 file_id,

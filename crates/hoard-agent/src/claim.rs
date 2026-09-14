@@ -464,12 +464,16 @@ fn catch_up(slot: &mut SaveSlot, lease: Option<&LeaseHandle>) {
 
 /// Behind the head with writes in the folder and no session to own them: they
 /// cannot go up (no lease without the head) and the pull must not walk over
-/// them, so they go to a side copy, as a viewer's do. The copy runs under a
-/// stopped session made for it, which is what `on_side_copied` ends and what
-/// keeps its renames from reading as writes. Not with the game running, not
-/// under an upload, and not again once a copy failed (`local_only_pending`).
+/// them, so they go to a side copy, as a viewer's do. The same for the owner's
+/// writes to the world while somebody else hosts it: the lease they need is
+/// taken, and the owner's other files wait on them (HRD-D-0019, resolution 1).
+/// The copy runs under a stopped session made for it, which is what
+/// `on_side_copied` ends and what keeps its renames from reading as writes.
+/// Not with the game running, not under an upload, and not again once a copy
+/// failed (`local_only_pending`).
 fn set_aside_behind(slot: &mut SaveSlot, now: Instant) -> bool {
-    if slot.stale_base.is_none()
+    let hosted_elsewhere = slot.save.owns_whole_folder() && slot.lease == LeaseObs::Other;
+    if (slot.stale_base.is_none() && !hosted_elsewhere)
         || slot.session.is_some()
         || !slot.has_pending
         || slot.is_running
@@ -2452,6 +2456,74 @@ mod tests {
 
         std::fs::write(folder.join("worlds_local/Alpha.db"), b"world, changed").unwrap();
         assert_eq!(on_reconciled(slot, now, &tx, None), Followup::SideCopy);
+    }
+
+    /// Finding 3 of the third end-to-end run: with no session, the owner
+    /// changed the world and a character while a member hosts. The push holds
+    /// for the lease, so the world is set aside; the pull brings the head's
+    /// world back and the character goes up without the lease, with no second
+    /// copy after it.
+    #[tokio::test(start_paused = true)]
+    async fn an_owners_world_edit_under_a_members_lease_is_set_aside_with_no_session() {
+        use kernel::reconcile::HOLD_LEASE_OTHER;
+        let (tx, _rx) = mpsc::channel(8);
+        let tmp = tempfile::tempdir().unwrap();
+        let folder = owner_folder(tmp.path());
+        let now = Instant::now();
+        let mut s = slots(vec![owned_world(&folder)]);
+        {
+            let slot = s.get_mut("w1").unwrap();
+            slot.lease = LeaseObs::Other;
+            crate::agent::test_sync_now(slot);
+            std::fs::write(folder.join("worlds_local/Alpha.db"), b"world, changed").unwrap();
+            std::fs::write(folder.join("characters_local/me.fch"), b"me, levelled up").unwrap();
+            slot.has_pending = true;
+            assert_eq!(
+                crate::agent::test_decisions(slot),
+                vec![kernel::Decision::Hold {
+                    reason: HOLD_LEASE_OTHER
+                }]
+            );
+            assert!(slot.session.is_none() && slot.stale_base.is_none());
+            assert_eq!(on_reconciled(slot, now, &tx, None), Followup::SideCopy);
+            assert_eq!(
+                on_reconciled(slot, now, &tx, None),
+                Followup::Nothing,
+                "asked once"
+            );
+        }
+        let dir = side_copy_dir(
+            &tmp.path().join("conflicts"),
+            "w1",
+            OffsetDateTime::UNIX_EPOCH,
+        );
+        let moved = move_world_aside(&s["w1"].save, &dir).await.unwrap();
+        assert_eq!(moved, 1);
+        on_side_copied(&mut s, "w1", moved, now, &tx);
+        let slot = s.get_mut("w1").unwrap();
+        assert!(slot.session.is_none());
+        assert!(!slot.has_pending && slot.pull_pending);
+        assert_eq!(
+            std::fs::read(dir.join("worlds_local/Alpha.db")).unwrap(),
+            b"world, changed"
+        );
+
+        // The pull lands with the head's world; the character is still newer.
+        // The merge reports the world it left, equal to the head's
+        // (`disk_world_hash`), and the reducer adopts it; the whole folder
+        // diverged, so its fingerprint stays.
+        std::fs::write(folder.join("worlds_local/Alpha.db"), b"world").unwrap();
+        slot.pull_pending = false;
+        slot.known_version = Some(3);
+        crate::agent::test_sync_world_now(slot);
+        crate::agent::after_pull_landed(slot, None);
+        assert!(slot.has_pending, "the character stays pending");
+        let decisions = crate::agent::test_decisions(slot);
+        assert!(
+            decisions.contains(&kernel::Decision::Act(kernel::Action::Backup)),
+            "{decisions:?}"
+        );
+        assert_eq!(on_reconciled(slot, now, &tx, None), Followup::Nothing);
     }
 
     fn lines(seen: &mut mpsc::UnboundedReceiver<String>) -> Vec<String> {

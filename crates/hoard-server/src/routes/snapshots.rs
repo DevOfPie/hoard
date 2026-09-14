@@ -711,7 +711,14 @@ pub async fn create(
         .map(|(rel, _, sha)| (rel.as_str(), sha.as_str()))
         .collect();
     let gate = match crate::routes::share::push_gate(
-        &mut tx, &ns, &access, &save_id, &user_id, head, &manifest,
+        &mut tx,
+        &ns,
+        &access,
+        &save_id,
+        &user_id,
+        head,
+        base_version,
+        &manifest,
     )
     .await
     {
@@ -761,17 +768,26 @@ pub async fn create(
     let parent_version: Option<i64> = (head > 0).then_some(head);
 
     // A member's push names the world only; the head's other files come
-    // forward so the version stays whole for the owner (HRD-D-0019).
+    // forward so the version stays whole for the owner. An owner's push that
+    // only the world moved past takes the head's world instead of its own
+    // (HRD-D-0019).
     let carried = gate.carried(&mut tx, &save_id, head).await.map_err(|e| {
         rollback_blobs(&created_blobs);
         cleanup_tmp();
         internal_logged("reading the head's other files", e)
     })?;
+    let replaced: Vec<usize> = files
+        .iter()
+        .enumerate()
+        .filter(|(_, (rel, ..))| gate.replaces(rel))
+        .map(|(i, _)| i)
+        .collect();
     // What the caller pushed, which is what the response describes; the row
     // holds the whole version.
     let pushed_count = files.len() as i64;
-    let file_count = pushed_count + carried.len() as i64;
-    let stored_size = total_size + carried.iter().map(|r| r.size_bytes()).sum::<i64>();
+    let file_count = pushed_count - replaced.len() as i64 + carried.len() as i64;
+    let stored_size = total_size - replaced.iter().map(|i| files[*i].1).sum::<i64>()
+        + carried.iter().map(|r| r.size_bytes()).sum::<i64>();
     sqlx::query(
         "INSERT INTO snapshots (id, save_id, version_num, device_name, notes,
                                 total_size_bytes, file_count, parent_version)
@@ -797,6 +813,9 @@ pub async fn create(
     // store (see the placement pass above), so nothing below can block on the
     // network while holding SQLite's single write lock.
     for (i, (rel_path, size, sha)) in files.iter().enumerate() {
+        if replaced.contains(&i) {
+            continue;
+        }
         let file_id = Uuid::new_v4().to_string();
         if sqlx::query!(
             "INSERT INTO snapshot_files (id, snapshot_id, relative_path, size_bytes, sha256)

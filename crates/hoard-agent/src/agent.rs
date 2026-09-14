@@ -330,6 +330,9 @@ enum AgentCommand {
     // it inline made every `AgentCommand` value as big as a `WatchedSave`.
     AddSave(Box<WatchedSave>),
     RemoveSave(String),
+    /// The same save seated again with a changed row (a share, an unshare, a
+    /// settings change), keeping what the slot knows is synced.
+    ReseatSave(Box<WatchedSave>),
     BackupNow(String),
     /// Staggered "backup sweep": re-hash every tracked save to catch changes
     /// the fs-watcher missed, but spread the per-save work over time so disk
@@ -640,6 +643,15 @@ impl AgentHandle {
     pub async fn remove_save(&self, save_id: impl Into<String>) -> Result<()> {
         self.tx
             .send(AgentCommand::RemoveSave(save_id.into()))
+            .await?;
+        Ok(())
+    }
+
+    /// Seats a tracked save again with its changed row, keeping what its slot
+    /// knows is synced. A save not seated yet is added.
+    pub async fn reseat_save(&self, save: WatchedSave) -> Result<()> {
+        self.tx
+            .send(AgentCommand::ReseatSave(Box::new(save)))
             .await?;
         Ok(())
     }
@@ -2528,6 +2540,13 @@ async fn run_agent(
                             // watcher dropped here, releasing inotify handle.
                         }
                     }
+                    Some(AgentCommand::ReseatSave(save)) => {
+                        handle_reseat(&mut slots, *save, &fs_tx);
+                        reconcile_all(
+                            &mut slots, &api, &events_tx, &cmd_tx, &config, &done_tx,
+                            &cloud_heads, lease_task.as_ref(),
+                        );
+                    }
                     Some(AgentCommand::BackupNow(id)) => {
                         // A manual backup: mark pending when the content diverges from
                         // what is synced (as with the backup's skip-by-set-hash,
@@ -3050,28 +3069,7 @@ async fn run_agent(
                 // regression). That distinction lived here as shell bookkeeping; now
                 // it is in the kernel (D.8.2), where C.5's replay reproduces it.
                 if let Some(slot) = slots.get_mut(&done.save_id) {
-                    slot.next_scheduled_backup_at = None;
-                    slot.first_pending_event_at = None;
-                    if let Some(h) = &done.new_set_hash {
-                        slot.last_set_hash = Some(h.clone());
-                    }
-                    slot.pending_op_result = Some(kernel::OpResult::Ok {
-                        version: done.version_num,
-                        fingerprint: done.new_set_hash.as_deref().map(fingerprint_from_set_hash),
-                        wrote: done.committed,
-                        world_fingerprint: done
-                            .new_world_hash
-                            .as_deref()
-                            .map(fingerprint_from_set_hash),
-                    });
-                    // The content-addressed check's answer (D.8.3) travels in the
-                    // same observation as the op's result: it is what lets the
-                    // reducer tell this no-op (nothing uploaded and nothing written
-                    // to the folder) from the 409 settled onto the head, which did
-                    // write and therefore stamps `last_restore_at`.
-                    if done.landed {
-                        slot.pending_upload_landed = Some(true);
-                    }
+                    apply_backup_done(slot, done);
                 }
                 reconcile_all(
                     &mut slots, &api, &events_tx, &cmd_tx, &config, &done_tx, &cloud_heads,
@@ -3140,6 +3138,42 @@ pub(crate) fn world_pending(slot: &SaveSlot) -> bool {
     match (now, slot.synced_world_fingerprint) {
         (Some(now), Some(synced)) => now != synced,
         _ => true,
+    }
+}
+
+/// Did the server carry the head's world into this owner's push instead of
+/// the one it sent (HRD-D-0019)? It lands an owner's push on a base behind
+/// the head only when nothing but the world moved in between, so the version
+/// it makes is past `base + 1` exactly then.
+pub(crate) fn world_carried_forward(save: &WatchedSave, base: Option<i64>, version: i64) -> bool {
+    save.owns_whole_folder() && base.is_some_and(|b| version > b + 1)
+}
+
+/// A finished upload, translated for the reducer (ADR 0021 D.7): `committed`
+/// travels as `OpResult::Ok { wrote }`, the commit-versus-no-op discriminant the
+/// reducer uses to anchor, or NOT anchor, the min-interval.
+fn apply_backup_done(slot: &mut SaveSlot, done: BackupDone) {
+    slot.next_scheduled_backup_at = None;
+    slot.first_pending_event_at = None;
+    if let Some(h) = &done.new_set_hash {
+        slot.last_set_hash = Some(h.clone());
+    }
+    slot.pending_op_result = Some(kernel::OpResult::Ok {
+        version: done.version_num,
+        fingerprint: done.new_set_hash.as_deref().map(fingerprint_from_set_hash),
+        wrote: done.committed,
+        world_fingerprint: done
+            .new_world_hash
+            .as_deref()
+            .map(fingerprint_from_set_hash),
+    });
+    // The content-addressed check's answer (D.8.3) travels in the same
+    // observation as the op's result: it is what lets the reducer tell this
+    // no-op (nothing uploaded and nothing written to the folder) from the 409
+    // settled onto the head, which did write and therefore stamps
+    // `last_restore_at`.
+    if done.landed {
+        slot.pending_upload_landed = Some(true);
     }
 }
 
@@ -3250,6 +3284,53 @@ fn handle_add(
     // restores.
     mark_pending_if_diverged(&mut slot);
     slots.insert(save_id, slot);
+}
+
+/// Seats a save again with its changed row (a share, an unshare, a settings
+/// change). The slot is rebuilt from the row, as an add does, but what it
+/// knew is synced stays: the version, both fingerprints and what is pending or
+/// in flight. A row carries no signature, and one learnt again from the folder
+/// is pending with an unknown world, which made a share push identical content
+/// under the lease. A world whose list changed is taken from the folder while
+/// the folder is the synced one, since its part of it was synced with it.
+fn handle_reseat(
+    slots: &mut HashMap<String, SaveSlot>,
+    save: WatchedSave,
+    fs_tx: &mpsc::Sender<FsHit>,
+) {
+    let id = save.save_id.clone();
+    let mut old = slots.remove(&id);
+    if let Some(old) = old.as_mut() {
+        if let Some(p) = old.pending.take() {
+            p.abort();
+        }
+        old.watcher = None;
+    }
+    handle_add(slots, save, fs_tx);
+    let (Some(old), Some(slot)) = (old, slots.get_mut(&id)) else {
+        return;
+    };
+    if slot.save.track_only {
+        return;
+    }
+    slot.known_version = old.known_version.or(slot.known_version);
+    slot.last_set_hash = old.last_set_hash.or(slot.last_set_hash.take());
+    slot.synced_fingerprint = old.synced_fingerprint.or(slot.synced_fingerprint);
+    slot.synced_world_fingerprint = if old.save.world() == slot.save.world() {
+        old.synced_world_fingerprint
+    } else {
+        observe_local_fingerprint(
+            &slot.save.local_path,
+            &slot.save.game_slug,
+            &slot.save.include,
+            slot.save.world(),
+        )
+        .filter(|(whole, _)| slot.synced_fingerprint == Some(*whole))
+        .map(|(_, world)| world)
+    };
+    slot.in_flight = old.in_flight;
+    slot.has_pending = old.has_pending;
+    mark_pending_if_diverged(slot);
 }
 
 /// Idle process-poll slowdown factor. When no tracked game is running the agent
@@ -4712,13 +4793,26 @@ async fn run_backup_with_retry(
                 signature,
                 world,
             }) => {
+                let world_behind =
+                    world_carried_forward(&save, base_version, o.snapshot.version_num);
+                if world_behind {
+                    tracing::info!(
+                        save_id = %save.save_id,
+                        game_slug = %save.game_slug,
+                        version_num = o.snapshot.version_num,
+                        base_version = ?base_version,
+                        "agent: backed up without the lease; the shared world moved on the server and comes down with the next pull"
+                    );
+                }
                 let _ = events_tx
                     .send(AgentEvent::BackupSuccess {
                         save_id: save.save_id.clone(),
                         version_num: o.snapshot.version_num,
                         total_bytes: o.total_bytes,
-                        set_hash: Some(signature.clone()),
-                        world_hash: Some(world.clone()),
+                        // The folder is not that version while its world is
+                        // behind: persisted, a restart would call it synced.
+                        set_hash: (!world_behind).then(|| signature.clone()),
+                        world_hash: (!world_behind).then(|| world.clone()),
                         already_landed: false,
                         deliberate: origin.is_deliberate(),
                     })
@@ -4774,12 +4868,19 @@ async fn run_backup_with_retry(
                 // signature. If the channel is full or the agent is shutting down we
                 // just drop the signal; worst case we re-upload an unchanged snapshot
                 // on the next GameStopped, which is a soft failure.
+                //
+                // A world carried forward leaves the folder behind the version
+                // it made: the version is not adopted, so the head is still
+                // ahead and gets pulled, and the world's fingerprint stays the
+                // base's, which is still what the folder holds. The folder's
+                // own signature is adopted: what it has went up, and the pull
+                // must not wait on it.
                 let _ = done_tx.try_send(BackupDone {
                     save_id: save.save_id.clone(),
                     new_set_hash: Some(signature),
-                    new_world_hash: Some(world),
+                    new_world_hash: (!world_behind).then_some(world),
                     committed: true,
-                    version_num: Some(o.snapshot.version_num),
+                    version_num: (!world_behind).then_some(o.snapshot.version_num),
                     landed: false,
                 });
                 return;
@@ -6435,6 +6536,15 @@ pub(crate) fn test_sync_now(slot: &mut SaveSlot) {
     slot.synced_world_fingerprint = Some(world);
 }
 
+/// Adopts the world on disk as synced and nothing else, as a pull that left
+/// the world equal to the head's and the rest diverged does. For `claim.rs`.
+#[cfg(test)]
+pub(crate) fn test_sync_world_now(slot: &mut SaveSlot) {
+    let whole = slot.synced_fingerprint;
+    test_sync_now(slot);
+    slot.synced_fingerprint = whole;
+}
+
 /// What the reducer decides for this slot as it stands: the folder sampled
 /// now, aged past the recency veto, and nothing heard from the cloud.
 #[cfg(test)]
@@ -8070,6 +8180,165 @@ mod tests {
         assert_eq!(seen.len(), 2, "{seen:?}");
         assert!(seen[1].1.contains("worlds_local/Alpha.db"), "{seen:?}");
         assert!(!seen[1].1.contains("characters_local"), "{seen:?}");
+    }
+
+    const INIT_V5: &str = r#"{"upload_id":"u1","version_num":5,"missing":[],"missing_bytes":0}"#;
+    const COMMIT_V5: &str = r#"{"id":"s5","version_num":5,"parent_version":4,"total_size_bytes":30,"file_count":3,"is_pinned":false,"created_at":"2026-09-14T09:14:11Z"}"#;
+
+    /// Steps 8 and 8b of the third end-to-end run (HRD-D-0019): the owner
+    /// synced at v3, a member hosting pushed v4, the owner changes Beta. The
+    /// backup goes out without the lease; the server carries the member's world
+    /// into v5. The owner's world stays the one it synced, nothing is pending,
+    /// and the next tick pulls the head instead of holding for the lease.
+    #[tokio::test(flavor = "current_thread")]
+    async fn an_owner_behind_a_members_push_backs_up_without_the_lease_then_pulls() {
+        use kernel::reconcile::{HOLD_LEASE_NEEDED, HOLD_LEASE_OTHER};
+        use kernel::{Action, Decision};
+
+        fn tick(slot: &mut SaveSlot, cloud: &CloudHeads, now: OffsetDateTime) -> Vec<Decision> {
+            let obs = observe_slot(slot, cloud);
+            let state = state_from_slot(slot, &AgentConfig::default(), now);
+            let (next, ds) =
+                kernel::reconcile::reconcile(&state, &obs, kernel::World { now, seed: 0 });
+            apply_state_to_slot(slot, next);
+            ds
+        }
+        let no_lease_hold = |ds: &[Decision]| {
+            !ds.iter().any(|d| {
+                matches!(d, Decision::Hold { reason } if *reason == HOLD_LEASE_OTHER || *reason == HOLD_LEASE_NEEDED)
+            })
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        owner_folder(root);
+        write_file(&root.join("worlds_local/Beta.db"), b"beta");
+        let mut save = owner_save(root);
+        save.policy.auto_restore = Some(true);
+        let mut slot = test_slot(save);
+        slot.known_version = Some(3);
+        slot.lease = kernel::LeaseObs::Other;
+        test_sync_now(&mut slot);
+        let world = slot.synced_world_fingerprint;
+        let t0 = OffsetDateTime::now_utc();
+        let mut cloud = CloudHeads::new(t0);
+        cloud.feed(HashMap::from([("w1".to_string(), 4)]), None, None, t0);
+
+        write_file(&root.join("worlds_local/Beta.db"), b"beta, changed");
+        mark_fs_hit(&mut slot, t0);
+        let ds = tick(&mut slot, &cloud, t0 + time::Duration::seconds(1));
+        assert!(ds.contains(&Decision::Act(Action::Backup)), "{ds:?}");
+        assert!(no_lease_hold(&ds), "{ds:?}");
+
+        let (url, seen) = refusing_server(vec![(200, INIT_V5), (201, COMMIT_V5)]).await;
+        let api = ApiClient::new(&url, "fake").unwrap();
+        let (events_tx, mut events_rx) = mpsc::channel(64);
+        let (done_tx, mut done_rx) = mpsc::channel(8);
+        let (cmd_tx, mut cmd_rx) = mpsc::channel(8);
+        run_backup_with_retry(
+            api,
+            slot.save.clone(),
+            None,
+            slot.known_version,
+            None,
+            VersionOrigin::Automatic,
+            false,
+            events_tx,
+            done_tx,
+            cmd_tx,
+            0,
+            false,
+            None,
+            14,
+        )
+        .await;
+        assert!(cmd_rx.try_recv().is_err(), "no hold, no retry");
+        {
+            let seen = seen.lock().unwrap();
+            assert_eq!(seen.len(), 2, "{seen:?}");
+            assert!(seen[0].1.contains(r#""base_version":3"#), "{seen:?}");
+        }
+        let done = done_rx.try_recv().expect("the push landed");
+        assert!(done.committed);
+        assert_eq!(done.version_num, None, "v5's world is not in the folder");
+        assert_eq!(done.new_world_hash, None);
+        assert!(done.new_set_hash.is_some());
+        let mut persisted = None;
+        while let Ok(e) = events_rx.try_recv() {
+            if let AgentEvent::BackupSuccess {
+                version_num,
+                set_hash,
+                world_hash,
+                ..
+            } = e
+            {
+                persisted = Some((version_num, set_hash, world_hash));
+            }
+        }
+        assert_eq!(persisted, Some((5, None, None)));
+
+        apply_backup_done(&mut slot, done);
+        let later = t0 + time::Duration::hours(1);
+        cloud.feed(HashMap::from([("w1".to_string(), 5)]), None, None, later);
+        let ds = tick(&mut slot, &cloud, later);
+        assert_eq!(ds, vec![Decision::Act(Action::Restore)]);
+        assert!(!slot.has_pending);
+        assert_eq!(slot.known_version, Some(3));
+        assert_eq!(slot.synced_world_fingerprint, world);
+
+        // Had the pull been held, the owner's folder would still not read as
+        // a world change or a pending push.
+        let mut held = slot;
+        held.in_flight = None;
+        held.next_restore_at = Some(later + time::Duration::minutes(5));
+        let ds = tick(&mut held, &cloud, later + time::Duration::seconds(1));
+        assert!(no_lease_hold(&ds), "{ds:?}");
+        assert!(!ds.contains(&Decision::Act(Action::Backup)), "{ds:?}");
+    }
+
+    /// Finding 2 of the third end-to-end run: sharing a tracked, synced save
+    /// seats it again with the share's list. It stays synced, its world
+    /// included, so nothing is pending, no lease is asked for and nothing is
+    /// pushed.
+    #[tokio::test(flavor = "current_thread")]
+    async fn sharing_a_synced_save_pushes_nothing_and_asks_for_no_lease() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        owner_folder(root);
+        write_file(&root.join("worlds_local/Beta.db"), b"beta");
+        let mut private = owner_save(root);
+        private.shared = None;
+        let mut slots = HashMap::new();
+        let (fs_tx, _fs_rx) = mpsc::channel(4);
+        handle_add(&mut slots, private, &fs_tx);
+        {
+            let slot = slots.get_mut("w1").unwrap();
+            test_sync_now(slot);
+            slot.has_pending = false;
+            assert_eq!(
+                crate::agent::test_decisions(slot),
+                vec![kernel::Decision::Hold {
+                    reason: "converged"
+                }]
+            );
+        }
+
+        handle_reseat(&mut slots, owner_save(root), &fs_tx);
+        let slot = slots.get_mut("w1").unwrap();
+        assert!(slot.save.owns_whole_folder());
+        assert!(!slot.has_pending);
+        let (_, world) =
+            observe_local_fingerprint(root, "valheim", &slot.save.include, slot.save.world())
+                .unwrap();
+        assert_eq!(slot.synced_world_fingerprint, Some(world));
+        assert_eq!(slot.known_version, Some(3));
+        assert!(!crate::claim::may_request_lease(slot));
+        assert_eq!(
+            crate::agent::test_decisions(slot),
+            vec![kernel::Decision::Hold {
+                reason: "converged"
+            }]
+        );
     }
 
     /// The L1 sample and the backup's skip signature are the same walk: with

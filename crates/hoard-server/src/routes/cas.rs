@@ -338,6 +338,7 @@ pub async fn init(
         &save_id,
         &user_id,
         head,
+        body.base_version,
         &manifest_rows(&body.files),
     )
     .await?;
@@ -1051,6 +1052,7 @@ pub async fn commit(
         &save_id,
         &user_id,
         head,
+        body.base_version,
         &manifest_rows(&body.files),
     )
     .await
@@ -1083,17 +1085,28 @@ pub async fn commit(
     let fail = |e: sqlx::Error, step: &'static str| internal_logged(step, e);
 
     // A member's push names the world only; the head's other files come
-    // forward so the version stays whole for the owner (HRD-D-0019).
+    // forward so the version stays whole for the owner. An owner's push that
+    // only the world moved past takes the head's world instead of its own
+    // (HRD-D-0019).
     let carried = gate.carried(&mut tx, &save_id, head).await.map_err(|e| {
         rollback(&placed);
         cleanup_staging();
         fail(e, "reading the head's other files")
     })?;
+    let written: Vec<&CasFile> = body
+        .files
+        .iter()
+        .filter(|f| !gate.replaces(&f.relative_path))
+        .collect();
     // What the caller pushed, which is what the response describes; the row
     // holds the whole version.
     let pushed_count = body.files.len() as i64;
-    let file_count = pushed_count + carried.len() as i64;
-    let stored_size = total_size + carried.iter().map(|r| r.size_bytes()).sum::<i64>();
+    let file_count = written.len() as i64 + carried.len() as i64;
+    let stored_size = written
+        .iter()
+        .map(|f| size_by_sha.get(f.sha256.as_str()).copied().unwrap_or(0))
+        .sum::<i64>()
+        + carried.iter().map(|r| r.size_bytes()).sum::<i64>();
 
     sqlx::query(
         "INSERT INTO snapshots (id, save_id, version_num, device_name, notes,
@@ -1116,7 +1129,7 @@ pub async fn commit(
         fail(e, "recording the snapshot")
     })?;
 
-    for f in &body.files {
+    for f in written {
         let file_id = Uuid::new_v4().to_string();
         let sha = f.sha256.as_str();
         let size = size_by_sha.get(sha).copied().unwrap_or(0);
