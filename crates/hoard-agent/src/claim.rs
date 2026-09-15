@@ -24,6 +24,7 @@ use std::path::{Path, PathBuf};
 
 use hoard_core::ipc::{AgentEvent, WorldChoice, WorldLease, WorldRole};
 use hoard_core::kernel::fileclass::Scope;
+use hoard_core::kernel::session::RECENT_SAVE_GRACE_SECS;
 use hoard_core::kernel::LeaseObs;
 use time::OffsetDateTime;
 use tokio::sync::mpsc;
@@ -315,9 +316,29 @@ pub(crate) fn on_claim(slot: &mut SaveSlot) {
     }
 }
 
+/// `ForceWorld`: the lease is taken off its holder and asked for here, as a
+/// host. Taken outside a session, like `ClaimWorld`, the role is the next
+/// one's, and not a push's lease to give back once idle.
+pub(crate) fn on_force_world(slot: &mut SaveSlot, lease: Option<&LeaseHandle>) {
+    slot.role = WorldRole::Host;
+    slot.role_pinned = slot.session.is_none();
+    on_claim(slot);
+    if let Some(lease) = lease {
+        // The task runs them in order: the takeover, then the acquire with
+        // this machine's head.
+        lease.force(slot.save.save_id.clone());
+        request_acquire(slot, lease);
+    }
+}
+
 /// Asks for the lease. The verdict clears `lease_requested`; a release asked
-/// for before is overtaken, so the verdict's `Mine` is kept.
+/// for before is overtaken, so the verdict's `Mine` is kept. Not behind the
+/// head: the answer is known, and the pull asks again (`catch_up`).
 pub(crate) fn request_acquire(slot: &mut SaveSlot, lease: &LeaseHandle) {
+    if let Some(base) = slot.stale_base {
+        tracing::debug!(save_id = %slot.save.save_id, base, "agent: behind the head; the acquire waits for the pull");
+        return;
+    }
     slot.lease_requested = true;
     slot.release_requested = false;
     lease.acquire(slot.save.save_id.clone(), slot.known_version.unwrap_or(0));
@@ -461,6 +482,9 @@ fn catch_up(slot: &mut SaveSlot, lease: Option<&LeaseHandle>) {
 /// stopped session made for it, which is what `on_side_copied` ends and what
 /// keeps its renames from reading as writes. Not with the game running, not
 /// under an upload, and not again once a copy failed (`local_only_pending`).
+/// Not while the folder was written within the kernel's recent-save grace
+/// either: a game `is_running` does not see may still have it open, and a
+/// later pass sets the writes aside once the folder is quiet.
 fn set_aside_behind(slot: &mut SaveSlot, now: Instant) -> bool {
     if slot.stale_base.is_none()
         || slot.session.is_some()
@@ -470,6 +494,14 @@ fn set_aside_behind(slot: &mut SaveSlot, now: Instant) -> bool {
         || slot.local_only_pending
         || slot.lease == LeaseObs::Mine
     {
+        return false;
+    }
+    let wall = OffsetDateTime::now_utc();
+    if slot
+        .last_fs_event_at
+        .is_some_and(|t| (wall - t).whole_seconds() < RECENT_SAVE_GRACE_SECS)
+    {
+        tracing::debug!(save_id = %slot.save.save_id, "agent: behind the head, but the folder was written recently; not setting it aside yet");
         return false;
     }
     tracing::info!(save_id = %slot.save.save_id, "agent: behind the head with local writes; setting them aside before the pull");
@@ -2213,6 +2245,136 @@ mod tests {
         assert!(!drain(&mut rx)
             .iter()
             .any(|e| matches!(e, AgentEvent::WorldLeaseLost { .. })));
+    }
+
+    /// Asked to host again, or forced, while the first acquire was refused as
+    /// stale: nothing is left waiting on a verdict. The game writes and
+    /// stops, the stopped session ends, the writes go aside, the head comes
+    /// down, and the next launch's write asks with the new head and is
+    /// answered.
+    #[tokio::test(start_paused = true)]
+    async fn asked_again_behind_the_head_leaves_no_acquire_waiting() {
+        for verb in ["host", "force"] {
+            let (tx, mut rx) = mpsc::channel(32);
+            let (lease, mut seen) = LeaseHandle::probe();
+            let now = Instant::now();
+            let tmp = tempfile::tempdir().unwrap();
+            let folder = tmp.path().join("save");
+            std::fs::create_dir_all(folder.join("worlds_local")).unwrap();
+            std::fs::write(folder.join("worlds_local/Alpha.db"), b"mine").unwrap();
+            let mut save = world("w1", "valheim");
+            save.local_path = folder.clone();
+            save.include = vec!["worlds_local/Alpha.db".into()];
+            let mut s = slots(vec![save]);
+            s.get_mut("w1").unwrap().lease = LeaseObs::Free;
+            on_game_started(&mut s, "w1", now, &tx);
+            let ask = |slot: &mut SaveSlot| match verb {
+                "host" => on_claim_world(slot, WorldRole::Host, &tx, Some(&lease)),
+                _ => on_force_world(slot, Some(&lease)),
+            };
+            {
+                let slot = s.get_mut("w1").unwrap();
+                ask(slot);
+                assert!(slot.lease_requested, "{verb}");
+                // The engine's `LeaseStale` arm.
+                on_lease(slot, LeaseObs::Free, None, true, &tx, Some(&lease));
+                on_stale(slot, 3);
+                ask(slot);
+                assert!(!slot.lease_requested, "{verb}: no verdict is coming");
+
+                // The game writes, and the grace has passed by the time it
+                // stops.
+                slot.has_pending = true;
+                slot.last_fs_event_at = Some(
+                    OffsetDateTime::now_utc() - time::Duration::seconds(RECENT_SAVE_GRACE_SECS + 1),
+                );
+                on_write(slot, &tx, Some(&lease));
+                on_game_stopped(slot);
+                assert_eq!(
+                    on_reconciled(slot, now, &tx, Some(&lease)),
+                    Followup::Nothing
+                );
+                assert!(slot.session.is_none(), "{verb}: the stopped session ends");
+                assert_eq!(
+                    on_reconciled(slot, now, &tx, Some(&lease)),
+                    Followup::SideCopy,
+                    "{verb}"
+                );
+            }
+            let dir = side_copy_dir(
+                &tmp.path().join("conflicts"),
+                "w1",
+                OffsetDateTime::UNIX_EPOCH,
+            );
+            let moved = move_world_aside(&s["w1"].save, &dir).await.unwrap();
+            on_side_copied(&mut s, "w1", moved, now, &tx);
+            assert_eq!(
+                std::fs::read(dir.join("worlds_local/Alpha.db")).unwrap(),
+                b"mine"
+            );
+            {
+                let slot = s.get_mut("w1").unwrap();
+                assert!(slot.pull_pending && !slot.has_pending, "{verb}");
+                // The pull landed.
+                slot.pull_pending = false;
+                slot.known_version = Some(4);
+                assert_eq!(
+                    on_reconciled(slot, now, &tx, Some(&lease)),
+                    Followup::Nothing
+                );
+                assert_eq!(slot.stale_base, None, "{verb}");
+            }
+
+            on_game_started(&mut s, "w1", now, &tx);
+            let slot = s.get_mut("w1").unwrap();
+            on_write(slot, &tx, Some(&lease));
+            assert!(
+                slot.lease_requested,
+                "{verb}: asked again with the new head"
+            );
+            on_lease(
+                slot,
+                LeaseObs::Mine,
+                Some("me".into()),
+                true,
+                &tx,
+                Some(&lease),
+            );
+            assert!(!slot.lease_requested, "{verb}: answered");
+            assert_eq!(slot.lease, LeaseObs::Mine, "{verb}");
+            tokio::task::yield_now().await;
+            let expected: &[&str] = match verb {
+                "host" => &["acquire w1", "acquire w1"],
+                _ => &["force w1", "acquire w1", "force w1", "acquire w1"],
+            };
+            assert_eq!(lines(&mut seen), expected, "{verb}");
+            assert!(
+                !drain(&mut rx)
+                    .iter()
+                    .any(|e| matches!(e, AgentEvent::WorldLeaseLost { .. })),
+                "{verb}"
+            );
+        }
+    }
+
+    /// Behind the head with writes and no session, a folder written within
+    /// the kernel's grace is not moved aside: a game the agent does not see
+    /// may still have it open. Once the grace has passed, it is.
+    #[tokio::test(start_paused = true)]
+    async fn behind_the_head_a_recent_write_is_not_set_aside_until_the_grace_passes() {
+        let (tx, _rx) = mpsc::channel(8);
+        let now = Instant::now();
+        let mut s = slots(vec![world("w1", "valheim")]);
+        let slot = s.get_mut("w1").unwrap();
+        slot.has_pending = true;
+        on_stale(slot, 3);
+        slot.last_fs_event_at = Some(OffsetDateTime::now_utc() - time::Duration::seconds(10));
+        assert_eq!(on_reconciled(slot, now, &tx, None), Followup::Nothing);
+        assert!(slot.session.is_none(), "no side copy under a recent write");
+        slot.last_fs_event_at =
+            Some(OffsetDateTime::now_utc() - time::Duration::seconds(RECENT_SAVE_GRACE_SECS + 1));
+        assert_eq!(on_reconciled(slot, now, &tx, None), Followup::SideCopy);
+        assert!(slot.session.as_ref().is_some_and(|w| w.side_copy_started));
     }
 
     /// A failed side copy of writes behind the head is not retried every
