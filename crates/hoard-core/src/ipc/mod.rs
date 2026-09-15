@@ -1662,6 +1662,7 @@ mod tests {
             Request::ShareSave {
                 save_id: id(),
                 group_id: "g1".into(),
+                world: None,
             },
             Request::UnshareSave { save_id: id() },
             Request::GetLease { save_id: id() },
