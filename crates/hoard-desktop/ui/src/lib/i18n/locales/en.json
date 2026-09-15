@@ -1126,7 +1126,7 @@
   "lease.take_over_title": "Take over this world?",
   "lease.take_over_body": "You become the host of \"{label}\". The current holder's session stops pushing; the service refuses if they already pushed under their lease.",
   "lease.err_held": "Another member is hosting this world.",
-  "lease.err_stale": "Your lease went stale: the server hasn't heard from this machine in a while. Claim it again.",
+  "lease.err_stale": "This world is behind the latest version: Hoard is pulling it first. Claim it again once it's in.",
   "lease.err_required": "You need to host this world before pushing to it.",
   "lease.err_pushed": "The holder already pushed under their lease. It can't be taken over; ask them to release it.",
   "lease.err_not_holder": "This machine doesn't hold the lease on this world.",

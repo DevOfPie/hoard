@@ -1126,7 +1126,7 @@
   "lease.take_over_title": "接管这个世界？",
   "lease.take_over_body": "你将成为“{label}”的托管者。当前持有者的会话停止推送；如果其已在租约下推送过，服务会拒绝。",
   "lease.err_held": "另一位成员正在托管这个世界。",
-  "lease.err_stale": "你的租约已失效：服务器已有一段时间没有收到这台电脑的消息。请重新申请。",
+  "lease.err_stale": "此世界不是最新版本：Hoard 正在先拉取最新版本。拉取完成后请再次申请。",
   "lease.err_required": "推送前需要先托管这个世界。",
   "lease.err_pushed": "持有者已在租约下推送过。无法接管；请让其释放。",
   "lease.err_not_holder": "这台电脑不持有这个世界的租约。",

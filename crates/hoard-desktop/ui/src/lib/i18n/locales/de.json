@@ -1126,7 +1126,7 @@
   "lease.take_over_title": "Diese Welt übernehmen?",
   "lease.take_over_body": "Du wirst Host von „{label}“. Die Sitzung des bisherigen Inhabers lädt nichts mehr hoch; der Dienst lehnt ab, wenn er unter seiner Lease bereits hochgeladen hat.",
   "lease.err_held": "Ein anderes Mitglied hostet diese Welt.",
-  "lease.err_stale": "Deine Lease ist abgelaufen: der Server hat länger nichts von diesem Rechner gehört. Beanspruche sie erneut.",
+  "lease.err_stale": "Diese Welt ist nicht auf dem neuesten Stand: Hoard lädt zuerst die neueste Version. Beanspruche sie erneut, sobald sie da ist.",
   "lease.err_required": "Du musst diese Welt hosten, bevor du hochladen kannst.",
   "lease.err_pushed": "Der Inhaber hat unter seiner Lease bereits hochgeladen. Sie kann nicht übernommen werden; bitte ihn, sie freizugeben.",
   "lease.err_not_holder": "Dieser Rechner hält die Lease auf diese Welt nicht.",

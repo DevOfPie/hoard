@@ -1126,7 +1126,7 @@
   "lease.take_over_title": "Assumir este mundo?",
   "lease.take_over_body": "Você passa a hospedar \"{label}\". A sessão do titular atual para de enviar; o serviço recusa se ele já enviou sob a posse dele.",
   "lease.err_held": "Outro membro está hospedando este mundo.",
-  "lease.err_stale": "Sua posse expirou: o servidor não tem notícias desta máquina há um tempo. Reivindique de novo.",
+  "lease.err_stale": "Este mundo não está na versão mais recente: o Hoard está primeiro a obtê-la. Reclame-o de novo quando tiver chegado.",
   "lease.err_required": "Você precisa hospedar este mundo antes de enviar para ele.",
   "lease.err_pushed": "O titular já enviou sob a posse dele. Não dá para assumir; peça que ele libere.",
   "lease.err_not_holder": "Esta máquina não tem a posse deste mundo.",

@@ -1126,7 +1126,7 @@
   "lease.take_over_title": "Reprendre ce monde ?",
   "lease.take_over_body": "Vous devenez l'hôte de « {label} ». La session du détenteur actuel cesse d'envoyer ; le service refuse s'il a déjà envoyé sous son bail.",
   "lease.err_held": "Un autre membre héberge ce monde.",
-  "lease.err_stale": "Votre bail est périmé : le serveur n'a pas eu de nouvelles de cette machine depuis un moment. Réclamez-le à nouveau.",
+  "lease.err_stale": "Ce monde n'est pas à jour : Hoard récupère d'abord la dernière version. Réclamez-le à nouveau une fois qu'elle est arrivée.",
   "lease.err_required": "Vous devez héberger ce monde avant d'y envoyer quoi que ce soit.",
   "lease.err_pushed": "Le détenteur a déjà envoyé sous son bail. Impossible de reprendre ; demandez-lui de le libérer.",
   "lease.err_not_holder": "Cette machine ne détient pas le bail de ce monde.",

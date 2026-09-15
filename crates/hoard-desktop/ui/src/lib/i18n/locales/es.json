@@ -1126,7 +1126,7 @@
   "lease.take_over_title": "¿Tomar el control de este mundo?",
   "lease.take_over_body": "Pasas a alojar «{label}». La sesión del titular actual deja de subir; el servicio se niega si ya subió bajo su alquiler.",
   "lease.err_held": "Otro miembro está alojando este mundo.",
-  "lease.err_stale": "Tu alquiler ha caducado: el servidor lleva un rato sin saber de esta máquina. Reclámalo de nuevo.",
+  "lease.err_stale": "Este mundo no está en la última versión: Hoard la está descargando primero. Reclámalo de nuevo cuando haya llegado.",
   "lease.err_required": "Tienes que alojar este mundo antes de subir a él.",
   "lease.err_pushed": "El titular ya subió bajo su alquiler. No se puede tomar el control; pídele que lo libere.",
   "lease.err_not_holder": "Esta máquina no tiene el alquiler de este mundo.",
