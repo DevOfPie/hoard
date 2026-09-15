@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [1.2.0-1] - 2026-09-15
+
 ### Added
 - **A self-hosted server can share a save between accounts.** Create a group,
   invite the people you play with, and share a save into it: every member sees
