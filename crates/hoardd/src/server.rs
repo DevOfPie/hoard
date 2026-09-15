@@ -749,9 +749,9 @@ where
                 }
             }
             other => {
-                let kind = request_kind(&other);
+                let kind = other.kind();
                 let reply = daemon.dispatch(other).await;
-                if out.send(reply_frame(id, reply, &kind)).await.is_err() {
+                if out.send(reply_frame(id, reply, kind)).await.is_err() {
                     break;
                 }
             }
@@ -797,23 +797,6 @@ fn reply_frame(id: u64, reply: Reply, kind: &str) -> ServerFrame {
             }
         }
     }
-}
-
-/// A request's wire name (`get_lease`), for the log. Read off the serde tag so
-/// it cannot drift from the contract; nothing else of the request is kept, and
-/// an adopted session's tokens never reach the log.
-fn request_kind(request: &Request) -> String {
-    #[derive(serde::Deserialize)]
-    struct Op {
-        op: String,
-    }
-    encode_frame(request)
-        .ok()
-        .and_then(|bytes| {
-            hoard_core::ipc::decode_frame::<Op>(&bytes[hoard_core::ipc::HEADER_BYTES..]).ok()
-        })
-        .map(|tag| tag.op)
-        .unwrap_or_else(|| "unknown".to_string())
 }
 
 /// Forwards new journal rows to the client. It skips what was already in the
@@ -1006,9 +989,10 @@ mod tests {
     #[test]
     fn a_request_is_logged_by_its_wire_name() {
         assert_eq!(
-            request_kind(&Request::GetLease {
+            Request::GetLease {
                 save_id: "w1".into()
-            }),
+            }
+            .kind(),
             "get_lease"
         );
     }
