@@ -1,0 +1,62 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT g.id, g.name, g.owner_user_id, g.created_at,\n                  gm.user_id AS member_id, u.username, gm.role, gm.joined_at\n           FROM groups g\n           JOIN group_members gm ON gm.group_id = g.id\n           JOIN users u ON u.id = gm.user_id\n           WHERE g.id = ?\n           ORDER BY gm.joined_at, gm.user_id",
+  "describe": {
+    "columns": [
+      {
+        "name": "id",
+        "ordinal": 0,
+        "type_info": "Text"
+      },
+      {
+        "name": "name",
+        "ordinal": 1,
+        "type_info": "Text"
+      },
+      {
+        "name": "owner_user_id",
+        "ordinal": 2,
+        "type_info": "Text"
+      },
+      {
+        "name": "created_at",
+        "ordinal": 3,
+        "type_info": "Text"
+      },
+      {
+        "name": "member_id",
+        "ordinal": 4,
+        "type_info": "Text"
+      },
+      {
+        "name": "username",
+        "ordinal": 5,
+        "type_info": "Text"
+      },
+      {
+        "name": "role",
+        "ordinal": 6,
+        "type_info": "Text"
+      },
+      {
+        "name": "joined_at",
+        "ordinal": 7,
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "d6501cf65ef3bef7b4d0d811548bcfc430c8565cc33f3b4a85236c47d8345990"
+}

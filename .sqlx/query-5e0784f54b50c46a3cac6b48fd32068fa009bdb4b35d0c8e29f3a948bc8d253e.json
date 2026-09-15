@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "UPDATE groups SET storage_used_bytes = MAX(0, storage_used_bytes + ?) WHERE id = ?",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 2
+    },
+    "nullable": []
+  },
+  "hash": "5e0784f54b50c46a3cac6b48fd32068fa009bdb4b35d0c8e29f3a948bc8d253e"
+}

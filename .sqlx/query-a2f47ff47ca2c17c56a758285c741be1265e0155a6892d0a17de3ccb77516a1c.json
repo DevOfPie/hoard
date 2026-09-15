@@ -1,26 +1,26 @@
 {
   "db_name": "SQLite",
-  "query": "SELECT storage_used_bytes, storage_quota_bytes FROM users WHERE id = ?",
+  "query": "SELECT refcount, size_bytes FROM chunks WHERE user_id = ? AND sha256 = ?",
   "describe": {
     "columns": [
       {
-        "name": "storage_used_bytes",
+        "name": "refcount",
         "ordinal": 0,
         "type_info": "Integer"
       },
       {
-        "name": "storage_quota_bytes",
+        "name": "size_bytes",
         "ordinal": 1,
         "type_info": "Integer"
       }
     ],
     "parameters": {
-      "Right": 1
+      "Right": 2
     },
     "nullable": [
       false,
       false
     ]
   },
-  "hash": "a929feac5c11e0ca4bba001e758e95ab8199e0215c9963bc9ebccbc697466c64"
+  "hash": "a2f47ff47ca2c17c56a758285c741be1265e0155a6892d0a17de3ccb77516a1c"
 }

@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "UPDATE group_invites SET used_by = ?, used_at = ?\n         WHERE id = ? AND used_at IS NULL AND expires_at > ?",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 4
+    },
+    "nullable": []
+  },
+  "hash": "e80ae5ff622f7647a90c7946866baff0372c984886c8e7aa85f808aa7768c7f5"
+}

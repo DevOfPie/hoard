@@ -55,7 +55,7 @@ use hoard_agent::state::CliState;
 use hoard_agent::supervisor::{self, Finished};
 use hoard_core::ipc::{
     AdoptedSession, AgentSlotStatus, CloudToken, DaemonStatus, EngineDownReason, IpcError,
-    KeyringFault, Payload, Request, ServerSession, UpdateState,
+    KeyringFault, Payload, Request, ServerSession, UpdateState, WorldPrompt,
 };
 use hoardd::client::{Client, Push};
 use hoardd::endpoint::Endpoint;
@@ -250,6 +250,10 @@ pub struct UiSnapshot {
     /// HUD will say nobody is playing with the game right there. The service already
     /// keeps the tally; this copies it.
     pub slots: Vec<AgentSlotStatus>,
+    /// The claim prompts the engine is still waiting on, from the same `Status`
+    /// the slots come from. State, like them: the HUD draws the question from
+    /// here because `WorldClaimWanted` went out before the HUD existed.
+    pub prompts: Vec<WorldPrompt>,
     /// In chronological order, oldest first (like the backlog).
     pub rows: Vec<BacklogRow>,
     pub cloud: CloudPulse,
@@ -290,6 +294,8 @@ pub struct DaemonLink {
     /// The last slots the service reported, from the same `Status`
     /// [`Self::last_status`] comes from.
     slots: Mutex<Vec<AgentSlotStatus>>,
+    /// The pending claim prompts from that same `Status`.
+    prompts: Mutex<Vec<WorldPrompt>>,
     /// The cloud loop's last pulse; it lives in `commands::cloud_pull` and emits on
     /// its own. The same reason as the journal: its events are momentary and whoever
     /// was not listening cannot get them back.
@@ -550,6 +556,13 @@ impl DaemonLink {
         *self.slots.lock().unwrap() = slots.to_vec();
     }
 
+    /// Records the last `Status`'s pending prompts, and empties them with the
+    /// slots: a question from an engine we can no longer reach is not one the
+    /// HUD can answer.
+    fn note_prompts(&self, prompts: &[WorldPrompt]) {
+        *self.prompts.lock().unwrap() = prompts.to_vec();
+    }
+
     /// Todo lo que este proceso sabe, copiado. Sin E/S y sin tocar el servicio:
     /// ver [`UiSnapshot`].
     pub fn snapshot(&self) -> UiSnapshot {
@@ -562,6 +575,7 @@ impl DaemonLink {
                 .clone()
                 .unwrap_or_else(AgentStatus::down),
             slots: self.slots.lock().unwrap().clone(),
+            prompts: self.prompts.lock().unwrap().clone(),
             rows: self.journal.lock().unwrap().iter().cloned().collect(),
             cloud,
             cloud_retry_in,
@@ -618,6 +632,7 @@ async fn pump(app: AppHandle) -> Finished {
         // The UI must not be left believing the engine is still there: if we lost
         // the socket, we know nothing about it.
         app.state::<AppState>().daemon.note_slots(&[]);
+        app.state::<AppState>().daemon.note_prompts(&[]);
         emit_status(&app, &AgentStatus::down());
         tokio::time::sleep(reconnect_delay()).await;
     }
@@ -686,7 +701,29 @@ async fn pump_once(app: &AppHandle) -> Result<()> {
                 // the one the main window heard.
                 let row = BacklogRow::from(entry);
                 state.daemon.remember(std::slice::from_ref(&row), false);
+                // The prompt and the lease are *state*, and the HUD reads state
+                // from the last `Status` (every 20 s). A question that waits 20 s
+                // to be shown, or lingers 20 s after its answer, is the wrong
+                // HUD, so the status is re-read on the events that move it:
+                // before the prompt goes out, so the main window's snapshot
+                // already has the clock; after the rest, so the mirror follows.
+                let moves_state = matches!(
+                    row.event,
+                    AgentEvent::GameStarted { .. }
+                        | AgentEvent::GameStopped { .. }
+                        | AgentEvent::WorldClaimed { .. }
+                        | AgentEvent::WorldReleased { .. }
+                        | AgentEvent::WorldHostedElsewhere { .. }
+                        | AgentEvent::WorldLeaseLost { .. }
+                );
+                if matches!(row.event, AgentEvent::WorldClaimWanted { .. }) {
+                    refresh_status(app).await;
+                }
                 emit_event(app, &row.event);
+                if moves_state {
+                    let app = app.clone();
+                    tokio::spawn(async move { refresh_status(&app).await });
+                }
             }
             // We lagged and the channel dropped rows. The daemon confesses instead
             // of leaving the gap invisible, and we ask again from our cursor.
@@ -731,6 +768,7 @@ async fn status_loop(app: AppHandle) -> Finished {
             Ok(status) => {
                 announce_slots(&app, &status.slots, &mut armed);
                 state.daemon.note_slots(&status.slots);
+                state.daemon.note_prompts(&status.engine.prompts);
                 let now = AgentStatus::from_daemon(&status);
                 if !now.running {
                     tracing::debug!(
@@ -745,10 +783,30 @@ async fn status_loop(app: AppHandle) -> Finished {
             Err(err) => {
                 tracing::debug!(error = %format!("{err:#}"), "desktop: couldn't read the service status");
                 state.daemon.note_slots(&[]);
+                state.daemon.note_prompts(&[]);
                 emit_status(&app, &AgentStatus::down());
             }
         }
         tokio::time::sleep(STATUS_EVERY).await;
+    }
+}
+
+/// One out-of-turn read of the state, for the events that change what the
+/// HUD's snapshot says (a prompt, a claim, a lease). It notes and publishes
+/// exactly as the loop does, minus the watcher announcements, which are the
+/// loop's alone: announcing again from here would arm every slot twice in the
+/// feed. A read that fails changes nothing; the loop's next pass will say.
+async fn refresh_status(app: &AppHandle) {
+    let state = app.state::<AppState>();
+    match state.daemon.status().await {
+        Ok(status) => {
+            state.daemon.note_slots(&status.slots);
+            state.daemon.note_prompts(&status.engine.prompts);
+            emit_status(app, &AgentStatus::from_daemon(&status));
+        }
+        Err(err) => {
+            tracing::debug!(error = %format!("{err:#}"), "desktop: couldn't re-read the service status after an event");
+        }
     }
 }
 
@@ -854,6 +912,12 @@ fn emit_event(app: &AppHandle, ev: &AgentEvent) {
         AgentEvent::RestoreDeferred { .. } => "agent://restore-deferred",
         AgentEvent::SaveAutoRestoreStuck { .. } => "agent://save-auto-restore-stuck",
         AgentEvent::SaveAutoRestoreRecovered { .. } => "agent://save-auto-restore-recovered",
+        AgentEvent::WorldClaimed { .. } => "agent://world-claimed",
+        AgentEvent::WorldReleased { .. } => "agent://world-released",
+        AgentEvent::WorldHostedElsewhere { .. } => "agent://world-hosted-elsewhere",
+        AgentEvent::WorldLeaseLost { .. } => "agent://world-lease-lost",
+        AgentEvent::WorldClaimWanted { .. } => "agent://world-claim-wanted",
+        AgentEvent::ViewSessionWriting { .. } => "agent://view-session-writing",
     };
     let _ = app.emit(topic, ev);
 

@@ -38,6 +38,7 @@
  * uploads…) in one obvious spot.
  */
 import { derived, get, writable, type Writable } from "svelte/store";
+import { subscribeWorldEvents, unsubscribeWorldEvents } from "./groups";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import {
   isPermissionGranted,
@@ -224,6 +225,14 @@ async function ensureNotificationPermission() {
  *  toast or a system notification for something that happened while the app
  *  was closed. */
 let replaying = false;
+
+/** Whether the journal is being replayed right now. The world stores ask
+ *  before raising anything from an event: a claim prompt or a hold that
+ *  happened while the app was closed is history, and the engine's status
+ *  says whether it is still open. */
+export function isReplaying(): boolean {
+  return replaying;
+}
 
 function notify(title: string, body: string) {
   if (replaying) return;
@@ -617,6 +626,10 @@ export async function subscribeAgent() {
     api.setTrayState(s).catch((e) => console.warn("setTrayState failed:", e));
   });
 
+  // The world leases live in their own store; its listeners go in here, before
+  // the relay, for the same reason as the rest.
+  await subscribeWorldEvents();
+
   // Only now, with every listener registered, ask Rust to relay the service's
   // journal and live events. Do it the other way round and the backlog lands
   // before anyone is listening.
@@ -629,6 +642,7 @@ export async function unsubscribeAgent() {
   await api
     .detachAgentEvents()
     .catch((e) => console.warn("detachAgentEvents failed:", e));
+  await unsubscribeWorldEvents();
   for (const u of unlisteners) {
     try {
       u();

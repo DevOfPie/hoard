@@ -98,6 +98,19 @@ pub enum Kind {
     UpdateReady {
         version: String,
     },
+    /// Local changes on a shared world another member is hosting: they stay
+    /// on this machine until the lease is free.
+    WorldHostedElsewhere {
+        holder: String,
+    },
+    /// The hosting lease this machine held is gone; nothing pushes from here.
+    WorldLeaseLost,
+    /// The app has a question: which shared world, and hosting or viewing.
+    WorldClaimWanted {
+        worlds: usize,
+    },
+    /// The game keeps saving into a world this machine only views.
+    ViewSessionWriting,
 }
 
 /// What to notify about for this event, or nothing.
@@ -179,6 +192,47 @@ pub fn notice_for(event: &AgentEvent, prefs: &Prefs) -> Option<Notice> {
                 failures: *failures,
             },
         }),
+        // The two shared-world notices are problems the user has to know
+        // about: their play is not reaching the server.
+        AgentEvent::WorldHostedElsewhere {
+            save_id,
+            game_slug,
+            holder,
+        } => prefs.notify_on_failure.then(|| Notice {
+            name: Some(game_slug.clone()),
+            save_id: save_id.clone(),
+            kind: Kind::WorldHostedElsewhere {
+                holder: holder.clone(),
+            },
+        }),
+        AgentEvent::WorldLeaseLost {
+            save_id, game_slug, ..
+        } => prefs.notify_on_failure.then(|| Notice {
+            name: Some(game_slug.clone()),
+            save_id: save_id.clone(),
+            kind: Kind::WorldLeaseLost,
+        }),
+        // The prompt is a question, not a problem, and it is answered in the
+        // app: the notice only says the app is waiting. It skips the failure
+        // preference the way a deliberate backup does, because silence here
+        // costs a minute of nobody hosting or a session that never pushes.
+        AgentEvent::WorldClaimWanted { game_slug, worlds } => Some(Notice {
+            name: Some(game_slug.clone()),
+            save_id: worlds
+                .first()
+                .map(|w| w.save_id.clone())
+                .unwrap_or_default(),
+            kind: Kind::WorldClaimWanted {
+                worlds: worlds.len(),
+            },
+        }),
+        AgentEvent::ViewSessionWriting { save_id, game_slug } => {
+            prefs.notify_on_failure.then(|| Notice {
+                name: Some(game_slug.clone()),
+                save_id: save_id.clone(),
+                kind: Kind::ViewSessionWriting,
+            })
+        }
         _ => None,
     }
 }
@@ -335,6 +389,10 @@ fn notifiable(event: &AgentEvent) -> bool {
             | AgentEvent::BackupFailed { .. }
             | AgentEvent::BackupTooLarge { .. }
             | AgentEvent::SaveAutoRestoreStuck { .. }
+            | AgentEvent::WorldHostedElsewhere { .. }
+            | AgentEvent::WorldLeaseLost { .. }
+            | AgentEvent::WorldClaimWanted { .. }
+            | AgentEvent::ViewSessionWriting { .. }
     )
 }
 
@@ -456,6 +514,7 @@ mod tests {
             version_num: 12,
             total_bytes: 2048,
             set_hash: None,
+            world_hash: None,
             already_landed,
             deliberate,
         }

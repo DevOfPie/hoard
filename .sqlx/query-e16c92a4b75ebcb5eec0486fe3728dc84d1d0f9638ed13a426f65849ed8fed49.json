@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "INSERT OR REPLACE INTO save_leases\n                 (save_id, holder_user_id, holder_device_fp, acquired_at, renewed_at,\n                  base_version, pushed_since, released_at)\n             VALUES (?, ?, ?, strftime('%Y-%m-%dT%H:%M:%SZ', 'now'),\n                     strftime('%Y-%m-%dT%H:%M:%SZ', 'now'), ?, 0, NULL)",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 4
+    },
+    "nullable": []
+  },
+  "hash": "e16c92a4b75ebcb5eec0486fe3728dc84d1d0f9638ed13a426f65849ed8fed49"
+}

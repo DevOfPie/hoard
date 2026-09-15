@@ -271,9 +271,29 @@ pub async fn run(cmd: UserCommand, cfg: &Config) -> Result<()> {
             // `data_dir/<user_id>`, a path nothing has written to since the
             // content-addressed store landed, so the command reported success
             // while leaving every byte on disk.
+            //
+            // Shares end first, both ways: the user's own shared saves come
+            // back to them so the purge finds them, and what other members
+            // shared into the user's groups goes back to those members, whose
+            // rows would otherwise vanish with the group. Then the groups they
+            // own, holding nothing by now, since the cascade through `groups`
+            // would take the `group_blobs` rows and orphan the objects.
             let store = hoard_server::store::build_store(cfg).await?;
+            hoard_server::routes::share::take_back_owned(&pool, &store, &user_id, &user_id).await?;
+            let owned: Vec<String> =
+                sqlx::query_scalar("SELECT id FROM groups WHERE owner_user_id = ?")
+                    .bind(&user_id)
+                    .fetch_all(&pool)
+                    .await?;
+            for gid in &owned {
+                hoard_server::routes::share::take_back_group(&pool, &store, &user_id, gid, None)
+                    .await?;
+            }
+            let (group_objects, group_bytes) =
+                hoard_server::store::purge_owned_groups(&pool, &store, &user_id).await?;
             let (objects, bytes) =
                 hoard_server::store::purge_user_objects(&pool, &store, &user_id).await?;
+            let (objects, bytes) = (objects + group_objects, bytes + group_bytes);
 
             sqlx::query("DELETE FROM users WHERE id = ?")
                 .bind(&user_id)

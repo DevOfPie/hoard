@@ -1,0 +1,26 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT sfc.chunk_sha256 AS sha, COUNT(*) AS \"count!: i64\"\n           FROM snapshot_file_chunks sfc\n           JOIN snapshot_files sf ON sf.id = sfc.snapshot_file_id\n           JOIN snapshots s ON s.id = sf.snapshot_id\n           WHERE s.save_id = ?\n           GROUP BY sfc.chunk_sha256",
+  "describe": {
+    "columns": [
+      {
+        "name": "sha",
+        "ordinal": 0,
+        "type_info": "Text"
+      },
+      {
+        "name": "count!: i64",
+        "ordinal": 1,
+        "type_info": "Null"
+      }
+    ],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": [
+      false,
+      null
+    ]
+  },
+  "hash": "61956ea10f8435ca53a4424346253458b552638ba273a91ec37c3298446e1617"
+}

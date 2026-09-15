@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "INSERT INTO group_blobs (group_id, sha256, size_bytes, refcount) VALUES (?,?,?,?)\n                 ON CONFLICT(group_id, sha256) DO UPDATE SET refcount = refcount + excluded.refcount",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 4
+    },
+    "nullable": []
+  },
+  "hash": "b51edb6722f800a721633334191b8cb801b06dfc80e0d77f73c17e2b229f2de2"
+}

@@ -26,7 +26,10 @@
     PauseCircle,
     Pencil,
     PlayCircle,
+    Radio,
+    Share2,
     UploadCloud,
+    Users,
   } from "@lucide/svelte";
   import { _ } from "svelte-i18n";
 
@@ -42,6 +45,7 @@
     SQUARE,
   } from "../stores/coverAspect.svelte";
   import { activity } from "../stores/agent";
+  import { leases } from "../stores/groups";
   import { customNames } from "../stores/gameNames";
   import {
     formatBytes,
@@ -62,6 +66,10 @@
     onBackup,
     onTogglePause,
     onHistory,
+    onShare,
+    onUnshare,
+    onRelease,
+    onTakeOver,
   }: {
     save: TrackedSave;
     /** Ticking clock (epoch ms) from the parent, drives the scheduled
@@ -90,7 +98,50 @@
     onBackup: (save: TrackedSave) => void;
     onTogglePause: (save: TrackedSave) => void;
     onHistory: (save: TrackedSave) => void;
+    onShare: (save: TrackedSave) => void;
+    onUnshare: (save: TrackedSave) => void;
+    /** Give the hosting lease back (only offered while this machine hosts). */
+    onRelease: (save: TrackedSave) => void;
+    /** Take the lease: free, or held by someone who has pushed nothing yet. */
+    onTakeOver: (save: TrackedSave) => void;
   } = $props();
+
+  /** The lease on a shared save, as the store last heard it. `unknown` until
+   *  something said: no chip then, rather than a wrong one. */
+  const lease = $derived(save.shared ? ($leases[save.save_id] ?? { state: "unknown" }) : null);
+  /** Another member hosts: this machine's changes stay local, so a manual
+   *  backup would only look like it worked. */
+  const hostedElsewhere = $derived(lease?.state === "other");
+
+  /** The lease chip: a third chip beside the status pill, never merged with
+   *  it, since "saved v12" and "hosted by alice" answer different questions. */
+  const leaseChip = $derived.by(() => {
+    if (!lease || !save.shared) return null;
+    switch (lease.state) {
+      case "mine":
+        return {
+          label: $_("lease.chip_hosting", { values: { group: save.shared.group_name } }),
+          chip: "bg-emerald-500/10 text-emerald-400 ring-emerald-500/30",
+        };
+      case "other":
+        return {
+          label: $_("lease.chip_hosted_by", {
+            values: {
+              name: lease.holder ?? "",
+              elapsed: lease.since ? formatRelativeTime(lease.since, now) : "",
+            },
+          }),
+          chip: "bg-amber-500/10 text-amber-400 ring-amber-500/30",
+        };
+      case "free":
+        return {
+          label: $_("lease.chip_free"),
+          chip: "bg-white/[0.05] text-zinc-400 ring-white/[0.08]",
+        };
+      default:
+        return null;
+    }
+  });
 
   /** Flipped on every press so the upload icon has something to react to. */
   let backupPressed = $state(false);
@@ -405,6 +456,66 @@
             <History size={13} class="shrink-0 text-zinc-500" />
             {$_("dashboard.history")}
           </button>
+          <!-- Sharing: into a group, or back out of it. The lease items only
+               make sense on a shared save, and only in the states the engine
+               reported; the engine still has the last word. -->
+          {#if save.shared}
+            <button
+              type="button"
+              class={menuItemClass}
+              onclick={() => {
+                menuOpen = false;
+                onUnshare(save);
+              }}
+            >
+              <Share2 size={13} class="shrink-0 text-zinc-500" />
+              {$_("share.menu_unshare")}
+            </button>
+            {#if lease?.state === "mine"}
+              <button
+                type="button"
+                class={menuItemClass}
+                onclick={() => {
+                  menuOpen = false;
+                  onRelease(save);
+                }}
+              >
+                <Radio size={13} class="shrink-0 text-zinc-500" />
+                {$_("lease.menu_release")}
+              </button>
+            {:else if lease?.state === "free" || lease?.state === "other"}
+              {@const pushed = lease.state === "other" && lease.pushed === true}
+              <button
+                type="button"
+                class={cloudOnly || pushed ? menuItemDisabledClass : menuItemClass}
+                disabled={cloudOnly || pushed}
+                title={cloudOnly ? $_("common.cloud_only_no_local") : undefined}
+                onclick={() => {
+                  menuOpen = false;
+                  onTakeOver(save);
+                }}
+              >
+                <Users size={13} class="shrink-0 text-zinc-500" />
+                {pushed
+                  ? $_("lease.menu_take_over_pushed", { values: { name: lease.holder ?? "" } })
+                  : $_("lease.menu_take_over")}
+              </button>
+            {/if}
+          {:else}
+            <button
+              type="button"
+              class={cloudOnly ? menuItemDisabledClass : menuItemClass}
+              disabled={cloudOnly}
+              title={cloudOnly ? $_("common.cloud_only_no_local") : undefined}
+              onclick={() => {
+                menuOpen = false;
+                onShare(save);
+              }}
+            >
+              <Share2 size={13} class="shrink-0 text-zinc-500" />
+              {$_("share.menu_share")}
+            </button>
+          {/if}
         </div>
       {/if}
     </div>
@@ -479,6 +590,15 @@
         {/if}
         <span class="truncate">{pill.label}</span>
       </span>
+      {#if leaseChip}
+        <span
+          class="inline-flex min-w-0 items-center gap-1 rounded-md px-2 py-1 text-[11px] font-medium ring-1 ring-inset {leaseChip.chip}"
+          title={leaseChip.label}
+        >
+          <Users size={12} class="shrink-0" />
+          <span class="truncate">{leaseChip.label}</span>
+        </span>
+      {/if}
       <Button
         variant="secondary"
         size="md"
@@ -490,9 +610,11 @@
           backupPressed = !backupPressed;
           onBackup(save);
         }}
-        disabled={!agentRunning || cloudOnly}
+        disabled={!agentRunning || cloudOnly || hostedElsewhere}
         title={cloudOnly
           ? $_("common.cloud_only_no_local")
+          : hostedElsewhere
+            ? $_("lease.tooltip_hosted_elsewhere", { values: { name: lease?.holder ?? "" } })
           : !agentRunning
             ? $_("dashboard.tooltip_offline")
             : save.paused

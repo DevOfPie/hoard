@@ -394,6 +394,44 @@ fn render(ev: &AgentEvent) -> Option<String> {
         SaveAutoRestoreRecovered { game_slug, .. } => {
             format!("✓  {game_slug}: cloud restore working again")
         }
+        WorldClaimed {
+            game_slug,
+            role,
+            auto,
+            ..
+        } => {
+            let role = match role {
+                hoard_core::ipc::WorldRole::Host => "hosting",
+                hoard_core::ipc::WorldRole::View => "viewing",
+            };
+            format!(
+                "★  {game_slug}: {role} the shared world{}",
+                if *auto { " (nobody else was)" } else { "" }
+            )
+        }
+        WorldReleased { game_slug, .. } => format!("☆  {game_slug}: hosting lease released"),
+        WorldHostedElsewhere {
+            game_slug, holder, ..
+        } => format!("⚠  {game_slug}: {holder} is hosting this world — your changes stay local"),
+        WorldLeaseLost { game_slug, .. } => {
+            format!("⚠  {game_slug}: hosting lease lost — nothing more is pushed this session")
+        }
+        WorldClaimWanted { game_slug, worlds } => {
+            let names: Vec<String> = worlds
+                .iter()
+                .map(|w| match &w.holder {
+                    Some(h) => format!("{} (hosted by {h})", w.label),
+                    None => w.label.clone(),
+                })
+                .collect();
+            format!(
+                "?  {game_slug}: which shared world, and host or view? {}",
+                names.join(", ")
+            )
+        }
+        ViewSessionWriting { game_slug, .. } => {
+            format!("⚠  {game_slug}: the game is saving into a world you only view — nothing is uploaded")
+        }
         _ => return None,
     })
 }

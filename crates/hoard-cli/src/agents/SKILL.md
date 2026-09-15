@@ -81,19 +81,38 @@ exit status grouped by what to do about it:
 
 | Exit | Meaning |
 |---|---|
-| 2 | Not signed in (`no_session`, `unauthorized`): tell the user to run `hoard login`; do not attempt it yourself |
-| 3 | It isn't there (`not_found`, `not_tracked`): re-read `hoard saves --json`, do not retry with a guessed id |
-| 4 | `rate_limited`: the envelope carries `retry_after_seconds`; wait that long, exactly once, and don't loop |
-| 5 | Storage limit (`quota_exceeded`, `too_large`, `archived`): will fail identically until the user frees space or upgrades |
+| 2 | Not signed in (`no_session`, `unauthorized`, `forbidden`): tell the user to run `hoard login`; do not attempt it yourself. A command that goes through the sync service gets `no_session` when the service has no session, it expired, or the keyring will not hand it over (signing in again rewrites it) |
+| 3 | It isn't there (`not_found`, `not_tracked`, `not_watched`): re-read `hoard saves --json`, do not retry with a guessed id |
+| 4 | `rate_limited`, or `throttled` from the sync service: `rate_limited` carries `retry_after_seconds`, `throttled` names the wait in its message; wait that long, exactly once, and don't loop |
+| 5 | Storage limit (`quota_exceeded`, `quota_full`, `too_large`, `archived`): will fail identically until the user frees space or upgrades |
 | 6 | Network (`network`, `storage_unreachable`): may work later |
+| 1 | `no_service`: the sync service isn't running, and groups, sharing and leases have nobody to ask without it: tell the user to run `hoard sync start` |
+| 1 | A shared save refused (`held`, `stale`, `lease_required`, `not_shared`, `pushed`, `conflict`): see below; retrying unchanged gets the same answer |
+| 1 | `engine_down`: the sync service is running but its engine is not ready (starting, shutting down or failing); the message says which. Wait and retry once if it is starting; otherwise tell the user what the message says, and do not tell them to sign in |
+| 1 | `already_tracked`: `hoard adopt` on a save this machine already has a folder for; `hoard saves --json` shows where |
+| 1 | `bad_request`: the request itself is wrong (a world name that is not one, an expiry past a year, a folder that is not one); change it, don't retry |
+| 1 | `needs_input`, `needs_choice`: see below |
 | 1 | Anything else |
 
 Two codes are about you rather than the user's account: `needs_choice` and
 `needs_input` mean the command wanted to ask a question and found no terminal:
-re-run it with the flags the message names, never by feeding it input.
+re-run it with the flags the message names, never by feeding it input. `hoard
+share` answers `needs_input` for a game that shares one world at a time
+(Valheim) when `--world` is missing, and the message lists the worlds found.
 `needs_confirmation` means the command destroys something and nobody is there to
 say yes: bring it to the user and let them decide, and only pass `--yes` when
 they have said so about that exact command.
+
+The shared-save codes name who is in the way. `held`: another member hosts the
+world, so this machine can only view it until they release. `stale`: the save
+moved past this machine's copy; it has to pull before it can host.
+`lease_required`: a push to a shared save without hosting it. `not_shared`: the
+save is not in a group. `hoard world` on a save this machine does not watch is
+`not_watched`, exit 3. `pushed`: `hoard world force` refused because the holder
+has pushed under their lease; a pushed lease cannot be forced, only released by
+its holder. `conflict`: any other refusal; the message says which.
+Tell the user; taking the lease with `hoard world force` takes it off a person,
+so only on their word.
 
 ## The mental model
 
@@ -110,6 +129,53 @@ Other things worth knowing before you act:
 - A tracked folder can be **paused**: still known, not being watched.
 - Some rows exist **only in the cloud**, with no folder on this machine.
   Mutations on those fail; that is expected, not a bug to work around.
+- A save can be **shared** into a group: every member pulls it, and one of them
+  at a time **hosts** it, holding the lease that lets them push.
+
+## Shared saves
+
+These fields only appear on a self-hosted server with groups, so read them when
+present and do not expect them otherwise:
+
+- `hoard saves --json`: each row has `group` (null when not shared). A shared
+  row also has `lease`, one of `"mine"`, `"other"`, `"free"` or `"unknown"`,
+  and `hosted`, the same as text: `"hosted here"`, `"hosted by <name>"`,
+  `"hosted elsewhere"`, `"nobody"` or `"unknown"`. Branch on `lease`, not on
+  `hosted`. Both are the sync service's last word on the lease, and both are
+  absent when there was no service to ask.
+- `hoard status --json`: `shared` lists this machine's shared saves, each with
+  `save_id`, `game_slug`, `label`, `group` and the same optional `hosted` and
+  `lease`. An empty list is also what you get when local state could not be
+  read.
+- `hoard group list --json`: `groups`, each with `id`, `name`, `owner` and
+  `members` (a count).
+- `hoard share --json`: the save as shared, with `group_id`, `group_name`,
+  `owner` and `include`, the files members pull (empty for the whole folder).
+- `hoard world lease <save_id> --json`: `save_id` and `lease`, null when nobody
+  holds it, otherwise `holder`, `here` (held by this machine's account, as the
+  sync service sees it), `acquired_at`,
+  `renewed_at`, `base_version`, `live` and `pushed_since`.
+- `hoard world claim|release|force|dismiss <save_id> --json`: `save_id` and
+  `outcome`, see below.
+- `hoard group create|join --json`: the group, with `id`, `name`, `owner` and
+  `members`. `hoard group invite --json`: `group_id`, `token` and
+  `expires_at`; the token is shown once, so hand it to the user and do not keep
+  it. `hoard group leave --json`: `group_id`.
+- `hoard adopt <save_id> --path <folder> --json`: `save`, the row `hoard saves`
+  now lists, and `watching`, false when the sync service was not running (it
+  picks the save up when it starts).
+
+A save that is on the server but has no folder on this machine (a world shared
+with the user, or their own save from another machine) is not in `hoard saves`,
+and every `hoard world` verb refuses it. `hoard adopt` gives it a folder here.
+The folder is the user's to choose: ask for it, never guess one.
+
+`hoard world claim` and `hoard world force` wait up to 10 seconds for the
+server's answer. `outcome` `hosting` means this machine holds the lease;
+`pending` means no answer came in time, and `hoard world lease` has it later. A
+refusal exits 1 with `held` (someone else hosts; the message names them) or,
+for `force`, `pushed`. `claim --view`, `release` and `dismiss` do not wait:
+their `outcome` is `viewing`, `releasing` or `dismissed`.
 
 ## Safety rules
 
@@ -121,7 +187,11 @@ dangerous thing here.
    returns the diff file by file: `modified` (overwritten), `added`, and
    `local_only`, files on disk that the version doesn't have, which are the
    saves made *after* it. Show the user the names, not just the counts; the
-   `*_count` fields carry the real totals when a list is capped.
+   `*_count` fields carry the real totals when a list is capped. On the
+   owner's restore of a shared save, `outside_share` names the overwritten
+   files outside the shared world: no version since the share holds them, so
+   the restore (with `--force`) copies them aside first and says where in
+   `restored.set_aside`.
 2. Only run the real restore after the user confirms that specific save and
    version.
 3. Same for anything that deletes: `hoard snapshots delete`, `hoard save delete`.
@@ -130,7 +200,7 @@ dangerous thing here.
    command is `hoard save untrack <save_id>`; reach for that one first.
 
 Reading is free: `saves`, `save show`, `snapshots list`, `status`, `devices`,
-`scan`. Prefer reading and proposing over acting.
+`scan`, `group list`, `world lease`. Prefer reading and proposing over acting.
 
 Save folder paths say what the user has installed and where. Do not send them
 anywhere or include them in anything published.

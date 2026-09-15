@@ -1,0 +1,20 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT g.owner_user_id\n           FROM groups g\n           JOIN group_members gm ON gm.group_id = g.id AND gm.user_id = ?\n           WHERE g.id = ?",
+  "describe": {
+    "columns": [
+      {
+        "name": "owner_user_id",
+        "ordinal": 0,
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Right": 2
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "21b05040a337bb210d7c202c9f6f6dc6e8429fd06ca4f1e02a3fc5d1ac7f89ec"
+}

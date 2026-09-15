@@ -1,0 +1,62 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT l.save_id, l.holder_user_id, u.username AS holder_username,\n                  l.holder_device_fp, l.acquired_at, l.renewed_at, l.base_version,\n                  l.pushed_since\n           FROM save_leases l JOIN users u ON u.id = l.holder_user_id\n           WHERE l.save_id = ? AND l.released_at IS NULL\n             AND l.renewed_at > strftime('%Y-%m-%dT%H:%M:%SZ', 'now', ? || ' seconds')",
+  "describe": {
+    "columns": [
+      {
+        "name": "save_id",
+        "ordinal": 0,
+        "type_info": "Text"
+      },
+      {
+        "name": "holder_user_id",
+        "ordinal": 1,
+        "type_info": "Text"
+      },
+      {
+        "name": "holder_username",
+        "ordinal": 2,
+        "type_info": "Text"
+      },
+      {
+        "name": "holder_device_fp",
+        "ordinal": 3,
+        "type_info": "Text"
+      },
+      {
+        "name": "acquired_at",
+        "ordinal": 4,
+        "type_info": "Text"
+      },
+      {
+        "name": "renewed_at",
+        "ordinal": 5,
+        "type_info": "Text"
+      },
+      {
+        "name": "base_version",
+        "ordinal": 6,
+        "type_info": "Integer"
+      },
+      {
+        "name": "pushed_since",
+        "ordinal": 7,
+        "type_info": "Integer"
+      }
+    ],
+    "parameters": {
+      "Right": 2
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      true,
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "0105952e8e5bd67463671e8cbdcce304870c0a11f49ad792f24673488b41c233"
+}

@@ -235,15 +235,23 @@ pub async fn overview(
     .await
     .map_err(|e| db_error(e, "admin trash totals"))?;
 
+    // Four tables since the group namespace (0024): what is stored is the sum.
     let (objects, stored_bytes, orphan_objects, orphan_bytes): (i64, i64, i64, i64) =
         sqlx::query_as(
-            "SELECT (SELECT COUNT(*) FROM blobs) + (SELECT COUNT(*) FROM chunks), \
+            "SELECT (SELECT COUNT(*) FROM blobs) + (SELECT COUNT(*) FROM chunks) \
+                  + (SELECT COUNT(*) FROM group_blobs) + (SELECT COUNT(*) FROM group_chunks), \
                     (SELECT COALESCE(SUM(size_bytes),0) FROM blobs) \
-                  + (SELECT COALESCE(SUM(size_bytes),0) FROM chunks), \
+                  + (SELECT COALESCE(SUM(size_bytes),0) FROM chunks) \
+                  + (SELECT COALESCE(SUM(size_bytes),0) FROM group_blobs) \
+                  + (SELECT COALESCE(SUM(size_bytes),0) FROM group_chunks), \
                     (SELECT COUNT(*) FROM blobs WHERE refcount <= 0) \
-                  + (SELECT COUNT(*) FROM chunks WHERE refcount <= 0), \
+                  + (SELECT COUNT(*) FROM chunks WHERE refcount <= 0) \
+                  + (SELECT COUNT(*) FROM group_blobs WHERE refcount <= 0) \
+                  + (SELECT COUNT(*) FROM group_chunks WHERE refcount <= 0), \
                     (SELECT COALESCE(SUM(size_bytes),0) FROM blobs WHERE refcount <= 0) \
-                  + (SELECT COALESCE(SUM(size_bytes),0) FROM chunks WHERE refcount <= 0)",
+                  + (SELECT COALESCE(SUM(size_bytes),0) FROM chunks WHERE refcount <= 0) \
+                  + (SELECT COALESCE(SUM(size_bytes),0) FROM group_blobs WHERE refcount <= 0) \
+                  + (SELECT COALESCE(SUM(size_bytes),0) FROM group_chunks WHERE refcount <= 0)",
         )
         .fetch_one(pool)
         .await
@@ -284,9 +292,14 @@ pub async fn overview(
         .await
         .map_err(|e| db_error(e, "admin per-user saves"))?;
 
+        // A user's footprint includes the groups they own: that is who pays.
         let (stored_bytes,): (i64,) = sqlx::query_as(
             "SELECT (SELECT COALESCE(SUM(size_bytes),0) FROM blobs WHERE user_id = ?1) \
-                  + (SELECT COALESCE(SUM(size_bytes),0) FROM chunks WHERE user_id = ?1)",
+                  + (SELECT COALESCE(SUM(size_bytes),0) FROM chunks WHERE user_id = ?1) \
+                  + (SELECT COALESCE(SUM(gb.size_bytes),0) FROM group_blobs gb \
+                       JOIN groups g ON g.id = gb.group_id WHERE g.owner_user_id = ?1) \
+                  + (SELECT COALESCE(SUM(gc.size_bytes),0) FROM group_chunks gc \
+                       JOIN groups g ON g.id = gc.group_id WHERE g.owner_user_id = ?1)",
         )
         .bind(&id)
         .fetch_one(pool)
@@ -606,13 +619,54 @@ pub async fn delete_user(
         return Err(err(StatusCode::NOT_FOUND, "no_such_user"));
     };
 
-    let (objects_removed, bytes_removed) =
-        crate::store::purge_user_objects(&state.pool, &state.store, &target_id)
+    // Shares end before anything is purged. The user's own shared saves come
+    // back to them, so the purge below finds them and the group's owner stops
+    // paying; the saves other members shared into the user's groups go back
+    // to those members, whose `blobs` rows and bytes would otherwise vanish
+    // with the group. Every lease that ends along the way is announced.
+    let actor = user.user_id.to_string();
+    let purge_failed = |e: anyhow::Error| {
+        tracing::error!(error = %e, "admin: taking back shared saves failed");
+        err(StatusCode::INTERNAL_SERVER_ERROR, "internal")
+    };
+    let mut ended =
+        crate::routes::share::take_back_owned(&state.pool, &state.store, &actor, &target_id)
+            .await
+            .map_err(purge_failed)?;
+    let owned: Vec<String> = sqlx::query_scalar("SELECT id FROM groups WHERE owner_user_id = ?")
+        .bind(&target_id)
+        .fetch_all(&state.pool)
+        .await
+        .map_err(|e| db_error(e, "admin delete groups lookup"))?;
+    for gid in &owned {
+        ended.extend(
+            crate::routes::share::take_back_group(&state.pool, &state.store, &actor, gid, None)
+                .await
+                .map_err(purge_failed)?,
+        );
+    }
+    for lease in &ended {
+        crate::routes::leases::announce_end(&state, lease).await;
+    }
+
+    // The groups this user owns go with them; by now they hold nothing, and
+    // the cascade through `groups` would otherwise take the `group_blobs`
+    // rows and orphan whatever objects are left.
+    let (mut objects_removed, mut bytes_removed) =
+        crate::store::purge_owned_groups(&state.pool, &state.store, &target_id)
             .await
             .map_err(|e| {
-                tracing::error!(error = %e, "admin user purge failed");
+                tracing::error!(error = %e, "admin group purge failed");
                 err(StatusCode::INTERNAL_SERVER_ERROR, "internal")
             })?;
+    let (objects, bytes) = crate::store::purge_user_objects(&state.pool, &state.store, &target_id)
+        .await
+        .map_err(|e| {
+            tracing::error!(error = %e, "admin user purge failed");
+            err(StatusCode::INTERNAL_SERVER_ERROR, "internal")
+        })?;
+    objects_removed += objects;
+    bytes_removed += bytes;
 
     sqlx::query("DELETE FROM users WHERE id = ?")
         .bind(&target_id)

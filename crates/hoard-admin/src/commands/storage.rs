@@ -14,6 +14,7 @@ use clap::{Subcommand, ValueEnum};
 use futures::stream::StreamExt;
 use hoard_server::config::{Config, StorageBackend};
 use hoard_server::db;
+use hoard_server::namespace::Namespace;
 use hoard_server::store::{self, blob_key, chunk_key, BlobStore};
 use indicatif::{ProgressBar, ProgressStyle};
 use sha2::{Digest, Sha256};
@@ -110,20 +111,22 @@ struct ObjKey {
     size: i64,
 }
 
-/// Enumerate object keys from the DB (`blobs` and `chunks`, refcount > 0), which is
-/// the source of truth. Never lists the filesystem or bucket. With `sample`, draws
-/// a random subset via SQL `RANDOM()`.
+/// Enumerate object keys from the DB (`blobs`, `chunks` and their group twins,
+/// refcount > 0), which is the source of truth. Never lists the filesystem or
+/// bucket. With `sample`, draws a random subset via SQL `RANDOM()`.
 async fn enumerate_keys(pool: &sqlx::SqlitePool, sample: Option<usize>) -> Result<Vec<ObjKey>> {
-    let (blob_sql, chunk_sql) = match sample {
-        Some(n) => (
-            format!("SELECT user_id, sha256, size_bytes FROM blobs WHERE refcount > 0 ORDER BY RANDOM() LIMIT {n}"),
-            format!("SELECT user_id, sha256, size_bytes FROM chunks WHERE refcount > 0 ORDER BY RANDOM() LIMIT {n}"),
-        ),
-        None => (
-            "SELECT user_id, sha256, size_bytes FROM blobs WHERE refcount > 0".to_string(),
-            "SELECT user_id, sha256, size_bytes FROM chunks WHERE refcount > 0".to_string(),
-        ),
+    let limit = match sample {
+        Some(n) => format!(" ORDER BY RANDOM() LIMIT {n}"),
+        None => String::new(),
     };
+    let blob_sql =
+        format!("SELECT user_id, sha256, size_bytes FROM blobs WHERE refcount > 0{limit}");
+    let chunk_sql =
+        format!("SELECT user_id, sha256, size_bytes FROM chunks WHERE refcount > 0{limit}");
+    let group_blob_sql =
+        format!("SELECT group_id, sha256, size_bytes FROM group_blobs WHERE refcount > 0{limit}");
+    let group_chunk_sql =
+        format!("SELECT group_id, sha256, size_bytes FROM group_chunks WHERE refcount > 0{limit}");
 
     let mut keys = Vec::new();
     for r in sqlx::query(&blob_sql).fetch_all(pool).await? {
@@ -140,6 +143,24 @@ async fn enumerate_keys(pool: &sqlx::SqlitePool, sample: Option<usize>) -> Resul
         let sha: String = r.get("sha256");
         keys.push(ObjKey {
             key: chunk_key(&user, &sha),
+            sha,
+            size: r.get("size_bytes"),
+        });
+    }
+    for r in sqlx::query(&group_blob_sql).fetch_all(pool).await? {
+        let ns = Namespace::Group(r.get("group_id"));
+        let sha: String = r.get("sha256");
+        keys.push(ObjKey {
+            key: ns.blob_key(&sha),
+            sha,
+            size: r.get("size_bytes"),
+        });
+    }
+    for r in sqlx::query(&group_chunk_sql).fetch_all(pool).await? {
+        let ns = Namespace::Group(r.get("group_id"));
+        let sha: String = r.get("sha256");
+        keys.push(ObjKey {
+            key: ns.chunk_key(&sha),
             sha,
             size: r.get("size_bytes"),
         });
@@ -632,6 +653,35 @@ async fn status(cfg: &Config) -> Result<()> {
         total_bytes += bytes;
         if objs > 0 {
             println!("{:<24} {:>10} {:>12}", username, objs, human_bytes(bytes));
+        }
+    }
+
+    // Group namespaces: what members shared, billed to the group's owner but
+    // stored under the group's keys, so it is in nobody's row above.
+    let groups = sqlx::query(
+        "SELECT g.name AS name, u.username AS owner,
+            (SELECT COUNT(*) FROM group_blobs b WHERE b.group_id = g.id AND b.refcount > 0)
+          + (SELECT COUNT(*) FROM group_chunks c WHERE c.group_id = g.id AND c.refcount > 0) AS objs,
+            (SELECT COALESCE(SUM(size_bytes),0) FROM group_blobs b WHERE b.group_id = g.id AND b.refcount > 0)
+          + (SELECT COALESCE(SUM(size_bytes),0) FROM group_chunks c WHERE c.group_id = g.id AND c.refcount > 0) AS bytes
+         FROM groups g JOIN users u ON u.id = g.owner_user_id ORDER BY g.name",
+    )
+    .fetch_all(&pool)
+    .await?;
+    for r in &groups {
+        let name: String = r.get("name");
+        let owner: String = r.get("owner");
+        let objs: i64 = r.get("objs");
+        let bytes: i64 = r.get("bytes");
+        total_objs += objs;
+        total_bytes += bytes;
+        if objs > 0 {
+            println!(
+                "{:<24} {:>10} {:>12}",
+                format!("group:{name} ({owner})"),
+                objs,
+                human_bytes(bytes)
+            );
         }
     }
     println!(

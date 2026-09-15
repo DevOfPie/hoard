@@ -47,6 +47,19 @@ pub enum Op {
     Restore,
 }
 
+/// Who holds the hosting lease on a shared save, as last told by the server.
+/// The kernel keeps no holder name: the shell does, for the events it emits.
+/// An unshared save ignores it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum LeaseObs {
+    /// Nothing heard yet. A shared save with unknown lease is not pushed.
+    #[default]
+    Unknown,
+    Free,
+    Mine,
+    Other,
+}
+
 /// Restore failure escalation, keyed by cloud *version* rather than by save: a
 /// new version is new content and a fresh reason to try again, so it resets the
 /// escalation instead of inheriting the old version's penalty. Sans-IO twin of
@@ -116,7 +129,16 @@ pub enum OpResult {
         version: Option<i64>,
         fingerprint: Option<u64>,
         wrote: bool,
+        /// The world's fingerprint in what was synced
+        /// ([`Observation::world_fingerprint`]'s twin), adopted as
+        /// [`State::synced_world_fingerprint`] when `Some`.
+        world_fingerprint: Option<u64>,
     },
+    /// 409 `lease_required`: the server wanted the lease for this push. The
+    /// adopted world fingerprint is cleared, so the owner's next tick holds
+    /// for the lease instead of pushing again (HRD-D-0019). No backoff: the
+    /// hold is the wait. `has_pending` stays, as for any refused upload.
+    LeaseRequired,
     /// 404, the save is not on the backend. Not a failure (retrying will not
     /// conjure a snapshot that is not there); parked on the long backoff.
     NotFound,
@@ -166,6 +188,14 @@ pub struct State {
     // ---- resolved policy
     /// Playtime-only entry: there is no folder to sync.
     pub track_only: bool,
+    /// The save lives in a group namespace: pushes need the hosting lease
+    /// ([`Observation::lease`]). Pulls are unaffected.
+    pub shared: bool,
+    /// This machine's account owns the shared save and walks its whole folder
+    /// (HRD-D-0019): a push that leaves the world as last synced
+    /// ([`Self::synced_world_fingerprint`]) needs no lease, since the lease
+    /// guards the world and nothing else. Meaningless unless [`Self::shared`].
+    pub owner: bool,
     pub restore_enabled: bool,
     /// Floor between committing backups (ADR 0018, axis A). `0` means no floor.
     /// Measured from [`Self::last_backup_at`], which only advances on a real
@@ -194,6 +224,10 @@ pub struct State {
     /// means zero actions" true, and that is what killed the compression hot
     /// loop.
     pub synced_fingerprint: Option<u64>,
+    /// Fingerprint of the shared world inside that synced content
+    /// ([`Observation::world_fingerprint`]). `None` is unknown, and an owner
+    /// whose world is unknown holds for the lease like anyone.
+    pub synced_world_fingerprint: Option<u64>,
     /// Last backup that actually committed, and the anchor of the min-interval.
     /// Only an `OpResult::Ok { wrote: true }` moves it; letting a no-op move it
     /// would push the next real upload out by a whole interval (the R.E.P.O.
@@ -272,6 +306,11 @@ pub struct Observation {
     /// Hash of the local content, computed only when L0 moved or a hint pointed
     /// at this save. `None` means nothing was hashed this tick.
     pub local_fingerprint: Option<u64>,
+    /// Hash of the shared world inside the local content (the share's include
+    /// list), sampled by the same walk as [`Self::local_fingerprint`] and
+    /// `None` exactly when it is. Equal to it for anything but an owner's
+    /// save. Compared against [`State::synced_world_fingerprint`].
+    pub world_fingerprint: Option<u64>,
 
     // ---- process evidence
     pub process_alive: bool,
@@ -289,6 +328,8 @@ pub struct Observation {
     /// writing, so this arrives `false` and the usual guards decide. See
     /// `hoard_agent::locks`.
     pub save_files_locked: bool,
+    /// The hosting lease on a shared save. Read only when [`State::shared`].
+    pub lease: LeaseObs,
 
     // ---- server head
     /// Latest cloud version known for this save. `None` means unknown:

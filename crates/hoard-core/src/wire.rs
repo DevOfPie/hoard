@@ -102,6 +102,12 @@ pub struct Health {
     /// which should not be sent heartbeats.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub devices: bool,
+    /// This server has groups, shared saves and hosting leases (`/v1/groups`,
+    /// `/v1/saves/{id}/share`, `/v1/saves/{id}/lease`). Same discipline as
+    /// [`Health::cas`]: absent means a server that knows none of it, and the
+    /// client keeps every save private.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub groups: bool,
 }
 
 // ---- GET /v1/auth/whoami and PUT /v1/me/max-versions
@@ -253,6 +259,186 @@ pub struct Save {
     pub created_at: OffsetDateTime,
     #[serde(with = "ts")]
     pub updated_at: OffsetDateTime,
+    /// The group this save is shared into, on the owner's copy and on every
+    /// member's. Skipped when absent so an unshared save keeps emitting exactly
+    /// the release's JSON.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shared: Option<SharedInfo>,
+}
+
+/// Where a shared save lives: the group, and the group's owner, who pays for
+/// its storage.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SharedInfo {
+    pub group_id: String,
+    pub group_name: String,
+    pub owner_user_id: String,
+    pub owner_username: Username,
+    /// What the shared save consists of, as `/`-separated patterns relative to
+    /// its root; empty means everything. Set at share time and the same for
+    /// every member, so every machine walks the same files.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub include: Vec<String>,
+    /// The caller owns the save: their uploads carry the whole folder, while a
+    /// member's carry `include` (HRD-D-0019). An older server omits it, which
+    /// reads as a member and keeps every walk narrowed to the list.
+    #[serde(default)]
+    pub caller_owns: bool,
+}
+
+// ---- /v1/groups
+
+/// One member of a group. `role` is `owner` or `member`; anything else came
+/// from a newer server and reads as a plain member.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GroupMember {
+    pub user_id: String,
+    pub username: Username,
+    pub role: String,
+    #[serde(with = "ts")]
+    pub joined_at: OffsetDateTime,
+}
+
+/// A group as the caller sees it (`GET /v1/groups`, `POST /v1/groups`,
+/// `POST /v1/groups/join`), members included.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Group {
+    pub id: String,
+    pub name: String,
+    pub owner_user_id: String,
+    #[serde(with = "ts")]
+    pub created_at: OffsetDateTime,
+    #[serde(default)]
+    pub members: Vec<GroupMember>,
+}
+
+/// Body of `POST /v1/groups`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CreateGroupRequest {
+    pub name: String,
+}
+
+/// Body of `POST /v1/groups/{id}/invites`. `expires_in_secs` defaults to seven
+/// days on the server.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct CreateInviteRequest {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_in_secs: Option<u64>,
+}
+
+/// A freshly minted invite. `token` is shown once: the server keeps only its
+/// hash.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InviteOut {
+    pub invite_id: String,
+    pub token: String,
+    #[serde(with = "ts")]
+    pub expires_at: OffsetDateTime,
+}
+
+/// Body of `POST /v1/groups/join`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct JoinGroupRequest {
+    pub token: String,
+}
+
+/// Body of `POST /v1/saves/{id}/share`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ShareSaveRequest {
+    pub group_id: String,
+    /// See [`SharedInfo::include`]. Checked with [`validate_include`]; the
+    /// server answers 400 to a list that fails it.
+    #[serde(default)]
+    pub include: Vec<String>,
+}
+
+/// The most patterns a share may name.
+pub const MAX_INCLUDE_PATTERNS: usize = 64;
+
+/// Is this an include list the server will store? Each pattern is non-empty,
+/// `/`-separated with no empty segment, no `..`, no leading `/`, no `\`; the
+/// list has at most [`MAX_INCLUDE_PATTERNS`] entries. The rule lives here so
+/// the client refuses what the server would.
+pub fn validate_include(include: &[String]) -> Result<(), String> {
+    if include.len() > MAX_INCLUDE_PATTERNS {
+        return Err(format!(
+            "too many include patterns: {} (at most {MAX_INCLUDE_PATTERNS})",
+            include.len()
+        ));
+    }
+    for p in include {
+        if p.is_empty() {
+            return Err("an include pattern is empty".to_string());
+        }
+        if p.starts_with('/') {
+            return Err(format!("include pattern starts with `/`: {p}"));
+        }
+        if p.contains('\\') {
+            return Err(format!("include pattern uses `\\`; separate with `/`: {p}"));
+        }
+        if p.split('/')
+            .any(|seg| seg.is_empty() || seg == ".." || seg == ".")
+        {
+            return Err(format!(
+                "include pattern has an empty, `.` or `..` segment: {p}"
+            ));
+        }
+    }
+    Ok(())
+}
+
+// ---- /v1/saves/{id}/lease
+
+/// Who is hosting a shared save. `live` is computed on read: a lease is live
+/// while it is unreleased and `renewed_at` is within the server's TTL, so a
+/// host whose machine died drops out on its own.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Lease {
+    pub save_id: String,
+    pub holder_user_id: String,
+    pub holder_username: Username,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub holder_device_fp: Option<String>,
+    #[serde(with = "ts")]
+    pub acquired_at: OffsetDateTime,
+    #[serde(with = "ts")]
+    pub renewed_at: OffsetDateTime,
+    /// The save's head when the holder took the lease.
+    pub base_version: i64,
+    /// The holder has pushed a version since acquiring. A lease with this set
+    /// cannot be forced: the play it covers already reached the server.
+    #[serde(default)]
+    pub pushed_since: bool,
+    #[serde(default)]
+    pub live: bool,
+}
+
+/// `GET /v1/saves/{id}/lease`. `lease` is absent when nobody is hosting.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct LeaseOut {
+    #[serde(default)]
+    pub lease: Option<Lease>,
+}
+
+/// Body of `POST /v1/saves/{id}/lease/acquire`: the head the caller has. The
+/// server refuses (`409 stale`) when the save moved past it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LeaseAcquireRequest {
+    pub base_version: i64,
+}
+
+/// `event: lease` on `/v1/events`: the lease of `save_id` changed hands, was
+/// released, expired or covered a push. `holder_user_id` is absent when the
+/// save has no live holder.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LeaseEvent {
+    pub save_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub holder_user_id: Option<String>,
+    #[serde(default)]
+    pub live: bool,
+    #[serde(default)]
+    pub pushed_since: bool,
 }
 
 // ---- /v1/saves/{id}/snapshots
@@ -422,6 +608,12 @@ pub struct CasInit {
     /// this is rejected, here *before* a byte moves, which is the whole point.
     #[serde(default)]
     pub base_version: Option<i64>,
+    /// The version the manifest's shared world came from, when it is not
+    /// `base_version`: an owner who took a version the server carried a newer
+    /// world into as its base, before that world came down (HRD-D-0019).
+    /// Absent from older clients, which means the base's world.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub world_base_version: Option<i64>,
     pub files: Vec<CasFile>,
 }
 
@@ -462,6 +654,9 @@ pub struct CasCommit {
     pub upload_id: String,
     #[serde(default)]
     pub base_version: Option<i64>,
+    /// As in [`CasInit::world_base_version`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub world_base_version: Option<i64>,
     #[serde(default)]
     pub device_name: Option<String>,
     #[serde(default)]
@@ -837,11 +1032,58 @@ mod tests {
         assert!(!old.blob_zstd, "silence means the server cannot take zstd");
         assert!(!old.cas);
         assert!(!old.devices);
+        assert!(!old.groups);
 
         let new: Health = serde_json::from_str(
             r#"{"status":"ok","version":"1.1.7","mode":"cloud","log_min_level":"warn","blob_zstd":true}"#,
         )
         .expect("the new body parses");
         assert!(new.blob_zstd);
+    }
+
+    fn strs(list: &[&str]) -> Vec<String> {
+        list.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn a_share_body_without_include_still_parses_and_means_everything() {
+        let req: ShareSaveRequest = serde_json::from_str(r#"{"group_id":"g1"}"#).unwrap();
+        assert!(req.include.is_empty());
+        let info: SharedInfo = serde_json::from_str(
+            r#"{"group_id":"g1","group_name":"n","owner_user_id":"u","owner_username":"jacka"}"#,
+        )
+        .unwrap();
+        assert!(info.include.is_empty());
+        assert!(!info.caller_owns, "an older server reads as a member");
+        // And an empty list is not emitted, so an older reader sees the old shape.
+        let json = serde_json::to_value(&info).unwrap();
+        assert!(json.get("include").is_none(), "{json}");
+    }
+
+    #[test]
+    fn include_validation_admits_the_valheim_template_and_refuses_escapes() {
+        assert!(validate_include(&[]).is_ok());
+        assert!(validate_include(&strs(&[
+            "worlds_local/Alpha.db",
+            "worlds_local/Alpha_backup_*",
+            "slot?.sav",
+        ]))
+        .is_ok());
+        for bad in [
+            "",
+            "/abs/path",
+            "a//b",
+            "../up",
+            "worlds_local/..",
+            "a\\b",
+            "a/",
+        ] {
+            assert!(validate_include(&strs(&[bad])).is_err(), "{bad:?}");
+        }
+        let many: Vec<String> = (0..=MAX_INCLUDE_PATTERNS)
+            .map(|i| format!("f{i}"))
+            .collect();
+        assert!(validate_include(&many).is_err());
+        assert!(validate_include(&many[..MAX_INCLUDE_PATTERNS]).is_ok());
     }
 }

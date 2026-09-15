@@ -24,6 +24,7 @@
     Bell,
     Eye,
     EyeOff,
+    Users,
   } from "@lucide/svelte";
   import { _ } from "svelte-i18n";
 
@@ -43,6 +44,7 @@
   const loadOnboardingDone = () => import("./routes/OnboardingDone.svelte");
   const loadDashboard = () => import("./routes/Dashboard.svelte");
   const loadLibrary = () => import("./routes/Library.svelte");
+  const loadGroups = () => import("./routes/Groups.svelte");
   const loadSettings = () => import("./routes/Settings.svelte");
   const loadHistory = () => import("./routes/History.svelte");
   const loadLogs = () => import("./routes/Logs.svelte");
@@ -97,6 +99,7 @@
   import { tapVersion } from "./lib/stores/versionTap";
   import Modal from "./lib/components/Modal.svelte";
   import DeviceLimitModal from "./lib/components/DeviceLimitModal.svelte";
+  import ClaimWorldModal from "./lib/components/ClaimWorldModal.svelte";
   import HylianUser from "./lib/components/HylianUser.svelte";
   import MarioStar from "./lib/components/MarioStar.svelte";
   import Triforce from "./lib/components/Triforce.svelte";
@@ -172,6 +175,7 @@
     "/onboarding/done": lazy(loadOnboardingDone),
     "/dashboard": lazy(loadDashboard),
     "/library": lazy(loadLibrary),
+    "/groups": lazy(loadGroups),
     "/settings": lazy(loadSettings),
     // The old `/history` index was a duplicate of the Dashboard, so it was
     // dropped from the nav. The per-save timeline still lives here and is
@@ -807,6 +811,7 @@
       children: [
         { kind: "link", labelKey: "nav.library", icon: Library, route: "/library" },
         { kind: "link", labelKey: "nav.dashboard", icon: Triforce, route: "/dashboard" },
+        { kind: "link", labelKey: "nav.groups", icon: Users, route: "/groups" },
       ],
     },
     // Hoard-Screen (overlay) is a Cloud-only paid feature: shown (and server
@@ -827,6 +832,7 @@
   const APP_ROUTE_PREFIXES = [
     "/dashboard",
     "/library",
+    "/groups",
     "/settings",
     "/history",
     "/logs",
@@ -1305,6 +1311,10 @@
     </Button>
   {/snippet}
 </Modal>
+
+<!-- The claim prompt, when this window is the one in front; otherwise the
+     HUD over the game asks (HRD-D-0014). Opened by `stores/groups.ts`. -->
+<ClaimWorldModal />
 
 <DeviceLimitModal
   open={deviceLimit !== null || $debugDeviceLimit !== null}

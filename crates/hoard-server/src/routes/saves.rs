@@ -3,14 +3,14 @@ use axum::{
     http::StatusCode,
     response::Json,
 };
-use hoard_core::wire::{CreateSaveRequest, PatchSaveRequest, Save};
+use hoard_core::wire::{CreateSaveRequest, PatchSaveRequest, Save, SharedInfo};
 use serde::Deserialize;
 use std::sync::Arc;
 use uuid::Uuid;
 
 use crate::auth::AuthUser;
 use crate::routes::health::ServerState;
-use crate::routes::{parse_save_id, repair_slug, repair_ts};
+use crate::routes::{parse_save_id, repair_slug, repair_ts, repair_username};
 
 // ---- request and response types
 //
@@ -127,6 +127,8 @@ pub async fn create(
     Ok((StatusCode::CREATED, Json(row)))
 }
 
+/// Every save the caller owns plus every save shared into a group they belong
+/// to, each with `shared` filled when a `shared_saves` row exists.
 pub async fn list(
     State(state): State<Arc<ServerState>>,
     Extension(user): Extension<AuthUser>,
@@ -135,75 +137,71 @@ pub async fn list(
     let user_id = user.user_id.to_string();
 
     let rows = if let Some(slug) = q.game_slug {
-        sqlx::query!(
-            r#"SELECT s.id, s.game_slug, s.label, s.local_path_hint, s.client_os,
+        sqlx::query_as!(
+            SaveRow,
+            r#"SELECT s.id, s.user_id as owner_user_id, s.game_slug, s.label,
+                      s.local_path_hint, s.client_os,
                       s.latest_version_num, s.created_at, s.updated_at,
                       COALESCE(COUNT(sn.id), 0) as "snapshot_count: i64",
-                      COALESCE(SUM(sn.total_size_bytes), 0) as "total_size_bytes: i64"
+                      COALESCE(SUM(sn.total_size_bytes), 0) as "total_size_bytes: i64",
+                      ss.group_id as "group_id?", g.name as "group_name?",
+                      g.owner_user_id as "group_owner_id?", u.username as "group_owner_name?",
+                      ss.include_json as "include_json?"
                FROM saves s
+               LEFT JOIN shared_saves ss ON ss.save_id = s.id
+               LEFT JOIN groups g ON g.id = ss.group_id
+               LEFT JOIN users u ON u.id = g.owner_user_id
+               LEFT JOIN group_members gm ON gm.group_id = ss.group_id AND gm.user_id = ?
                LEFT JOIN snapshots sn ON sn.save_id = s.id AND sn.deleted_at IS NULL
-               WHERE s.user_id = ? AND s.game_slug = ?
+               WHERE (s.user_id = ? OR gm.user_id IS NOT NULL) AND s.game_slug = ?
                GROUP BY s.id ORDER BY s.created_at"#,
+            user_id,
             user_id,
             slug
         )
         .fetch_all(&state.pool)
         .await
-        .map_err(|e| internal_logged_status("listing rows", e))?
-        .into_iter()
-        .filter_map(|r| {
-            Some(Save {
-                id: parse_save_id(&r.id)?,
-                user_id: None,
-                game_slug: repair_slug(&r.game_slug),
-                label: r.label,
-                local_path_hint: r.local_path_hint,
-                client_os: r.client_os,
-                latest_version_num: Some(r.latest_version_num),
-                snapshot_count: Some(r.snapshot_count.unwrap_or(0)),
-                total_size_bytes: Some(r.total_size_bytes.unwrap_or(0)),
-                created_at: repair_ts(&r.created_at),
-                updated_at: repair_ts(&r.updated_at),
-            })
-        })
-        .collect()
     } else {
-        sqlx::query!(
-            r#"SELECT s.id, s.game_slug, s.label, s.local_path_hint, s.client_os,
+        sqlx::query_as!(
+            SaveRow,
+            r#"SELECT s.id, s.user_id as owner_user_id, s.game_slug, s.label,
+                      s.local_path_hint, s.client_os,
                       s.latest_version_num, s.created_at, s.updated_at,
                       COALESCE(COUNT(sn.id), 0) as "snapshot_count: i64",
-                      COALESCE(SUM(sn.total_size_bytes), 0) as "total_size_bytes: i64"
+                      COALESCE(SUM(sn.total_size_bytes), 0) as "total_size_bytes: i64",
+                      ss.group_id as "group_id?", g.name as "group_name?",
+                      g.owner_user_id as "group_owner_id?", u.username as "group_owner_name?",
+                      ss.include_json as "include_json?"
                FROM saves s
+               LEFT JOIN shared_saves ss ON ss.save_id = s.id
+               LEFT JOIN groups g ON g.id = ss.group_id
+               LEFT JOIN users u ON u.id = g.owner_user_id
+               LEFT JOIN group_members gm ON gm.group_id = ss.group_id AND gm.user_id = ?
                LEFT JOIN snapshots sn ON sn.save_id = s.id AND sn.deleted_at IS NULL
-               WHERE s.user_id = ?
+               WHERE s.user_id = ? OR gm.user_id IS NOT NULL
                GROUP BY s.id ORDER BY s.created_at"#,
+            user_id,
             user_id
         )
         .fetch_all(&state.pool)
         .await
-        .map_err(|e| internal_logged_status("listing rows", e))?
-        .into_iter()
-        .filter_map(|r| {
-            Some(Save {
-                id: parse_save_id(&r.id)?,
-                user_id: None,
-                game_slug: repair_slug(&r.game_slug),
-                label: r.label,
-                local_path_hint: r.local_path_hint,
-                client_os: r.client_os,
-                latest_version_num: Some(r.latest_version_num),
-                snapshot_count: Some(r.snapshot_count.unwrap_or(0)),
-                total_size_bytes: Some(r.total_size_bytes.unwrap_or(0)),
-                created_at: repair_ts(&r.created_at),
-                updated_at: repair_ts(&r.updated_at),
-            })
-        })
-        .collect()
-    };
+    }
+    .map_err(|e| internal_logged_status("listing rows", e))?;
 
-    Ok(Json(rows))
+    let mut out = Vec::with_capacity(rows.len());
+    for row in rows {
+        if let Some(save) = row
+            .into_visible(&state.pool, &user_id)
+            .await
+            .map_err(|e| internal_logged_status("reading a member's totals", e))?
+        {
+            out.push(save);
+        }
+    }
+    Ok(Json(out))
 }
 
+/// One save by id, for its owner or a member of the group it is shared into.
 pub async fn get_one(
     State(state): State<Arc<ServerState>>,
     Extension(user): Extension<AuthUser>,
@@ -371,10 +369,41 @@ pub async fn delete(
     .map_err(|e| internal_logged_status("reading a row", e))?
     .ok_or(StatusCode::NOT_FOUND)?;
 
-    sqlx::query!("DELETE FROM saves WHERE id=?", save_id)
-        .execute(&state.pool)
+    // A shared save comes back to its owner first: the cascade would take the
+    // `shared_saves` row without releasing the group's refcounts or refunding
+    // its owner. A share landing between the take-back and the delete is
+    // caught under the write lock and taken back again.
+    for round in 0.. {
+        crate::routes::share::take_back(&state.pool, &state.store, &user_id, &save_id)
+            .await
+            .map_err(|e| internal_logged_status("taking back a shared save", e))?;
+        let mut tx = state
+            .pool
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .map_err(|e| internal_logged_status("opening a transaction", e))?;
+        let shared = sqlx::query_scalar!(
+            r#"SELECT COUNT(*) AS "n: i64" FROM shared_saves WHERE save_id = ?"#,
+            save_id
+        )
+        .fetch_one(&mut *tx)
         .await
-        .map_err(|e| internal_logged_status("writing to the database", e))?;
+        .map_err(|e| internal_logged_status("reading a row", e))?;
+        if shared > 0 {
+            if round >= 2 {
+                return Err(StatusCode::CONFLICT);
+            }
+            continue;
+        }
+        sqlx::query!("DELETE FROM saves WHERE id=?", save_id)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| internal_logged_status("writing to the database", e))?;
+        tx.commit()
+            .await
+            .map_err(|e| internal_logged_status("writing to the database", e))?;
+        break;
+    }
 
     // Remove physical directory
     let dir = state
@@ -392,42 +421,148 @@ pub async fn delete(
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
 
-async fn fetch_save(
+/// A `saves` row with its aggregates and, when shared, its group. The same
+/// columns from every query so one conversion serves them all.
+struct SaveRow {
+    id: String,
+    owner_user_id: String,
+    game_slug: String,
+    label: String,
+    local_path_hint: Option<String>,
+    client_os: Option<String>,
+    latest_version_num: i64,
+    created_at: String,
+    updated_at: String,
+    snapshot_count: Option<i64>,
+    total_size_bytes: Option<i64>,
+    group_id: Option<String>,
+    group_name: Option<String>,
+    group_owner_id: Option<String>,
+    group_owner_name: Option<String>,
+    include_json: Option<String>,
+}
+
+impl SaveRow {
+    /// [`Self::into_wire`] as `user_id` may see it. The row's size sums every
+    /// file of every live version; a member of a share that names its files
+    /// reads only those, so for that caller alone the size is recomputed from
+    /// the live versions' manifests, matched the way the snapshot list matches
+    /// them. The owner and a member of an unfiltered share cost no query.
+    async fn into_visible(
+        self,
+        pool: &sqlx::SqlitePool,
+        user_id: &str,
+    ) -> Result<Option<Save>, sqlx::Error> {
+        let is_owner = self.owner_user_id == user_id;
+        let save_id = self.id.clone();
+        let Some(mut save) = self.into_wire() else {
+            return Ok(None);
+        };
+        if let Some(shared) = save.shared.as_mut() {
+            shared.caller_owns = is_owner;
+        }
+        let include = match &save.shared {
+            Some(shared) if !is_owner && !shared.include.is_empty() => &shared.include,
+            _ => return Ok(Some(save)),
+        };
+        // Summed per path in SQL, so the rows scale with distinct paths rather
+        // than versions times files; the included total is the same sum.
+        let files: Vec<(String, i64)> = sqlx::query_as(
+            "SELECT sf.relative_path, SUM(sf.size_bytes)
+             FROM snapshot_files sf
+             JOIN snapshots sn ON sn.id = sf.snapshot_id
+             WHERE sn.save_id = ? AND sn.deleted_at IS NULL
+             GROUP BY sf.relative_path",
+        )
+        .bind(&save_id)
+        .fetch_all(pool)
+        .await?;
+        let (_, size) = crate::routes::snapshots::included_totals(include, &files);
+        save.total_size_bytes = Some(size);
+        Ok(Some(save))
+    }
+
+    /// `None` only for a row whose id is not a UUID (see [`parse_save_id`]).
+    fn into_wire(self) -> Option<Save> {
+        let shared = match (
+            self.group_id,
+            self.group_name,
+            self.group_owner_id,
+            self.group_owner_name,
+        ) {
+            (Some(group_id), Some(group_name), Some(owner_user_id), Some(owner)) => {
+                // A column that does not parse reads as everything, the same as
+                // NULL: the share was validated on the way in, so this only
+                // happens to a row edited by hand.
+                let include = self
+                    .include_json
+                    .as_deref()
+                    .and_then(|j| serde_json::from_str::<Vec<String>>(j).ok())
+                    .unwrap_or_default();
+                Some(SharedInfo {
+                    group_id,
+                    group_name,
+                    owner_user_id,
+                    owner_username: repair_username(&owner),
+                    include,
+                    // Set for the caller by `into_visible`.
+                    caller_owns: false,
+                })
+            }
+            _ => None,
+        };
+        Some(Save {
+            id: parse_save_id(&self.id)?,
+            user_id: None,
+            game_slug: repair_slug(&self.game_slug),
+            label: self.label,
+            local_path_hint: self.local_path_hint,
+            client_os: self.client_os,
+            latest_version_num: Some(self.latest_version_num),
+            snapshot_count: Some(self.snapshot_count.unwrap_or(0)),
+            total_size_bytes: Some(self.total_size_bytes.unwrap_or(0)),
+            created_at: repair_ts(&self.created_at),
+            updated_at: repair_ts(&self.updated_at),
+            shared,
+        })
+    }
+}
+
+/// The save as the caller may see it: theirs, or shared into one of their
+/// groups. A stranger gets `None`, the same as an unknown id.
+pub(crate) async fn fetch_save(
     pool: &sqlx::SqlitePool,
     save_id: &str,
     user_id: &str,
 ) -> Result<Option<Save>, sqlx::Error> {
-    sqlx::query!(
-        r#"SELECT s.id, s.game_slug, s.label, s.local_path_hint, s.client_os,
+    let row = sqlx::query_as!(
+        SaveRow,
+        r#"SELECT s.id, s.user_id as owner_user_id, s.game_slug, s.label,
+                  s.local_path_hint, s.client_os,
                   s.latest_version_num, s.created_at, s.updated_at,
                   COALESCE(COUNT(sn.id), 0) as "snapshot_count: i64",
-                  COALESCE(SUM(sn.total_size_bytes), 0) as "total_size_bytes: i64"
+                  COALESCE(SUM(sn.total_size_bytes), 0) as "total_size_bytes: i64",
+                  ss.group_id as "group_id?", g.name as "group_name?",
+                  g.owner_user_id as "group_owner_id?", u.username as "group_owner_name?",
+                  ss.include_json as "include_json?"
            FROM saves s
+           LEFT JOIN shared_saves ss ON ss.save_id = s.id
+           LEFT JOIN groups g ON g.id = ss.group_id
+           LEFT JOIN users u ON u.id = g.owner_user_id
+           LEFT JOIN group_members gm ON gm.group_id = ss.group_id AND gm.user_id = ?
            LEFT JOIN snapshots sn ON sn.save_id = s.id AND sn.deleted_at IS NULL
-           WHERE s.id = ? AND s.user_id = ?
+           WHERE s.id = ? AND (s.user_id = ? OR gm.user_id IS NOT NULL)
            GROUP BY s.id"#,
+        user_id,
         save_id,
         user_id
     )
     .fetch_optional(pool)
-    .await
-    .map(|opt| {
-        opt.and_then(|r| {
-            Some(Save {
-                id: parse_save_id(&r.id)?,
-                user_id: None,
-                game_slug: repair_slug(&r.game_slug),
-                label: r.label,
-                local_path_hint: r.local_path_hint,
-                client_os: r.client_os,
-                latest_version_num: Some(r.latest_version_num),
-                snapshot_count: Some(r.snapshot_count.unwrap_or(0)),
-                total_size_bytes: Some(r.total_size_bytes.unwrap_or(0)),
-                created_at: repair_ts(&r.created_at),
-                updated_at: repair_ts(&r.updated_at),
-            })
-        })
-    })
+    .await?;
+    match row {
+        Some(row) => row.into_visible(pool, user_id).await,
+        None => Ok(None),
+    }
 }
 
 fn internal_err() -> (StatusCode, Json<serde_json::Value>) {

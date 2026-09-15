@@ -2653,7 +2653,7 @@ fn holds_player_data(dir: &Path, shields: &[String]) -> bool {
             }
             let name = entry.file_name();
             let Some(name) = name.to_str() else { continue };
-            if fileclass::classify(name, shields).is_backed_up() {
+            if fileclass::classify(name, fileclass::Scope::shields_only(shields)).is_backed_up() {
                 return true;
             }
         }
@@ -2744,7 +2744,8 @@ fn inspect_folder(dir: &Path, shields: &[String]) -> FolderContents {
                     continue;
                 }
                 self.saw_file = true;
-                if fileclass::classify(&child, self.shields) == fileclass::FileClass::SaveData {
+                let scope = fileclass::Scope::shields_only(self.shields);
+                if fileclass::classify(&child, scope) == fileclass::FileClass::SaveData {
                     return true;
                 }
             }
@@ -6880,7 +6881,10 @@ mod tests {
                 paused: false,
                 preset: None,
                 allow_device_local: None,
+                shared: None,
+                include: Vec::new(),
                 set_hash: None,
+                world_hash: None,
                 processes: Vec::new(),
                 shared_processes: false,
             },

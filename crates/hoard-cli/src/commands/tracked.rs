@@ -1,7 +1,9 @@
 //! `hoard saves`: the saves this machine tracks, meaning what `daemon` and `sync`
-//! watch. Purely local: it reads `contexts/<id>.json` of the active context (Cloud
-//! or self-host) and never touches the network, so it works offline and is
-//! instant.
+//! watch. Local: it reads `contexts/<id>.json` of the active context (Cloud or
+//! self-host) and never touches the network itself. Who hosts a shared save
+//! takes one more local call, a status read from the resident service, and no
+//! server call: the engine already holds every slot's lease. With no service
+//! answering the HOST column is left out.
 
 use anyhow::Result;
 use serde::Serialize;
@@ -10,7 +12,8 @@ use time::format_description::well_known::Rfc3339;
 use hoard_agent::session;
 use hoard_agent::state::CliState;
 
-use crate::output;
+use super::world;
+use crate::output::{self, truncate};
 
 /// One tracked save as agents and scripts see it. Declared here on purpose:
 /// `SaveState` is the engine's own struct and must stay free to change.
@@ -26,6 +29,17 @@ pub struct SaveRow {
     /// RFC3339, or null when this save has never been backed up.
     pub last_backup_at: Option<String>,
     pub preset: Option<String>,
+    /// The group this save is shared into, or null.
+    pub group: Option<String>,
+    /// Who hosts a shared save: "hosted here", "hosted by <name>", "hosted
+    /// elsewhere", "nobody" or "unknown". Absent on a save that is not shared,
+    /// or with no service to ask.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hosted: Option<String>,
+    /// The lease behind `hosted`: "mine", "other", "free" or "unknown".
+    /// Present exactly when `hosted` is.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lease: Option<&'static str>,
 }
 
 #[derive(Serialize)]
@@ -47,18 +61,36 @@ pub async fn run() -> Result<()> {
             .then_with(|| a.label.cmp(&b.label))
     });
 
+    // The engine's to know (it holds the session). No service means no
+    // column, not a column claiming nobody hosts.
+    let hosts = if rows.iter().any(|(_, s)| s.shared.is_some()) {
+        world::Hosts::read().await
+    } else {
+        None
+    };
+    let host_column = hosts.is_some();
+
     let out = SavesOut {
         saves: rows
             .into_iter()
-            .map(|(id, s)| SaveRow {
-                save_id: id.clone(),
-                game_slug: s.game_slug.clone(),
-                label: s.label.clone(),
-                local_path: s.local_path.display().to_string(),
-                paused: s.paused,
-                last_version_num: s.last_version_num,
-                last_backup_at: s.last_backup_at.and_then(|t| t.format(&Rfc3339).ok()),
-                preset: s.preset.clone(),
+            .map(|(id, s)| {
+                let host = hosts
+                    .as_ref()
+                    .filter(|_| s.shared.is_some())
+                    .map(|h| h.of(id));
+                SaveRow {
+                    save_id: id.clone(),
+                    game_slug: s.game_slug.clone(),
+                    label: s.label.clone(),
+                    local_path: s.local_path.display().to_string(),
+                    paused: s.paused,
+                    last_version_num: s.last_version_num,
+                    last_backup_at: s.last_backup_at.and_then(|t| t.format(&Rfc3339).ok()),
+                    preset: s.preset.clone(),
+                    group: s.shared.as_ref().map(|g| g.group_name.clone()),
+                    hosted: host.as_ref().map(|h| h.cell.clone()),
+                    lease: host.map(|h| h.lease),
+                }
             })
             .collect(),
         state_file: path.display().to_string(),
@@ -72,9 +104,22 @@ pub async fn run() -> Result<()> {
             );
             return;
         }
+        let host = |cell: &str| {
+            if host_column {
+                format!("{cell:<16}  ")
+            } else {
+                String::new()
+            }
+        };
         println!(
-            "{:<24}  {:<10}  {:>6}  {:<20}  {:<8}  PATH",
-            "GAME", "LABEL", "VER", "LAST", "STATE"
+            "{:<24}  {:<10}  {:>6}  {:<20}  {:<8}  {:<12}  {}PATH",
+            "GAME",
+            "LABEL",
+            "VER",
+            "LAST",
+            "STATE",
+            "GROUP",
+            host("HOST")
         );
         for s in &out.saves {
             let ver = s
@@ -87,25 +132,28 @@ pub async fn run() -> Result<()> {
                 .map(|t| t.chars().take(19).collect::<String>().replace('T', " "))
                 .unwrap_or_else(|| "—".to_string());
             let state_label = if s.paused { "paused" } else { "active" };
+            let group = s
+                .group
+                .as_deref()
+                .map(|g| truncate(g, 12))
+                .unwrap_or_else(|| "—".to_string());
+            let hosted = s
+                .hosted
+                .as_deref()
+                .map(|h| truncate(h, 16))
+                .unwrap_or_else(|| "—".to_string());
             println!(
-                "{:<24}  {:<10}  {:>6}  {:<20}  {:<8}  {}",
+                "{:<24}  {:<10}  {:>6}  {:<20}  {:<8}  {:<12}  {}{}",
                 truncate(&s.game_slug, 24),
                 truncate(&s.label, 10),
                 ver,
                 last,
                 state_label,
+                group,
+                host(&hosted),
                 s.local_path
             );
         }
         println!("\n{} save(s) · {}", out.saves.len(), out.state_file);
     })
-}
-
-fn truncate(s: &str, max: usize) -> String {
-    if s.chars().count() <= max {
-        s.to_string()
-    } else {
-        let cut: String = s.chars().take(max.saturating_sub(1)).collect();
-        format!("{cut}…")
-    }
 }

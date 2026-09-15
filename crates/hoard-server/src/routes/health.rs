@@ -38,6 +38,9 @@ pub struct ServerState {
 /// most: a client that sent a zstd body to a server without this would have
 /// every upload rejected for not hashing to its declared sha, and self-hosted
 /// servers are updated by whoever runs them, whenever they feel like it.
+///
+/// `groups` announces groups, shared saves and hosting leases (`routes::groups`,
+/// `routes::share`, `routes::leases`).
 fn body(status: &str, uptime_secs: u64) -> Health {
     Health {
         status: status.to_string(),
@@ -48,6 +51,7 @@ fn body(status: &str, uptime_secs: u64) -> Health {
         cas: true,
         devices: true,
         blob_zstd: true,
+        groups: true,
     }
 }
 

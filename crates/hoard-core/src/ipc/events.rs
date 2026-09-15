@@ -74,6 +74,12 @@ pub enum AgentEvent {
         /// `state.json` so the next session can skip a no-op re-upload of the
         /// same bytes. `None` only if the agent couldn't compute it.
         set_hash: Option<String>,
+        /// Cheap signature of the shared world inside that snapshot (the
+        /// share's include list), persisted beside `set_hash` so an owner's
+        /// push without the lease survives a restart (HRD-D-0019). `None` from
+        /// an older daemon, which reads as "world unknown" and holds.
+        #[serde(default)]
+        world_hash: Option<String>,
         /// Nothing was uploaded, because the content already was the server's
         /// head (ADR 0021 D.8.3). Happens when the daemon restarts with an
         /// upload in flight that did commit: the in-memory `in_flight` is gone
@@ -343,6 +349,9 @@ pub enum AgentEvent {
     /// was newer than the local copy (ADR 0014). Before overwriting, the
     /// agent moved each local version into `conflict_dir`. The UI surfaces
     /// a toast so the user can recover manually if mtime decided wrong.
+    /// Also what a shared-world session that never pushes (a viewer's, or
+    /// under somebody else's lease) leaves behind on close: its writes, set
+    /// aside in `conflict_dir` before the head comes back.
     SaveConflictsBackedUp {
         save_id: String,
         game_slug: String,
@@ -381,6 +390,82 @@ pub enum AgentEvent {
         /// The guard that vetoed, straight from `mid_session_reason`.
         reason: String,
     },
+    /// This machine took a role on a shared world. `auto` is the engine
+    /// deciding on its own (the unanswered prompt); `false` is the user asking.
+    WorldClaimed {
+        save_id: String,
+        game_slug: String,
+        role: WorldRole,
+        auto: bool,
+    },
+    /// This machine gave the hosting lease back.
+    WorldReleased {
+        save_id: String,
+        game_slug: String,
+    },
+    /// Local changes on a shared world whose lease another member holds: they
+    /// stay local until the lease is free. Once per hold, not per tick.
+    WorldHostedElsewhere {
+        save_id: String,
+        game_slug: String,
+        /// The holder's username.
+        holder: String,
+    },
+    /// The lease this machine held is gone: forced by a member, or expired
+    /// while the renew could not reach the server. Nothing pushes from here.
+    WorldLeaseLost {
+        save_id: String,
+        game_slug: String,
+        /// Who holds it now, when the engine was told; absent when nobody
+        /// does or the answer never named them.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        holder: Option<String>,
+    },
+    /// A game with shared worlds started and nothing says which world this
+    /// machine plays, or how. One per session per game: a re-prompt replaces
+    /// the last. The answer is `ClaimWorld` or `DismissWorld`; with exactly one
+    /// world whose lease is free, no answer within a minute hosts it.
+    WorldClaimWanted {
+        game_slug: String,
+        worlds: Vec<WorldChoice>,
+    },
+    /// A second write landed on a shared world this machine only views: the
+    /// game is saving into a copy that will never be pushed. Once per session.
+    ViewSessionWriting {
+        save_id: String,
+        game_slug: String,
+    },
+}
+
+/// One shared world the prompt offers.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorldChoice {
+    pub save_id: String,
+    pub label: String,
+    pub group_name: String,
+    /// Who hosts it now, when the lease is somebody's.
+    #[serde(default)]
+    pub holder: Option<String>,
+    pub lease: WorldLease,
+}
+
+/// The lease as the engine last heard it, for the prompt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorldLease {
+    Unknown,
+    Free,
+    Mine,
+    Other,
+}
+
+/// What a machine does with a shared world during a session. `Host` holds the
+/// lease and pushes; `View` plays a copy and pushes nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorldRole {
+    Host,
+    View,
 }
 
 /// Why we scheduled a backup. Useful in the UI to explain "the game just
@@ -419,4 +504,20 @@ pub struct AgentSlotStatus {
     pub last_fs_event_at: Option<OffsetDateTime>,
     #[serde(with = "time::serde::rfc3339::option")]
     pub next_scheduled_backup_at: Option<OffsetDateTime>,
+    /// The save is shared into a group. A surface that only reads the status
+    /// (the desktop's HUD) draws the lease from the two fields below when this
+    /// is set. Defaults keep an older daemon's rows parsing.
+    #[serde(default)]
+    pub shared: bool,
+    /// The lease as the engine last heard it, for a shared save.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lease: Option<WorldLease>,
+    /// Who hosts it, when the lease is somebody else's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lease_holder: Option<String>,
+    /// A shared world whose acquire was refused as stale: Hoard is pulling the
+    /// head before it can host. Absent from an older service, which reads as
+    /// `false`.
+    #[serde(default)]
+    pub lease_behind: bool,
 }

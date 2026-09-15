@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "DELETE FROM chunks WHERE user_id = ? AND sha256 = ?",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 2
+    },
+    "nullable": []
+  },
+  "hash": "8b8b78b348f6bd0ecef860d5f0b7f199f5a964825c9b60cfaef9ed4110a25eb3"
+}

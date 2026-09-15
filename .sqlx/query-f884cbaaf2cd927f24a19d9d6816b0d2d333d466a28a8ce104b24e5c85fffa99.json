@@ -1,0 +1,20 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT size_bytes FROM chunks WHERE user_id = ? AND sha256 = ?",
+  "describe": {
+    "columns": [
+      {
+        "name": "size_bytes",
+        "ordinal": 0,
+        "type_info": "Integer"
+      }
+    ],
+    "parameters": {
+      "Right": 2
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "f884cbaaf2cd927f24a19d9d6816b0d2d333d466a28a8ce104b24e5c85fffa99"
+}

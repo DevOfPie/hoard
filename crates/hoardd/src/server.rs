@@ -20,8 +20,8 @@ use std::time::Instant;
 use anyhow::{Context, Result};
 use hoard_agent::session::LendError;
 use hoard_core::ipc::{
-    ClientFrame, DaemonStatus, Hello, IpcError, JournalEntry, Payload, Rejected, Reply, Request,
-    ServerFrame, Welcome, PROTOCOL_VERSION,
+    encode_frame, ClientFrame, DaemonStatus, Hello, IpcError, JournalEntry, Payload, Rejected,
+    Reply, Request, ServerFrame, Welcome, PROTOCOL_VERSION,
 };
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::{broadcast, mpsc};
@@ -125,6 +125,9 @@ impl Daemon {
         let slots = engine::slot_status(&self.engine).await;
         if engine_status.running {
             engine_status.watched = slots.len();
+            // The open questions too: the HUD reads them from here, since it
+            // was not there when `WorldClaimWanted` went out.
+            engine_status.prompts = engine::prompt_status(&self.engine).await;
         }
         DaemonStatus {
             daemon_version: self.version.clone(),
@@ -365,6 +368,129 @@ impl Daemon {
                 self.with_engine(|h| async move { h.set_global_sync(enabled).await })
                     .await
             }
+            // The world verbs are engine commands: the outcome arrives as events,
+            // and a save that is not a shared world here is refused up front.
+            Request::ClaimWorld { save_id, role } => {
+                self.with_engine(|h| async move { h.claim_world(save_id, role).await })
+                    .await
+            }
+            Request::ReleaseWorld { save_id } => {
+                self.with_engine(|h| async move { h.release_world(save_id).await })
+                    .await
+            }
+            Request::ForceWorld { save_id } => {
+                self.with_engine(|h| async move { h.force_world(save_id).await })
+                    .await
+            }
+            Request::DismissWorld { save_id } => {
+                self.with_engine(|h| async move { h.dismiss_world(save_id).await })
+                    .await
+            }
+            // The group verbs are plain server calls on the engine's client, and
+            // they answer with the server's payload.
+            Request::ListGroups => {
+                self.with_client(|c| async move {
+                    c.list_groups()
+                        .await
+                        .map(|groups| Payload::Groups { groups })
+                })
+                .await
+            }
+            Request::CreateGroup { name } => {
+                self.with_client(|c| async move {
+                    c.create_group(&name)
+                        .await
+                        .map(|g| Payload::Group(Box::new(g)))
+                })
+                .await
+            }
+            Request::InviteToGroup {
+                group_id,
+                expires_in_secs,
+            } => {
+                self.with_client(|c| async move {
+                    c.create_invite(&group_id, expires_in_secs)
+                        .await
+                        .map(Payload::Invite)
+                })
+                .await
+            }
+            Request::JoinGroup { token } => {
+                self.with_client(|c| async move {
+                    c.join_group(&token)
+                        .await
+                        .map(|g| Payload::Group(Box::new(g)))
+                })
+                .await
+            }
+            Request::LeaveGroup { group_id } => {
+                self.with_client(|c| async move {
+                    let me = c.whoami().await?.user_id;
+                    c.leave_group(&group_id, &me).await.map(|()| Payload::Ack)
+                })
+                .await
+            }
+            Request::RemoveMember { group_id, user_id } => {
+                self.with_client(|c| async move {
+                    c.leave_group(&group_id, &user_id)
+                        .await
+                        .map(|()| Payload::Ack)
+                })
+                .await
+            }
+            Request::DeleteGroup { group_id } => {
+                self.with_client(|c| async move {
+                    c.delete_group(&group_id).await.map(|()| Payload::Ack)
+                })
+                .await
+            }
+            // The list comes off this machine's disk, but it is gated on the
+            // engine like a share is: with no engine there is no session, and
+            // a test fixture must never read the tester's own `state.json`.
+            Request::ListWorlds { save_id } => {
+                if self.engine.client().is_none() {
+                    return Reply::Error(self.engine.down_error());
+                }
+                match hoard_agent::library::list_worlds(&save_id) {
+                    Ok(worlds) => Reply::Ok(Payload::Worlds { worlds }),
+                    Err(err) => Reply::Error(IpcError::Invalid {
+                        message: format!("{err:#}"),
+                    }),
+                }
+            }
+            // Sharing changes what the owner's slot walks (the world's files and
+            // nothing else), so the row is rewritten and the slot re-seated here,
+            // the daemon being the one that owns both.
+            Request::ShareSave {
+                save_id,
+                group_id,
+                world,
+            } => {
+                self.with_client(|c| async move {
+                    let (save, reseat) =
+                        hoard_agent::library::share_save(&c, &save_id, &group_id, world.as_deref())
+                            .await?;
+                    engine::apply_reseat(&self.engine, reseat).await;
+                    Ok(Payload::Save(Box::new(save)))
+                })
+                .await
+            }
+            Request::UnshareSave { save_id } => {
+                self.with_client(|c| async move {
+                    let reseat = hoard_agent::library::unshare_save(&c, &save_id).await?;
+                    engine::apply_reseat(&self.engine, reseat).await;
+                    Ok(Payload::Ack)
+                })
+                .await
+            }
+            Request::GetLease { save_id } => {
+                self.with_client(|c| async move {
+                    c.get_lease(&save_id).await.map(|l| Payload::Lease {
+                        lease: l.map(Box::new),
+                    })
+                })
+                .await
+            }
             // How the update is going. Not through the engine: the updater belongs
             // to the daemon, and a downed engine (usually the very case where updating
             // fixes something) must not leave anybody unable to find out.
@@ -405,9 +531,7 @@ impl Daemon {
         Fut: std::future::Future<Output = anyhow::Result<()>>,
     {
         let Some(handle) = self.engine.handle() else {
-            return Reply::Error(IpcError::EngineDown {
-                reason: self.engine.down_reason(),
-            });
+            return Reply::Error(self.engine.down_error());
         };
         match f(handle).await {
             Ok(()) => Reply::Ok(Payload::Ack),
@@ -415,15 +539,46 @@ impl Daemon {
         }
     }
 
+    /// A server call on the live engine's client. No engine means no session to
+    /// call with, which is the same `EngineDown` the engine commands answer.
+    async fn with_client<F, Fut>(&self, f: F) -> Reply
+    where
+        F: FnOnce(hoard_agent::api::ApiClient) -> Fut,
+        Fut: std::future::Future<Output = anyhow::Result<Payload>>,
+    {
+        let Some(client) = self.engine.client() else {
+            return Reply::Error(self.engine.down_error());
+        };
+        match f(client).await {
+            Ok(payload) => Reply::Ok(payload),
+            Err(err) => self.api_error(err),
+        }
+    }
+
+    /// A share refused before the server was asked is the caller's to fix; see
+    /// [`share_refusal`]. Server refusals keep a code; see [`server_refusal`].
+    /// Everything else is `Internal`.
+    fn api_error(&self, err: anyhow::Error) -> Reply {
+        if let Some(refusal) = share_refusal(&err).or_else(|| server_refusal(&err)) {
+            return Reply::Error(refusal);
+        }
+        tracing::warn!(error = %format!("{err:#}"), "hoardd: a server call failed");
+        Reply::Error(IpcError::Internal {
+            message: format!("{err:#}"),
+        })
+    }
+
     /// A command that does not reach the engine almost always means the engine is
     /// gone (a closed channel), so it is reported as `EngineDown` with whatever reason
     /// the keeper recorded, not as an opaque `Internal`.
+    /// An engine that answered with a refusal is up, so that is checked first.
     fn engine_error(&self, err: anyhow::Error) -> Reply {
+        if let Some(refusal) = world_refusal(&err) {
+            return Reply::Error(refusal);
+        }
         tracing::warn!(error = %format!("{err:#}"), "hoardd: a request failed");
         if self.engine.handle().is_none() {
-            return Reply::Error(IpcError::EngineDown {
-                reason: self.engine.down_reason(),
-            });
+            return Reply::Error(self.engine.down_error());
         }
         Reply::Error(IpcError::Internal {
             message: format!("{err:#}"),
@@ -473,7 +628,9 @@ where
     let writer_task = tokio::spawn(async move {
         while let Some(frame) = out_rx.recv().await {
             if let Err(err) = write_frame(&mut writer, &frame).await {
-                tracing::debug!(error = %format!("{err:#}"), "hoardd: write failed; dropping the client");
+                // Warn, not debug: a writer that dies leaves the reader serving a
+                // client that will never hear back.
+                tracing::warn!(error = %format!("{err:#}"), "hoardd: write failed; dropping the client");
                 return;
             }
         }
@@ -569,10 +726,7 @@ where
             Request::Shutdown => {
                 tracing::info!("hoardd: shutdown requested over IPC");
                 let _ = out
-                    .send(ServerFrame::Reply {
-                        id,
-                        reply: Reply::Ok(Payload::Ack),
-                    })
+                    .send(reply_frame(id, Reply::Ok(Payload::Ack), "shutdown"))
                     .await;
                 daemon.shutdown.notify_one();
                 break;
@@ -593,10 +747,11 @@ where
                     );
                 }
                 let _ = out
-                    .send(ServerFrame::Reply {
+                    .send(reply_frame(
                         id,
-                        reply: Reply::Ok(Payload::Backlog(backlog)),
-                    })
+                        Reply::Ok(Payload::Backlog(backlog)),
+                        "subscribe",
+                    ))
                     .await;
                 if let Some(old) = pusher.replace(tokio::spawn(push_loop(
                     rx,
@@ -610,8 +765,9 @@ where
                 }
             }
             other => {
+                let kind = other.kind();
                 let reply = daemon.dispatch(other).await;
-                if out.send(ServerFrame::Reply { id, reply }).await.is_err() {
+                if out.send(reply_frame(id, reply, kind)).await.is_err() {
                     break;
                 }
             }
@@ -630,6 +786,33 @@ where
 /// error.
 fn accepts(hello: &Hello) -> bool {
     hello.protocol == PROTOCOL_VERSION
+}
+
+/// The frame answering request `id`, checked before it is queued.
+///
+/// The single writer encodes as it writes, so a reply that cannot be encoded (a
+/// payload serde refuses, a frame over the cap) used to kill the writer while
+/// the read loop kept the connection open, and the client waited out its
+/// timeout. Found here instead, the request gets an `Internal` error and the
+/// connection carries on.
+fn reply_frame(id: u64, reply: Reply, kind: &str) -> ServerFrame {
+    let frame = ServerFrame::Reply { id, reply };
+    match encode_frame(&frame) {
+        Ok(_) => frame,
+        Err(err) => {
+            tracing::warn!(
+                request = kind,
+                error = %err,
+                "hoardd: a reply could not be encoded; answering with an error"
+            );
+            ServerFrame::Reply {
+                id,
+                reply: Reply::Error(IpcError::Internal {
+                    message: format!("the answer to `{kind}` could not be encoded: {err}"),
+                }),
+            }
+        }
+    }
 }
 
 /// Forwards new journal rows to the client. It skips what was already in the
@@ -662,5 +845,216 @@ async fn push_loop(
             }
             Err(broadcast::error::RecvError::Closed) => return,
         }
+    }
+}
+
+/// A server refusal with its stable code, `None` for anything else. A 409 is
+/// `Conflict` and keeps its own tag (`held`, `stale`...), because the client
+/// branches on it; the other refusals are `Refused`, so a client can tell a
+/// sign-in problem or a missing save from a failure. A throttle's message
+/// already carries its retry-after.
+fn server_refusal(err: &anyhow::Error) -> Option<IpcError> {
+    use hoard_agent::api::ApiError;
+    let api = err.downcast_ref::<ApiError>()?;
+    let message = format!("{err:#}");
+    let conflict = match api {
+        ApiError::LeaseHeld(_) => Some("held"),
+        ApiError::LeaseStale(_) => Some("stale"),
+        ApiError::LeaseRequired(_) => Some("lease_required"),
+        ApiError::NotShared => Some("not_shared"),
+        ApiError::LeasePushed(_) => Some("pushed"),
+        ApiError::Conflict(_) => Some("conflict"),
+        _ => None,
+    };
+    if let Some(code) = conflict {
+        return Some(IpcError::Conflict {
+            code: code.to_string(),
+            message,
+        });
+    }
+    let code = match api {
+        ApiError::Unauthorized => "unauthorized",
+        ApiError::Forbidden => "forbidden",
+        ApiError::NotFound => "not_found",
+        ApiError::BadRequest(_) => "bad_request",
+        ApiError::RateLimited { .. } => "throttled",
+        ApiError::QuotaExceeded(_) => "quota_full",
+        _ => return None,
+    };
+    Some(IpcError::Refused {
+        code: code.to_string(),
+        message,
+    })
+}
+
+/// A share the engine refused before asking the server. A template game with
+/// no world named is `Refused` with `needs_input` and the worlds it found, so
+/// the caller can ask for one; the rest (a world name that is not a stem, a
+/// game with no template) are `Invalid`.
+fn share_refusal(err: &anyhow::Error) -> Option<IpcError> {
+    use hoard_agent::library::ShareError;
+    let message = format!("{err:#}");
+    Some(match err.downcast_ref::<ShareError>()? {
+        ShareError::NeedsWorld { .. } => IpcError::Refused {
+            code: "needs_input".to_string(),
+            message,
+        },
+        _ => IpcError::Invalid { message },
+    })
+}
+
+/// The engine's refusal of a world verb (a save it does not watch, or does not
+/// share), as a `Refused` naming the save.
+fn world_refusal(err: &anyhow::Error) -> Option<IpcError> {
+    let refused = err.downcast_ref::<hoard_agent::agent::WorldCommandError>()?;
+    Some(IpcError::Refused {
+        code: refused.code().to_string(),
+        message: refused.to_string(),
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use hoard_agent::agent::WorldCommandError;
+    use hoard_agent::api::{ApiError, RateLimitKind};
+    use hoard_agent::library::ShareError;
+    use hoard_core::ipc::IpcError;
+    use hoard_core::ipc::MAX_FRAME_BYTES;
+
+    /// An engine refusal crosses as `Refused` with its code and the save id.
+    #[test]
+    fn world_refusals_keep_their_code_and_save() {
+        for (err, code) in [
+            (WorldCommandError::NotWatched("s-1".into()), "not_watched"),
+            (WorldCommandError::NotShared("s-1".into()), "not_shared"),
+        ] {
+            match world_refusal(&anyhow::Error::new(err)) {
+                Some(IpcError::Refused { code: got, message }) => {
+                    assert_eq!(got, code);
+                    assert!(message.contains("s-1"), "{message}");
+                }
+                other => panic!("unexpected {other:?}"),
+            }
+        }
+        assert!(world_refusal(&anyhow::anyhow!("channel closed")).is_none());
+    }
+
+    /// A template game shared with no world is `needs_input` with the worlds;
+    /// the other share refusals stay `Invalid`, and anything else is not one.
+    #[test]
+    fn a_share_that_needs_a_world_asks_for_one() {
+        let needs = ShareError::NeedsWorld {
+            worlds: vec!["Alpha".into(), "Beta".into()],
+        };
+        match share_refusal(&anyhow::Error::new(needs)) {
+            Some(IpcError::Refused { code, message }) => {
+                assert_eq!(code, "needs_input");
+                assert!(message.ends_with("Alpha, Beta"), "{message}");
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        assert!(matches!(
+            share_refusal(&anyhow::Error::new(ShareError::NoTemplate(
+                "stardew".into()
+            ))),
+            Some(IpcError::Invalid { .. })
+        ));
+        assert!(share_refusal(&anyhow::Error::new(ApiError::NotFound)).is_none());
+    }
+
+    fn code_of(err: ApiError) -> Option<(&'static str, String)> {
+        match server_refusal(&anyhow::Error::new(err).context("sharing")) {
+            Some(IpcError::Refused { code, .. }) => Some(("refused", code)),
+            Some(IpcError::Conflict { code, .. }) => Some(("conflict", code)),
+            Some(other) => panic!("unexpected {other:?}"),
+            None => None,
+        }
+    }
+
+    /// Each server refusal crosses the socket with its code, through context;
+    /// the 409s stay `Conflict`, and what has no code stays out.
+    #[test]
+    fn server_refusals_keep_their_code() {
+        let refused = |c: &str| Some(("refused", c.to_string()));
+        assert_eq!(code_of(ApiError::Unauthorized), refused("unauthorized"));
+        assert_eq!(code_of(ApiError::Forbidden), refused("forbidden"));
+        assert_eq!(code_of(ApiError::NotFound), refused("not_found"));
+        assert_eq!(
+            code_of(ApiError::BadRequest("bad include".into())),
+            refused("bad_request")
+        );
+        assert_eq!(
+            code_of(ApiError::NotShared),
+            Some(("conflict", "not_shared".to_string()))
+        );
+        assert_eq!(
+            code_of(ApiError::LeasePushed("the holder has pushed".into())),
+            Some(("conflict", "pushed".to_string()))
+        );
+        assert_eq!(
+            code_of(ApiError::Server {
+                status: 500,
+                body: String::new()
+            }),
+            None
+        );
+        assert!(server_refusal(&anyhow::anyhow!("disk full")).is_none());
+
+        let throttled = server_refusal(&anyhow::Error::new(ApiError::RateLimited {
+            kind: RateLimitKind::Paced,
+            retry_after_seconds: 7,
+            body: String::new(),
+        }));
+        match throttled {
+            Some(IpcError::Refused { code, message }) => {
+                assert_eq!(code, "throttled");
+                assert!(message.contains("7s"), "{message}");
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    /// A reply that cannot be encoded is swapped for an `Internal` error on the
+    /// same id, and that error itself encodes: the client hears back instead of
+    /// waiting out its timeout.
+    #[test]
+    fn a_reply_that_cannot_be_encoded_becomes_an_internal_error() {
+        let oversized = Reply::Ok(Payload::Pong {
+            daemon_version: "x".repeat(MAX_FRAME_BYTES + 1),
+            pid: 1,
+        });
+        let frame = reply_frame(9, oversized, "ping");
+        let ServerFrame::Reply {
+            id,
+            reply: Reply::Error(IpcError::Internal { message }),
+        } = &frame
+        else {
+            panic!("not swapped for an error: the reply went out as it was");
+        };
+        assert_eq!(*id, 9);
+        assert!(message.contains("`ping`"), "{message}");
+        encode_frame(&frame).expect("the error must encode");
+
+        // And a reply that encodes goes out untouched.
+        let fine = reply_frame(10, Reply::Ok(Payload::Ack), "ping");
+        assert!(matches!(
+            fine,
+            ServerFrame::Reply {
+                id: 10,
+                reply: Reply::Ok(Payload::Ack)
+            }
+        ));
+    }
+
+    #[test]
+    fn a_request_is_logged_by_its_wire_name() {
+        assert_eq!(
+            Request::GetLease {
+                save_id: "w1".into()
+            }
+            .kind(),
+            "get_lease"
+        );
     }
 }

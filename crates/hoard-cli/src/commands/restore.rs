@@ -31,10 +31,15 @@ pub struct PreviewOut {
     /// the saves made *after* the version being restored, so they are the ones
     /// worth reading before saying yes.
     pub local_only: Vec<String>,
+    /// On the owner's restore of a shared save: overwritten files outside the
+    /// share's list, whose current bytes may be in no version yet. The restore
+    /// copies them into the side-copy folder before writing.
+    pub outside_share: Vec<String>,
     /// Real totals. The lists above stop at 200 entries; these never do.
     pub modified_count: usize,
     pub added_count: usize,
     pub local_only_count: usize,
+    pub outside_share_count: usize,
     pub unchanged: usize,
     pub bytes_to_write: u64,
     /// False on versions that don't publish per-file hashes: then modified and
@@ -51,6 +56,10 @@ pub struct RestoredOut {
     pub files_reused: u64,
     pub bytes_reused: u64,
     pub destination: String,
+    /// The folder the files in `preview.outside_share` were copied to before
+    /// the restore wrote over them. Absent when nothing needed keeping.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub set_aside: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -91,18 +100,19 @@ pub async fn apply(
 
     let version = resolve_version(&client, &save_id, version).await?;
 
+    // This machine's row, when it has one: the destination without `--to`, and
+    // the game and include list the gate below is built from. A state that does
+    // not load only matters when the row is the only place the destination is.
+    let row = match CliState::load_default() {
+        Ok((state, _)) => state.saves.get(&save_id).cloned(),
+        Err(e) if to.is_none() => return Err(e),
+        Err(_) => None,
+    };
     let dest = match to {
         Some(p) => p,
-        None => {
-            let (state, _) = CliState::load_default()?;
-            state
-                .saves
-                .get(&save_id)
-                .map(|s| s.local_path.clone())
-                .ok_or_else(|| {
-                    anyhow!("no remembered local path for save {save_id}; pass --to <PATH>")
-                })?
-        }
+        None => row.as_ref().map(|s| s.local_path.clone()).ok_or_else(|| {
+            anyhow!("no remembered local path for save {save_id}; pass --to <PATH>")
+        })?,
     };
 
     // `--remember` makes `dest` this save's folder here, through the same door as
@@ -122,49 +132,55 @@ pub async fn apply(
     // What is allowed to be written. The manifest's patterns can only be
     // consulted when we know which game the folder belongs to; a bare `--to` over
     // a save that is not in the local state gets no shields and the kernel
-    // decides on its own.
-    let shields = {
-        // A save new to this machine has no row until the restore is done, so with
-        // `--remember` its game comes from the plan.
-        let slug = match &home {
-            Some(home) => Some(home.game_slug.clone()),
-            None => CliState::load_default()
-                .ok()
-                .and_then(|(st, _)| st.saves.get(&save_id).map(|s| s.game_slug.clone())),
-        };
-        slug.map(|s| hoard_agent::savefilter::shields_for_slug(&s))
-            .unwrap_or_default()
-    };
-    let gate = hoard_core::kernel::fileclass::RestoreGate {
-        shields,
-        allow_device_local: allow_ini,
-    };
+    // decides on its own. A save new to this machine has no row until the
+    // restore is done, so with `--remember` its game comes from the plan. A
+    // member's restore of a shared save writes only its world's files, the list
+    // its backup walks; the owner's restores the whole of their own history.
+    // The share says which, and for a save new here it is the server row's.
+    let slug = home
+        .as_ref()
+        .map(|h| h.game_slug.as_str())
+        .or(row.as_ref().map(|s| s.game_slug.as_str()))
+        .unwrap_or_default();
+    let shared = home
+        .as_ref()
+        .and_then(|h| h.shared.as_ref())
+        .or(row.as_ref().and_then(|s| s.shared.as_ref()));
+    let include = hoard_agent::savefilter::restore_include(shared);
+    let gate = hoard_agent::savefilter::gate_for_save(slug, include, allow_ini);
+    // The owner's side of the same list, by the server's owner mark: what the
+    // restore overwrites outside it is copied aside before writing.
+    let outside = hoard_agent::savefilter::owner_share_include(shared);
 
     // What is going to happen to the folder. Nothing is downloaded: it crosses
     // the version's manifest with what is on disk. Always shown, because
     // restoring overwrites and that deserves saying beforehand; with `--dry-run`
     // it is all the command does.
-    let (preview, preview_error) =
-        match hoard_agent::preview::restore_preview(&client, &save_id, version, &dest, &gate).await
-        {
-            Ok(p) => (
-                Some(PreviewOut {
-                    modified: p.modified,
-                    added: p.added,
-                    local_only: p.local_only,
-                    modified_count: p.modified_count,
-                    added_count: p.added_count,
-                    local_only_count: p.local_only_count,
-                    unchanged: p.unchanged,
-                    bytes_to_write: p.bytes_to_write,
-                    comparable: p.comparable,
-                }),
-                None,
-            ),
-            // Not being able to look at what changes is no reason to block a
-            // restore.
-            Err(e) => (None, Some(format!("{e:#}"))),
-        };
+    let (preview, preview_error) = match hoard_agent::preview::restore_preview(
+        &client, &save_id, version, &dest, &gate, outside,
+    )
+    .await
+    {
+        Ok(p) => (
+            Some(PreviewOut {
+                modified: p.modified,
+                added: p.added,
+                local_only: p.local_only,
+                outside_share: p.outside_share,
+                modified_count: p.modified_count,
+                added_count: p.added_count,
+                local_only_count: p.local_only_count,
+                outside_share_count: p.outside_share_count,
+                unchanged: p.unchanged,
+                bytes_to_write: p.bytes_to_write,
+                comparable: p.comparable,
+            }),
+            None,
+        ),
+        // Not being able to look at what changes is no reason to block a
+        // restore.
+        Err(e) => (None, Some(format!("{e:#}"))),
+    };
 
     if dry_run {
         let out = RestoreOut {
@@ -231,6 +247,19 @@ pub async fn apply(
         bar.set_position(downloaded);
     };
 
+    // Kept before anything is written. Only with `--force`: without it a folder
+    // with files in it is refused, so there is nothing to overwrite.
+    let set_aside = if force {
+        let root = CliConfig::state_dir()?.join("conflicts");
+        hoard_agent::restore::keep_outside_share(
+            &client, &save_id, version, &dest, &gate, outside, &root,
+        )
+        .await
+        .context("couldn't copy the files outside the shared world aside; nothing was restored")?
+    } else {
+        None
+    };
+
     let options = RestoreOptions {
         skip_verify: no_verify,
         force,
@@ -276,6 +305,7 @@ pub async fn apply(
             files_reused: outcome.files_reused as u64,
             bytes_reused: outcome.bytes_reused,
             destination: outcome.destination.display().to_string(),
+            set_aside: set_aside.as_ref().map(|s| s.dir.display().to_string()),
         }),
         remembered,
     };
@@ -295,6 +325,12 @@ pub async fn apply(
                 fmt_bytes(r.bytes_reused)
             );
         }
+        if let (Some(dir), Some(kept)) = (&r.set_aside, &set_aside) {
+            println!(
+                "  {} file(s) outside the shared world were copied to {dir} first",
+                kept.files
+            );
+        }
         if let Some(applied) = &out.remembered {
             println!(
                 "  {} is now this save's folder here ({applied})",
@@ -309,9 +345,11 @@ fn clone_preview(p: &PreviewOut) -> PreviewOut {
         modified: p.modified.clone(),
         added: p.added.clone(),
         local_only: p.local_only.clone(),
+        outside_share: p.outside_share.clone(),
         modified_count: p.modified_count,
         added_count: p.added_count,
         local_only_count: p.local_only_count,
+        outside_share_count: p.outside_share_count,
         unchanged: p.unchanged,
         bytes_to_write: p.bytes_to_write,
         comparable: p.comparable,
@@ -348,6 +386,13 @@ fn print_preview(out: &RestoreOut, full: bool) {
         p.local_only_count,
         indicatif::HumanBytes(p.bytes_to_write),
     );
+    if p.outside_share_count > 0 {
+        println!(
+            "{} of the overwritten file(s) are outside the shared world: they are copied to \
+             the side-copy folder first",
+            p.outside_share_count
+        );
+    }
 
     if !full {
         return;
@@ -367,6 +412,11 @@ fn print_preview(out: &RestoreOut, full: bool) {
         }
     };
     listed("overwritten", &p.modified, p.modified_count);
+    listed(
+        "outside the shared world (copied aside first)",
+        &p.outside_share,
+        p.outside_share_count,
+    );
     listed("created", &p.added, p.added_count);
     listed(
         "only on disk (kept, but newer than this version)",

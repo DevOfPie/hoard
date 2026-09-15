@@ -1,0 +1,20 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT refcount FROM group_blobs WHERE group_id = ? AND sha256 = ?",
+  "describe": {
+    "columns": [
+      {
+        "name": "refcount",
+        "ordinal": 0,
+        "type_info": "Integer"
+      }
+    ],
+    "parameters": {
+      "Right": 2
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "1c0231b2815f3c3564bdf4072a0c54370eb1bc6ef389187eff756cbf072b728b"
+}

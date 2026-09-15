@@ -86,7 +86,11 @@ export type FeedEntry = {
     // in `reason_key` (an i18n key). Lets the user see WHY the candado
     // changed without opening a log file.
     | "gate_locked"
-    | "gate_unlocked";
+    | "gate_unlocked"
+    // This machine took a role on a shared world (`role`, and `auto` when the
+    // engine decided by itself), or gave the hosting lease back.
+    | "world_claimed"
+    | "world_released";
   /** Optional save_id / game_slug for renderers that want a hint. */
   save_id?: string;
   game_slug?: string;
@@ -109,6 +113,10 @@ export type FeedEntry = {
   failures?: number;
   /** i18n key for the cause of a `gate_locked`/`gate_unlocked` row. */
   reason_key?: string;
+  /** The role taken, for the `world_claimed` row. */
+  role?: "host" | "view";
+  /** The engine chose (the unanswered prompt, or a write), not the user. */
+  auto?: boolean;
 };
 
 const MAX_FEED_ENTRIES = 80;
@@ -312,6 +320,16 @@ function feedRowFor(p: AgentEvent): Omit<FeedEntry, "id" | "at"> | null {
         failures: p.conflicts,
         error: p.error,
       };
+    case "world_claimed":
+      return {
+        kind: "world_claimed",
+        save_id: p.save_id,
+        game_slug: p.game_slug,
+        role: p.role,
+        auto: p.auto,
+      };
+    case "world_released":
+      return { kind: "world_released", save_id: p.save_id, game_slug: p.game_slug };
     case "backup_attention_cleared":
       return {
         kind: "backup_unblocked",
@@ -695,6 +713,16 @@ export async function subscribeLive() {
       });
     }),
   );
+
+  // The shared-world rows: who this machine plays as, and when it let go.
+  for (const topic of ["agent://world-claimed", "agent://world-released"]) {
+    unlisteners.push(
+      await listen<AgentEvent>(topic, (e) => {
+        const row = feedRowFor(e.payload);
+        if (row) pushEntry(row);
+      }),
+    );
+  }
 }
 
 /** Last account-wide storage pressure we pushed a feed row for, so a 30s

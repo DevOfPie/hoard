@@ -85,6 +85,26 @@ pub enum ApiError {
     /// the callers keep their message-text fallback for exactly that.
     #[error("{}", .0.human())]
     NonFastForward(NonFastForward),
+    /// HTTP 409 with `code:"held"`: another member holds the lease this acquire
+    /// asked for. The body carries their lease, so the caller can name them.
+    #[error("{}", .0.human())]
+    LeaseHeld(LeaseConflict),
+    /// HTTP 409 with `code:"stale"`: the save's head moved past the
+    /// `base_version` the acquire declared. Pull first, then host.
+    #[error("{}", .0.human())]
+    LeaseStale(LeaseStale),
+    /// HTTP 409 with `code:"lease_required"`: a push on a shared save without
+    /// its lease. The body carries the holder's lease when there is one.
+    #[error("{}", .0.human())]
+    LeaseRequired(LeaseConflict),
+    /// HTTP 409 with `code:"not_shared"`: a lease or share verb on a save that
+    /// lives in nobody's group.
+    #[error("the save is not shared")]
+    NotShared,
+    /// HTTP 409 with `code:"pushed"`: a takeover refused because the holder
+    /// has pushed under the lease. Only an idle lease can be forced.
+    #[error("conflict (409): {0}")]
+    LeasePushed(String),
     #[error("conflict (409): {0}")]
     Conflict(String),
     #[error("bad request (400): {0}")]
@@ -225,6 +245,63 @@ impl NonFastForward {
         let mut s = String::from(
             "non-fast-forward: another device advanced this save since your base version",
         );
+        if self.head_version > 0 {
+            s.push_str(&format!(
+                " (head {}, base {})",
+                self.head_version, self.base_version
+            ));
+        }
+        s
+    }
+}
+
+/// Structured body of a `held` or `lease_required` 409. Same defaulting
+/// discipline as [`NonFastForward`]: `lease` is absent when nobody holds it
+/// (`lease_required` on a free save) or when the body could not be parsed.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct LeaseConflict {
+    #[serde(default)]
+    pub code: String,
+    #[serde(default)]
+    pub error: String,
+    /// Boxed so the error type stays small on every other path.
+    #[serde(default)]
+    pub lease: Option<Box<hoard_core::wire::Lease>>,
+}
+
+impl LeaseConflict {
+    /// The holder's username, when the server named one.
+    pub fn holder(&self) -> Option<&str> {
+        self.lease.as_deref().map(|l| l.holder_username.as_str())
+    }
+
+    pub fn human(&self) -> String {
+        match self.holder() {
+            Some(h) => format!("the world is hosted by {h}"),
+            None if self.error.is_empty() => "the world needs a hosting lease".to_string(),
+            None => self.error.clone(),
+        }
+    }
+}
+
+/// Structured body of a `stale` 409. `head_version` is `0` when the body did
+/// not say.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct LeaseStale {
+    #[serde(default)]
+    pub head_version: i64,
+    #[serde(default)]
+    pub base_version: i64,
+}
+
+impl LeaseStale {
+    /// The head to pull before hosting, when the server named one.
+    pub fn head(&self) -> Option<i64> {
+        (self.head_version > 0).then_some(self.head_version)
+    }
+
+    pub fn human(&self) -> String {
+        let mut s = String::from("the world moved past your version: pull before hosting");
         if self.head_version > 0 {
             s.push_str(&format!(
                 " (head {}, base {})",
@@ -426,12 +503,7 @@ impl ApiError {
             // Only the tagged one is typed. Every other 409 on these clients is
             // a duplicate label on rename, which has nothing to reconcile and
             // whose callers match on `Conflict`.
-            StatusCode::CONFLICT if extract_code(&body).as_deref() == Some("non_fast_forward") => {
-                ApiError::NonFastForward(
-                    serde_json::from_str::<NonFastForward>(&body).unwrap_or_default(),
-                )
-            }
-            StatusCode::CONFLICT => ApiError::Conflict(extract_message(&body)),
+            StatusCode::CONFLICT => conflict_from(&body),
             StatusCode::BAD_REQUEST => ApiError::BadRequest(extract_message(&body)),
             StatusCode::TOO_MANY_REQUESTS => {
                 let (kind, retry_after_seconds) = classify_rate_limit(&body, retry_after_header);
@@ -447,6 +519,48 @@ impl ApiError {
             },
         }
     }
+}
+
+/// The 409s with a stable `code` are typed; the rest carry their message. The
+/// lease codes that only ever mean "no" (`not_holder`, `not_held`,
+/// `already_shared`, `lease_held`) stay in [`ApiError::Conflict`]: none of
+/// their bodies has anything a caller recovers from. `pushed` is typed only so
+/// its code reaches whoever asked for the takeover.
+fn conflict_from(body: &str) -> ApiError {
+    match extract_code(body).as_deref() {
+        Some("non_fast_forward") => ApiError::NonFastForward(
+            serde_json::from_str::<NonFastForward>(body).unwrap_or_default(),
+        ),
+        Some("held") => {
+            ApiError::LeaseHeld(serde_json::from_str::<LeaseConflict>(body).unwrap_or_default())
+        }
+        Some("lease_required") => {
+            ApiError::LeaseRequired(serde_json::from_str::<LeaseConflict>(body).unwrap_or_default())
+        }
+        Some("stale") => {
+            ApiError::LeaseStale(serde_json::from_str::<LeaseStale>(body).unwrap_or_default())
+        }
+        Some("not_shared") => ApiError::NotShared,
+        Some("pushed") => ApiError::LeasePushed(extract_message(body)),
+        _ => ApiError::Conflict(extract_message(body)),
+    }
+}
+
+/// The server's text for a manifest file outside a shared save's include list
+/// (`code: "outside_include"`, a 400).
+const OUTSIDE_INCLUDE_TEXT: &str = "is not part of what this shared save consists of";
+
+/// Was this a 400 refusing a file outside a shared save's include list? The
+/// `code` does not survive into [`ApiError::BadRequest`], so the message those
+/// servers write is matched instead. What needs it is the owner's fallback for a
+/// server older than the owner's exception (HRD-D-0019), whose text is fixed.
+pub fn refused_outside_include(err: &anyhow::Error) -> bool {
+    err.chain().any(|c| {
+        matches!(
+            c.downcast_ref::<ApiError>(),
+            Some(ApiError::BadRequest(m)) if m.contains(OUTSIDE_INCLUDE_TEXT)
+        )
+    })
 }
 
 fn extract_message(body: &str) -> String {
@@ -619,6 +733,10 @@ pub struct ApiClient {
     /// `/v1/presence/heartbeat`)? Filled in by the same probe, for the same
     /// reason.
     devices: Arc<OnceCell<bool>>,
+    /// Does this server have groups, shared saves and hosting leases
+    /// (`/v1/groups`, `/v1/saves/{id}/share`, `/v1/saves/{id}/lease`)? Same
+    /// probe. Cloud has none and does not advertise it.
+    groups: Arc<OnceCell<bool>>,
     /// Does this server accept blob bodies compressed with zstd, and record the
     /// encoding when it does?
     ///
@@ -707,6 +825,7 @@ impl ApiClient {
             mode: Arc::new(OnceCell::new()),
             cas: Arc::new(OnceCell::new()),
             devices: Arc::new(OnceCell::new()),
+            groups: Arc::new(OnceCell::new()),
             blob_zstd: Arc::new(OnceCell::new()),
             plan_cap: Arc::new(RwLock::new(None)),
         })
@@ -782,6 +901,7 @@ impl ApiClient {
                 // capabilities always describe the same server.
                 let _ = self.cas.set(h.cas);
                 let _ = self.devices.set(h.devices);
+                let _ = self.groups.set(h.groups);
                 let _ = self.blob_zstd.set(h.blob_zstd);
                 Ok::<_, anyhow::Error>(h.mode)
             })
@@ -808,6 +928,19 @@ impl ApiClient {
     /// [`Self::probed_is_cloud`], which is what [`Self::has_presence`] does.
     pub fn probed_supports_devices(&self) -> Option<bool> {
         self.devices.get().copied()
+    }
+
+    /// Does this server have groups and hosting leases? `None` until a probe
+    /// has succeeded.
+    pub fn probed_supports_groups(&self) -> Option<bool> {
+        self.groups.get().copied()
+    }
+
+    /// Is it worth talking groups and leases to this server? Self-hosted with
+    /// the flag only: Cloud has none. It probes when it has to.
+    pub async fn has_groups(&self) -> bool {
+        let _ = self.server_mode().await;
+        self.probed_supports_groups() == Some(true)
     }
 
     /// May this client compress blobs before uploading them?
@@ -1360,6 +1493,228 @@ impl ApiClient {
             .await?;
         let resp = Self::ok_or_err(resp).await?;
         Ok(resp.json().await?)
+    }
+
+    // ---- Groups, shared saves and hosting leases (self-hosted) -----------
+
+    /// `GET /v1/groups`: the groups this account belongs to, members included.
+    pub async fn list_groups(&self) -> Result<Vec<hoard_core::wire::Group>> {
+        let resp = self
+            .http
+            .get(self.url("/v1/groups"))
+            .header("authorization", self.auth_header())
+            .send()
+            .await?;
+        let resp = Self::ok_or_err(resp).await?;
+        Ok(resp.json().await?)
+    }
+
+    /// `POST /v1/groups`.
+    pub async fn create_group(&self, name: &str) -> Result<hoard_core::wire::Group> {
+        let body = hoard_core::wire::CreateGroupRequest {
+            name: name.to_string(),
+        };
+        let resp = self
+            .http
+            .post(self.url("/v1/groups"))
+            .header("authorization", self.auth_header())
+            .json(&body)
+            .send()
+            .await?;
+        let resp = Self::ok_or_err(resp).await?;
+        Ok(resp.json().await?)
+    }
+
+    /// `POST /v1/groups/{id}/invites`. `None` takes the server's default expiry.
+    pub async fn create_invite(
+        &self,
+        group_id: &str,
+        expires_in_secs: Option<u64>,
+    ) -> Result<hoard_core::wire::InviteOut> {
+        let body = hoard_core::wire::CreateInviteRequest { expires_in_secs };
+        let resp = self
+            .http
+            .post(self.url(&format!("/v1/groups/{group_id}/invites")))
+            .header("authorization", self.auth_header())
+            .json(&body)
+            .send()
+            .await?;
+        let resp = Self::ok_or_err(resp).await?;
+        Ok(resp.json().await?)
+    }
+
+    /// `POST /v1/groups/join`: redeem an invite token.
+    pub async fn join_group(&self, token: &str) -> Result<hoard_core::wire::Group> {
+        let body = hoard_core::wire::JoinGroupRequest {
+            token: token.to_string(),
+        };
+        let resp = self
+            .http
+            .post(self.url("/v1/groups/join"))
+            .header("authorization", self.auth_header())
+            .json(&body)
+            .send()
+            .await?;
+        let resp = Self::ok_or_err(resp).await?;
+        Ok(resp.json().await?)
+    }
+
+    /// `DELETE /v1/groups/{id}/members/{user}`: leave a group. The caller's own
+    /// id goes in the path; the owner cannot leave (409).
+    pub async fn leave_group(&self, group_id: &str, my_user_id: &str) -> Result<()> {
+        let resp = self
+            .http
+            .delete(self.url(&format!("/v1/groups/{group_id}/members/{my_user_id}")))
+            .header("authorization", self.auth_header())
+            .send()
+            .await?;
+        Self::ok_or_err(resp).await?;
+        Ok(())
+    }
+
+    /// `DELETE /v1/groups/{id}`: the owner dissolves the group. Its shares
+    /// go back to their owners on the server.
+    pub async fn delete_group(&self, group_id: &str) -> Result<()> {
+        let resp = self
+            .http
+            .delete(self.url(&format!("/v1/groups/{group_id}")))
+            .header("authorization", self.auth_header())
+            .send()
+            .await?;
+        Self::ok_or_err(resp).await?;
+        Ok(())
+    }
+
+    /// `POST /v1/saves/{id}/share`: move the save into a group's namespace.
+    /// `include` names what the save consists of (empty for everything) and
+    /// comes back to every member on their listing.
+    pub async fn share_save(
+        &self,
+        save_id: &str,
+        group_id: &str,
+        include: &[String],
+    ) -> Result<Save> {
+        let body = hoard_core::wire::ShareSaveRequest {
+            group_id: group_id.to_string(),
+            include: include.to_vec(),
+        };
+        let resp = self
+            .http
+            .post(self.url(&format!("/v1/saves/{save_id}/share")))
+            .header("authorization", self.auth_header())
+            .json(&body)
+            .send()
+            .await?;
+        let resp = Self::ok_or_err(resp).await?;
+        Ok(resp.json().await?)
+    }
+
+    /// `DELETE /v1/saves/{id}/share`: move the save back to its owner.
+    pub async fn unshare_save(&self, save_id: &str) -> Result<()> {
+        let resp = self
+            .http
+            .delete(self.url(&format!("/v1/saves/{save_id}/share")))
+            .header("authorization", self.auth_header())
+            .send()
+            .await?;
+        Self::ok_or_err(resp).await?;
+        Ok(())
+    }
+
+    /// `GET /v1/saves/{id}/lease`: who is hosting, `None` when nobody.
+    pub async fn get_lease(&self, save_id: &str) -> Result<Option<hoard_core::wire::Lease>> {
+        let resp = self
+            .http
+            .get(self.url(&format!("/v1/saves/{save_id}/lease")))
+            .header("authorization", self.auth_header())
+            .send()
+            .await?;
+        let resp = Self::ok_or_err(resp).await?;
+        let out: hoard_core::wire::LeaseOut = resp.json().await?;
+        Ok(out.lease)
+    }
+
+    /// `POST /v1/saves/{id}/lease/acquire`. `base_version` is the head this
+    /// machine has; `409 stale` when the save moved past it, `409 held` when
+    /// another member holds it. The device fingerprint goes along because the
+    /// server records which machine hosts.
+    pub async fn acquire_lease(
+        &self,
+        save_id: &str,
+        base_version: i64,
+    ) -> Result<hoard_core::wire::Lease> {
+        let body = hoard_core::wire::LeaseAcquireRequest { base_version };
+        let resp = self
+            .lease_request(&format!("/v1/saves/{save_id}/lease/acquire"))
+            .json(&body)
+            .send()
+            .await?;
+        let resp = Self::ok_or_err(resp).await?;
+        Ok(resp.json().await?)
+    }
+
+    /// `POST /v1/saves/{id}/lease/renew`: the heartbeat. `409 not_holder` once
+    /// the lease is gone.
+    pub async fn renew_lease(&self, save_id: &str) -> Result<hoard_core::wire::Lease> {
+        let resp = self
+            .lease_request(&format!("/v1/saves/{save_id}/lease/renew"))
+            .send()
+            .await?;
+        let resp = Self::ok_or_err(resp).await?;
+        Ok(resp.json().await?)
+    }
+
+    /// `POST /v1/saves/{id}/lease/release`.
+    pub async fn release_lease(&self, save_id: &str) -> Result<()> {
+        let resp = self
+            .lease_request(&format!("/v1/saves/{save_id}/lease/release"))
+            .send()
+            .await?;
+        Self::ok_or_err(resp).await?;
+        Ok(())
+    }
+
+    /// `POST /v1/saves/{id}/lease/force`: take the lease off its holder. Only
+    /// while they have pushed nothing under it (`409 pushed` otherwise); the
+    /// caller acquires afterwards.
+    pub async fn force_lease(&self, save_id: &str) -> Result<()> {
+        let resp = self
+            .lease_request(&format!("/v1/saves/{save_id}/lease/force"))
+            .send()
+            .await?;
+        Self::ok_or_err(resp).await?;
+        Ok(())
+    }
+
+    /// A lease POST with the same device headers as the presence beat: the
+    /// server keys the holder's machine by `x-hoard-device-fp`.
+    fn lease_request(&self, path: &str) -> reqwest::RequestBuilder {
+        let dev = crate::logship::device_identity();
+        let mut req = self
+            .http
+            .post(self.url(path))
+            .header("authorization", self.auth_header())
+            .header("x-hoard-device-fp", &dev.fingerprint)
+            .header("x-hoard-device-os", &dev.os)
+            .header("x-hoard-app-version", env!("CARGO_PKG_VERSION"));
+        if let Some(name) = dev.name.as_deref() {
+            req = req.header("x-hoard-device-name", name);
+        }
+        req
+    }
+
+    /// `GET /v1/events`: the self-hosted server's event stream, opened on the
+    /// streaming client so the 60 s request timeout does not cut it. The
+    /// caller reads SSE frames off the body.
+    pub async fn events_stream(&self) -> Result<reqwest::Response> {
+        let resp = self
+            .download_http
+            .get(self.url("/v1/events"))
+            .header("authorization", self.auth_header())
+            .header("accept", "text/event-stream")
+            .send()
+            .await?;
+        Ok(Self::ok_or_err(resp).await?)
     }
 
     pub async fn list_saves(&self, game: Option<&str>) -> Result<Vec<Save>> {
@@ -2262,5 +2617,84 @@ mod non_fast_forward_tests {
         assert_eq!(d.head(), None);
         assert_eq!(d.canonical_id_for("mine"), None);
         assert!(!d.human().contains("head"));
+    }
+}
+
+/// The lease 409s carry who holds it and which head to pull; the ones that only
+/// mean "no" stay untyped.
+#[cfg(test)]
+mod lease_conflict_tests {
+    use super::*;
+
+    const LEASE: &str = r#"{"save_id":"w1","holder_user_id":"u2","holder_username":"bob","acquired_at":"2026-09-13T10:00:00Z","renewed_at":"2026-09-13T10:00:30Z","base_version":4,"pushed_since":false,"live":true}"#;
+
+    #[test]
+    fn a_held_409_names_the_holder() {
+        let body = format!(
+            r#"{{"error":"another member is hosting this save","code":"held","lease":{LEASE}}}"#
+        );
+        match conflict_from(&body) {
+            ApiError::LeaseHeld(c) => {
+                assert_eq!(c.holder(), Some("bob"));
+                assert!(c.human().contains("bob"));
+            }
+            other => panic!("expected LeaseHeld, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_lease_required_409_may_carry_no_holder() {
+        let body = r#"{"error":"a shared save is pushed by its host: acquire the lease first","code":"lease_required"}"#;
+        match conflict_from(body) {
+            ApiError::LeaseRequired(c) => {
+                assert_eq!(c.holder(), None);
+                assert!(c.human().contains("acquire the lease"));
+            }
+            other => panic!("expected LeaseRequired, got {other:?}"),
+        }
+        let body = format!(
+            r#"{{"error":"another member is hosting this save","code":"lease_required","lease":{LEASE}}}"#
+        );
+        assert!(matches!(
+            conflict_from(&body),
+            ApiError::LeaseRequired(c) if c.holder() == Some("bob")
+        ));
+    }
+
+    #[test]
+    fn a_stale_409_says_which_head_to_pull() {
+        let body = r#"{"error":"the save moved past your version: pull before hosting","code":"stale","head_version":9,"base_version":7}"#;
+        match conflict_from(body) {
+            ApiError::LeaseStale(st) => {
+                assert_eq!(st.head(), Some(9));
+                assert!(st.human().contains("head 9, base 7"));
+            }
+            other => panic!("expected LeaseStale, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn not_shared_is_typed_and_the_rest_keep_their_message() {
+        assert!(matches!(
+            conflict_from(r#"{"error":"the save is not shared","code":"not_shared"}"#),
+            ApiError::NotShared
+        ));
+        // Changed on purpose: `pushed` used to stay in this list.
+        match conflict_from(r#"{"error":"no (pushed)","code":"pushed"}"#) {
+            ApiError::LeasePushed(msg) => assert_eq!(msg, "no (pushed)"),
+            other => panic!("pushed: expected LeasePushed, got {other:?}"),
+        }
+        for code in ["not_holder", "not_held", "already_shared", "lease_held"] {
+            let body = format!(r#"{{"error":"no ({code})","code":"{code}"}}"#);
+            match conflict_from(&body) {
+                ApiError::Conflict(msg) => assert_eq!(msg, format!("no ({code})")),
+                other => panic!("{code}: expected Conflict, got {other:?}"),
+            }
+        }
+        // The untagged 409 (a duplicate label on rename) is unchanged.
+        assert!(matches!(
+            conflict_from(r#"{"error":"label taken"}"#),
+            ApiError::Conflict(m) if m == "label taken"
+        ));
     }
 }

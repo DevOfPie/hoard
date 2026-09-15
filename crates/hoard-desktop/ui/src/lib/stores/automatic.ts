@@ -25,6 +25,7 @@ import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { get } from "svelte/store";
 import { _ } from "svelte-i18n";
 import { toastInfo, toastSuccess } from "./toasts";
+import { noteSideCopy } from "./groups";
 
 export type AutomaticPhase =
   | { kind: "idle" }
@@ -101,7 +102,10 @@ export function initAutomaticListener(): void {
     listen<SaveConflictsBackedUp>(
       "agent://save-conflicts-backed-up",
       (event) => {
-        const { count, conflict_dir } = event.payload;
+        const { count, conflict_dir, save_id } = event.payload;
+        // A session's writes under somebody else's lease end here too: the
+        // hold's bell item gets the button that opens the folder.
+        noteSideCopy(save_id, conflict_dir);
         // No warning level in the toast store, so this surfaces as info.
         // The retention slider in Settings explains the lifetime; the
         // toast body cites the absolute path so the user can paste it

@@ -17,8 +17,11 @@ use tracing::{info, warn};
 use uuid::Uuid;
 
 use crate::auth::AuthUser;
+use crate::namespace::{self, Namespace};
+use crate::routes::access::{read_include, save_access, Role};
 use crate::routes::health::ServerState;
 use crate::routes::repair_ts;
+use hoard_core::kernel::fileclass::included;
 
 // ─── Response types ─────────────────────────────────────────────────────────
 //
@@ -47,6 +50,19 @@ pub(crate) fn err(status: StatusCode, msg: &str) -> (StatusCode, Json<serde_json
 
 pub(crate) fn internal() -> (StatusCode, Json<serde_json::Value>) {
     err(StatusCode::INTERNAL_SERVER_ERROR, "internal server error")
+}
+
+/// 409 for a push that found its save shared or unshared since it began: the
+/// bytes were placed under the old namespace's keys. The client retries from
+/// `init`, which reads the new one.
+pub(crate) fn namespace_changed() -> (StatusCode, Json<serde_json::Value>) {
+    (
+        StatusCode::CONFLICT,
+        Json(serde_json::json!({
+            "error": "the save was shared or unshared during this push: retry",
+            "code": "namespace_changed",
+        })),
+    )
 }
 
 /// A 500 that says, **in the log**, what actually went wrong.
@@ -140,39 +156,27 @@ fn too_large_body(
     (StatusCode::PAYLOAD_TOO_LARGE, Json(body))
 }
 
-/// Is this whole-file blob already stored for the user? The `blobs` table is
+/// Is this whole-file blob already stored in the namespace? The blob table is
 /// the source of truth (a row exists iff the object is stored and refcounted),
 /// so dedup and quota consult it instead of a per-key HEAD against the store,
 /// which on the S3 backend would be one network round-trip per file.
 pub(crate) async fn blob_in_db(
     pool: &sqlx::SqlitePool,
-    user_id: &str,
+    ns: &Namespace,
     sha: &str,
 ) -> Result<bool, sqlx::Error> {
-    Ok(
-        sqlx::query_scalar::<_, i64>("SELECT 1 FROM blobs WHERE user_id=? AND sha256=? LIMIT 1")
-            .bind(user_id)
-            .bind(sha)
-            .fetch_optional(pool)
-            .await?
-            .is_some(),
-    )
+    namespace::blob_size(pool, ns, sha)
+        .await
+        .map(|s| s.is_some())
 }
 
 /// Chunk-store analogue of [`blob_in_db`] (ADR 0019 chunk table).
 pub(crate) async fn chunk_in_db(
     pool: &sqlx::SqlitePool,
-    user_id: &str,
+    ns: &Namespace,
     sha: &str,
 ) -> Result<bool, sqlx::Error> {
-    Ok(
-        sqlx::query_scalar::<_, i64>("SELECT 1 FROM chunks WHERE user_id=? AND sha256=? LIMIT 1")
-            .bind(user_id)
-            .bind(sha)
-            .fetch_optional(pool)
-            .await?
-            .is_some(),
-    )
+    namespace::chunk_exists(pool, ns, sha).await
 }
 
 /// Validate that a relative path stays inside its parent directory.
@@ -191,19 +195,18 @@ pub(crate) fn is_safe_relative_path(p: &str) -> bool {
     true
 }
 
+/// `(game_slug, label)` when the caller owns the save, `None` otherwise. Soft
+/// delete and restore gate on this; reads and pushes take [`save_access`] and
+/// let a group member through.
 pub(crate) async fn ownership_check(
     pool: &sqlx::SqlitePool,
     save_id: &str,
     user_id: &str,
 ) -> Result<Option<(String, String)>, sqlx::Error> {
-    let row = sqlx::query!(
-        "SELECT game_slug, label FROM saves WHERE id=? AND user_id=?",
-        save_id,
-        user_id
-    )
-    .fetch_optional(pool)
-    .await?;
-    Ok(row.map(|r| (r.game_slug, r.label)))
+    Ok(save_access(pool, save_id, user_id)
+        .await?
+        .filter(|a| a.role == Role::Owner)
+        .map(|a| (a.game_slug, a.label)))
 }
 
 // ─── POST /v1/saves/:save_id/snapshots ──────────────────────────────────────
@@ -216,15 +219,30 @@ pub async fn create(
 ) -> Result<(StatusCode, Json<Snapshot>), (StatusCode, Json<serde_json::Value>)> {
     let user_id = user.user_id.to_string();
 
-    let (game_slug, label) = ownership_check(&state.pool, &save_id, &user_id)
+    let access = save_access(&state.pool, &save_id, &user_id)
         .await
-        .map_err(|e| internal_logged("ownership lookup", e))?
+        .map_err(|e| internal_logged("access lookup", e))?
         .ok_or_else(|| err(StatusCode::NOT_FOUND, "save not found"))?;
+    let (game_slug, label) = (access.game_slug.clone(), access.label.clone());
+    // A shared save's bytes live in its group and the group's owner pays,
+    // whoever pushes.
+    let ns = Namespace::of(&access.owner_user_id, access.group_id.as_deref());
+    // What a member may push, checked per file as it arrives so a client whose
+    // row lost the list is refused before its folder is uploaded. Empty for
+    // the owner, whose uploads carry the whole folder (HRD-D-0019). The gate
+    // inside the transaction rules again on the whole manifest.
+    let include = read_include(&state.pool, &save_id, &access)
+        .await
+        .map_err(|e| internal_logged("include lookup", e))?;
+    let billing = ns
+        .billing_user(&state.pool)
+        .await
+        .map_err(|e| internal_logged("billing lookup", e))?;
 
     // Quota check setup
     let (quota, used): (i64, i64) = sqlx::query!(
         "SELECT storage_quota_bytes, storage_used_bytes FROM users WHERE id=?",
-        user_id
+        billing
     )
     .fetch_one(&state.pool)
     .await
@@ -261,6 +279,9 @@ pub async fn create(
     // for this save). When present and it no longer matches the server's head,
     // another device advanced the save → non-fast-forward, rejected below.
     let mut base_version: Option<i64> = None;
+    // The version the folder's shared world came from, when the client names
+    // one apart from the base (`share::push_gate`).
+    let mut world_base_version: Option<i64> = None;
     let mut files: Vec<(String, i64, String)> = Vec::new(); // (rel_path, size, sha256)
     let mut total_size: i64 = 0;
 
@@ -286,6 +307,14 @@ pub async fn create(
         }
         if name == "base_version" {
             base_version = field
+                .text()
+                .await
+                .ok()
+                .and_then(|s| s.trim().parse::<i64>().ok());
+            continue;
+        }
+        if name == "world_base_version" {
+            world_base_version = field
                 .text()
                 .await
                 .ok()
@@ -334,6 +363,10 @@ pub async fn create(
                 if !is_safe_relative_path(&rel) {
                     cleanup_tmp();
                     return Err(err(StatusCode::BAD_REQUEST, "unsafe file path"));
+                }
+                if crate::routes::share::first_outside_include(&include, [rel.as_str()]).is_some() {
+                    cleanup_tmp();
+                    return Err(crate::routes::cas::outside_include(&rel));
                 }
                 if files.len() >= max_files {
                     cleanup_tmp();
@@ -401,6 +434,10 @@ pub async fn create(
         if !is_safe_relative_path(&file_name) {
             cleanup_tmp();
             return Err(err(StatusCode::BAD_REQUEST, "unsafe file path"));
+        }
+        if crate::routes::share::first_outside_include(&include, [file_name.as_str()]).is_some() {
+            cleanup_tmp();
+            return Err(crate::routes::cas::outside_include(&file_name));
         }
 
         if files.len() >= max_files {
@@ -509,7 +546,7 @@ pub async fn create(
         if let Some(plan) = chunk_plans.get(&i) {
             for c in plan {
                 if seen_chunks.insert(c.sha256.clone())
-                    && !chunk_in_db(&state.pool, &user_id, &c.sha256)
+                    && !chunk_in_db(&state.pool, &ns, &c.sha256)
                         .await
                         .map_err(|e| {
                             cleanup_tmp();
@@ -521,7 +558,7 @@ pub async fn create(
                 }
             }
         } else if seen_blobs.insert(sha.clone())
-            && !blob_in_db(&state.pool, &user_id, sha).await.map_err(|e| {
+            && !blob_in_db(&state.pool, &ns, sha).await.map_err(|e| {
                 cleanup_tmp();
                 internal_logged("blob dedup lookup", e)
             })?
@@ -566,13 +603,13 @@ pub async fn create(
     let rollback_blobs = {
         let store = store.clone();
         let pool = state.pool.clone();
-        let user_id = user_id.clone();
+        let ns = ns.clone();
         move |placed: &[Placed]| {
             let keys: Vec<(String, String, bool)> = placed
                 .iter()
                 .map(|p| (p.key.clone(), p.sha.clone(), p.chunk))
                 .collect();
-            let (store, pool, user_id) = (store.clone(), pool.clone(), user_id.clone());
+            let (store, pool, ns) = (store.clone(), pool.clone(), ns.clone());
             tokio::spawn(async move {
                 for (key, sha, is_chunk) in keys {
                     // Only drop bytes nothing references. Between our placement
@@ -582,9 +619,9 @@ pub async fn create(
                     // assume referenced: an orphan costs space, a wrong delete
                     // costs data.
                     let referenced = if is_chunk {
-                        chunk_in_db(&pool, &user_id, &sha).await.unwrap_or(true)
+                        chunk_in_db(&pool, &ns, &sha).await.unwrap_or(true)
                     } else {
-                        blob_in_db(&pool, &user_id, &sha).await.unwrap_or(true)
+                        blob_in_db(&pool, &ns, &sha).await.unwrap_or(true)
                     };
                     if !referenced {
                         let _ = store.delete(&key).await;
@@ -604,7 +641,7 @@ pub async fn create(
                 // We can't rename a byte range, so extract the chunk to a
                 // staging file under tmp/ first, then hand it to the backend
                 // (same-filesystem rename for local, upload for S3).
-                let key = crate::store::chunk_key(&user_id, &c.sha256);
+                let key = ns.chunk_key(&c.sha256);
                 let stage = tmp_root.join("_stage").join(&c.sha256);
                 if crate::chunking::place_chunk(&src, c.offset, c.len, &stage)
                     .await
@@ -629,7 +666,7 @@ pub async fn create(
         if !new_blobs.contains(sha) || !placed_blobs.insert(sha.clone()) {
             continue;
         }
-        let key = crate::store::blob_key(&user_id, sha);
+        let key = ns.blob_key(sha);
         let src = tmp_root.join(rel_path);
         if store.put_from_file(&key, &src).await.is_err() {
             warn!(sha = %sha, "blob placement failed");
@@ -645,11 +682,29 @@ pub async fn create(
     }
 
     let snapshot_id = Uuid::new_v4().to_string();
-    let mut tx = state.pool.begin().await.map_err(|e| {
+    let mut tx = state
+        .pool
+        .begin_with("BEGIN IMMEDIATE")
+        .await
+        .map_err(|e| {
+            rollback_blobs(&created_blobs);
+            cleanup_tmp();
+            internal_logged("opening the commit transaction", e)
+        })?;
+
+    // The namespace was read before the bytes were placed; a share or unshare
+    // since then means they sit under the wrong keys. Checked under the write
+    // lock, so nothing can move the save between here and the rows.
+    let now = Namespace::for_save(&mut *tx, &save_id).await.map_err(|e| {
         rollback_blobs(&created_blobs);
         cleanup_tmp();
-        internal_logged("opening the commit transaction", e)
+        internal_logged("namespace lookup", e)
     })?;
+    if now.as_ref() != Some(&ns) {
+        rollback_blobs(&created_blobs);
+        cleanup_tmp();
+        return Err(namespace_changed());
+    }
 
     let head: i64 = sqlx::query!("SELECT latest_version_num FROM saves WHERE id=?", save_id)
         .fetch_one(&mut *tx)
@@ -661,12 +716,47 @@ pub async fn create(
             internal_logged("reading the save's latest version", e)
         })?;
 
+    // A shared save's lease and include list (`share::push_gate`).
+    let manifest: Vec<(&str, &str)> = files
+        .iter()
+        .map(|(rel, _, sha)| (rel.as_str(), sha.as_str()))
+        .collect();
+    let gate = match crate::routes::share::push_gate(
+        &mut tx,
+        &ns,
+        &access,
+        &save_id,
+        &user_id,
+        head,
+        base_version,
+        world_base_version,
+        &manifest,
+    )
+    .await
+    {
+        Ok(g) => g,
+        Err(e) => {
+            rollback_blobs(&created_blobs);
+            cleanup_tmp();
+            return Err(e);
+        }
+    };
+
     // Fast-forward check (the DAG's enforcement). A client that declares a
     // base version which is no longer the head has diverged: another device
     // pushed since it last synced. Reject so the client can pull + merge
-    // (keep-both) instead of silently overwriting the other line.
+    // (keep-both) instead of silently overwriting the other line. A member
+    // whose listed files did not move in between is not diverged.
     if let Some(base) = base_version {
-        if base != head {
+        let accepted = match gate.base_accepted(&mut tx, &save_id, base, head).await {
+            Ok(a) => a,
+            Err(e) => {
+                rollback_blobs(&created_blobs);
+                cleanup_tmp();
+                return Err(e);
+            }
+        };
+        if !accepted {
             rollback_blobs(&created_blobs);
             cleanup_tmp();
             return Err((
@@ -689,7 +779,27 @@ pub async fn create(
     // descended from.
     let parent_version: Option<i64> = (head > 0).then_some(head);
 
-    let file_count = files.len() as i64;
+    // A member's push names the world only; the head's other files come
+    // forward so the version stays whole for the owner. An owner's push that
+    // only the world moved past takes the head's world instead of its own
+    // (HRD-D-0019).
+    let carried = gate.carried(&mut tx, &save_id, head).await.map_err(|e| {
+        rollback_blobs(&created_blobs);
+        cleanup_tmp();
+        internal_logged("reading the head's other files", e)
+    })?;
+    let replaced: Vec<usize> = files
+        .iter()
+        .enumerate()
+        .filter(|(_, (rel, ..))| gate.replaces(rel))
+        .map(|(i, _)| i)
+        .collect();
+    // What the caller pushed, which is what the response describes; the row
+    // holds the whole version.
+    let pushed_count = files.len() as i64;
+    let file_count = pushed_count - replaced.len() as i64 + carried.len() as i64;
+    let stored_size = total_size - replaced.iter().map(|i| files[*i].1).sum::<i64>()
+        + carried.iter().map(|r| r.size_bytes()).sum::<i64>();
     sqlx::query(
         "INSERT INTO snapshots (id, save_id, version_num, device_name, notes,
                                 total_size_bytes, file_count, parent_version)
@@ -700,7 +810,7 @@ pub async fn create(
     .bind(new_version)
     .bind(&device_name)
     .bind(&notes)
-    .bind(total_size)
+    .bind(stored_size)
     .bind(file_count)
     .bind(parent_version)
     .execute(&mut *tx)
@@ -715,6 +825,9 @@ pub async fn create(
     // store (see the placement pass above), so nothing below can block on the
     // network while holding SQLite's single write lock.
     for (i, (rel_path, size, sha)) in files.iter().enumerate() {
+        if replaced.contains(&i) {
+            continue;
+        }
         let file_id = Uuid::new_v4().to_string();
         if sqlx::query!(
             "INSERT INTO snapshot_files (id, snapshot_id, relative_path, size_bytes, sha256)
@@ -759,17 +872,9 @@ pub async fn create(
                     cleanup_tmp();
                     return Err(internal());
                 }
-                if sqlx::query(
-                    "INSERT INTO chunks (user_id, sha256, size_bytes, refcount)
-                     VALUES (?,?,?,1)
-                     ON CONFLICT(user_id, sha256) DO UPDATE SET refcount = refcount + 1",
-                )
-                .bind(&user_id)
-                .bind(&c.sha256)
-                .bind(csize)
-                .execute(&mut *tx)
-                .await
-                .is_err()
+                if namespace::chunk_incref(&mut tx, &ns, &c.sha256, csize, 1)
+                    .await
+                    .is_err()
                 {
                     rollback_blobs(&created_blobs);
                     cleanup_tmp();
@@ -781,23 +886,22 @@ pub async fn create(
         }
 
         // Reference-count the blob (insert at 1, or bump an existing one).
-        if sqlx::query(
-            "INSERT INTO blobs (user_id, sha256, size_bytes, refcount)
-             VALUES (?,?,?,1)
-             ON CONFLICT(user_id, sha256) DO UPDATE SET refcount = refcount + 1",
-        )
-        .bind(&user_id)
-        .bind(sha)
-        .bind(size)
-        .execute(&mut *tx)
-        .await
-        .is_err()
+        if namespace::blob_incref(&mut tx, &ns, sha, *size, 1)
+            .await
+            .is_err()
         {
             rollback_blobs(&created_blobs);
             cleanup_tmp();
             return Err(internal());
         }
     }
+    crate::routes::share::insert_carried(&mut tx, &ns, &snapshot_id, &carried)
+        .await
+        .map_err(|e| {
+            rollback_blobs(&created_blobs);
+            cleanup_tmp();
+            internal_logged("carrying the head's other files forward", e)
+        })?;
 
     sqlx::query!(
         "UPDATE saves SET latest_version_num=? WHERE id=?",
@@ -812,27 +916,31 @@ pub async fn create(
         internal_logged("reading the save's latest version", e)
     })?;
 
-    let new_used = used + newly_stored_bytes;
-    sqlx::query!(
-        "UPDATE users SET storage_used_bytes=? WHERE id=?",
-        new_used,
-        user_id
-    )
-    .execute(&mut *tx)
-    .await
-    .map_err(|e| {
-        rollback_blobs(&created_blobs);
-        cleanup_tmp();
-        internal_logged("updating storage accounting", e)
-    })?;
+    ns.charge(&mut tx, &billing, newly_stored_bytes)
+        .await
+        .map_err(|e| {
+            rollback_blobs(&created_blobs);
+            cleanup_tmp();
+            internal_logged("updating storage accounting", e)
+        })?;
+    if gate.hosted {
+        crate::routes::leases::mark_pushed(&mut *tx, &save_id, &user_id)
+            .await
+            .map_err(|e| {
+                rollback_blobs(&created_blobs);
+                cleanup_tmp();
+                internal_logged("marking the lease pushed", e)
+            })?;
+    }
 
     let audit_id = Uuid::new_v4().to_string();
     let metadata = serde_json::json!({
         "save_id": save_id,
         "version_num": new_version,
         "files": file_count,
-        "bytes": total_size,
+        "bytes": stored_size,
         "new_bytes": newly_stored_bytes,
+        "carried_files": carried.len(),
     })
     .to_string();
     sqlx::query!(
@@ -870,12 +978,12 @@ pub async fn create(
         "snapshot created"
     );
 
-    // Enforce the user's own "max versions per save" cap: trash the oldest
+    // Enforce the save owner's "max versions per save" cap: trash the oldest
     // non-pinned snapshots beyond it. Off the response path: a failed prune
     // must not fail an upload that already committed.
     {
         let pool = state.pool.clone();
-        let uid = user_id.clone();
+        let uid = access.owner_user_id.clone();
         let sid = save_id.clone();
         tokio::spawn(async move {
             if let Err(e) = prune_over_version_cap(&pool, &uid, Some(&sid)).await {
@@ -884,17 +992,28 @@ pub async fn create(
         });
     }
 
-    // Push the new version to any of this user's other devices listening on
-    // `/v1/events`, so they pull within ~1s instead of waiting for the agent's
-    // reconciliation sweep. No-op when nobody is connected (incl. cloud, which
-    // never has subscribers here).
-    state.events.publish(
-        user.user_id,
-        crate::routes::events::SaveEvent {
-            save_id: save_id.clone(),
-            version_num: new_version,
-        },
-    );
+    // Push the new version to the owner's other devices and, on a shared save,
+    // to every member listening on `/v1/events`, so they pull within ~1s
+    // instead of waiting for the agent's reconciliation sweep. No-op when
+    // nobody is connected (incl. cloud, which never has subscribers here).
+    if let Err(e) = state
+        .events
+        .publish_save(
+            &state.pool,
+            &save_id,
+            crate::routes::events::Frame::Save(crate::routes::events::SaveEvent {
+                save_id: save_id.clone(),
+                version_num: new_version,
+            }),
+        )
+        .await
+    {
+        warn!(error = %e, save_id = %save_id, "save event: recipients not resolved");
+    }
+    // Only a push that went through the lease is the host's news.
+    if gate.hosted {
+        crate::routes::leases::announce_push(&state, &save_id, &user_id).await;
+    }
 
     // What the history row will say. After the commit and never fatal.
     let insight = match crate::insight::record_selfhosted(&state.pool, &save_id, new_version).await
@@ -916,7 +1035,7 @@ pub async fn create(
             device_name,
             notes,
             total_size_bytes: total_size,
-            file_count,
+            file_count: pushed_count,
             is_pinned: false,
             deleted_at: None,
             created_at: time::OffsetDateTime::now_utc(),
@@ -935,13 +1054,13 @@ pub async fn list(
 ) -> Result<Json<Vec<Snapshot>>, (StatusCode, Json<serde_json::Value>)> {
     let user_id = user.user_id.to_string();
 
-    if ownership_check(&state.pool, &save_id, &user_id)
+    let access = save_access(&state.pool, &save_id, &user_id)
         .await
-        .map_err(|e| internal_logged("ownership lookup", e))?
-        .is_none()
-    {
-        return Err(err(StatusCode::NOT_FOUND, "save not found"));
-    }
+        .map_err(|e| internal_logged("access lookup", e))?
+        .ok_or_else(|| err(StatusCode::NOT_FOUND, "save not found"))?;
+    let include = read_include(&state.pool, &save_id, &access)
+        .await
+        .map_err(|e| internal_logged("include lookup", e))?;
 
     let limit = q.limit.clamp(1, 200);
     let offset = q.offset.max(0);
@@ -959,7 +1078,7 @@ pub async fn list(
          FROM snapshots WHERE save_id=? AND deleted_at IS NULL
          ORDER BY version_num DESC LIMIT ? OFFSET ?"
     };
-    let rows: Vec<Snapshot> = sqlx::query(sql)
+    let mut rows: Vec<Snapshot> = sqlx::query(sql)
         .bind(&save_id)
         .bind(limit)
         .bind(offset)
@@ -1007,7 +1126,55 @@ pub async fn list(
         });
     }
 
+    if !include.is_empty() && !rows.is_empty() {
+        // The whole page's manifests in one read, grouped by version here.
+        let sql = format!(
+            "SELECT snapshot_id, relative_path, size_bytes FROM snapshot_files
+             WHERE snapshot_id IN ({})",
+            vec!["?"; rows.len()].join(",")
+        );
+        let mut query = sqlx::query_as::<_, (String, String, i64)>(&sql);
+        for s in &rows {
+            query = query.bind(&s.id);
+        }
+        let mut files: std::collections::HashMap<String, Vec<(String, i64)>> =
+            std::collections::HashMap::new();
+        for (snapshot_id, path, bytes) in query
+            .fetch_all(&state.pool)
+            .await
+            .map_err(|e| internal_logged("listing snapshot rows", e))?
+        {
+            files.entry(snapshot_id).or_default().push((path, bytes));
+        }
+        for s in &mut rows {
+            let listed = files.get(&s.id).map(Vec::as_slice).unwrap_or_default();
+            restrict_to_include(s, &include, listed);
+        }
+    }
+
     Ok(Json(rows))
+}
+
+/// A version as a member of a share that names its files sees it: the count
+/// and size of those files only, and no insight, which is derived from the
+/// whole manifest and can name what the list leaves out. `files` is that
+/// version's manifest, `(path, bytes)`.
+fn restrict_to_include(snap: &mut Snapshot, include: &[String], files: &[(String, i64)]) {
+    let (count, size) = included_totals(include, files);
+    snap.file_count = count;
+    snap.total_size_bytes = size;
+    snap.insight = None;
+}
+
+/// How many of `files` (path, bytes) the include list names, and their bytes.
+/// The one place a member's totals are matched, for versions and for saves.
+pub(crate) fn included_totals(include: &[String], files: &[(String, i64)]) -> (i64, i64) {
+    files
+        .iter()
+        .filter(|(path, _)| included(include, path))
+        .fold((0i64, 0i64), |(n, total), (_, bytes)| {
+            (n + 1, total + bytes)
+        })
 }
 
 // ─── GET /v1/saves/:save_id/snapshots/:version ──────────────────────────────
@@ -1018,13 +1185,13 @@ pub async fn detail(
     Path((save_id, version)): Path<(String, i64)>,
 ) -> Result<Json<SnapshotDetail>, (StatusCode, Json<serde_json::Value>)> {
     let user_id = user.user_id.to_string();
-    if ownership_check(&state.pool, &save_id, &user_id)
+    let access = save_access(&state.pool, &save_id, &user_id)
         .await
-        .map_err(|e| internal_logged("ownership lookup", e))?
-        .is_none()
-    {
-        return Err(err(StatusCode::NOT_FOUND, "save not found"));
-    }
+        .map_err(|e| internal_logged("access lookup", e))?
+        .ok_or_else(|| err(StatusCode::NOT_FOUND, "save not found"))?;
+    let include = read_include(&state.pool, &save_id, &access)
+        .await
+        .map_err(|e| internal_logged("include lookup", e))?;
 
     let snap = sqlx::query(
         "SELECT id, version_num, parent_version, device_name, notes, total_size_bytes,
@@ -1048,6 +1215,7 @@ pub async fn detail(
     .await
     .map_err(|e| internal_logged("listing snapshot rows", e))?
     .into_iter()
+    .filter(|r| included(&include, &r.relative_path))
     .map(|r| {
         // The sha is computed by the server itself on upload, so an invalid one
         // means a hand-edited DB. It is neither repaired nor skipped here: the
@@ -1066,28 +1234,31 @@ pub async fn detail(
     })
     .collect::<Result<Vec<_>, _>>()?;
 
-    Ok(Json(SnapshotDetail {
-        snapshot: Snapshot {
-            id: snap.get("id"),
-            save_id: None,
-            version_num: snap.get("version_num"),
-            parent_version: snap.get("parent_version"),
-            device_name: snap.get("device_name"),
-            notes: snap.get("notes"),
-            total_size_bytes: snap.get("total_size_bytes"),
-            file_count: snap.get("file_count"),
-            is_pinned: snap.get::<i64, _>("is_pinned") != 0,
-            deleted_at: snap
-                .get::<Option<String>, _>("deleted_at")
-                .as_deref()
-                .map(repair_ts),
-            created_at: repair_ts(&snap.get::<String, _>("created_at")),
-            insight: crate::insight::parse_stored(
-                snap.get::<Option<String>, _>("insight").as_deref(),
-            ),
-        },
-        files,
-    }))
+    let mut snapshot = Snapshot {
+        id: snap.get("id"),
+        save_id: None,
+        version_num: snap.get("version_num"),
+        parent_version: snap.get("parent_version"),
+        device_name: snap.get("device_name"),
+        notes: snap.get("notes"),
+        total_size_bytes: snap.get("total_size_bytes"),
+        file_count: snap.get("file_count"),
+        is_pinned: snap.get::<i64, _>("is_pinned") != 0,
+        deleted_at: snap
+            .get::<Option<String>, _>("deleted_at")
+            .as_deref()
+            .map(repair_ts),
+        created_at: repair_ts(&snap.get::<String, _>("created_at")),
+        insight: crate::insight::parse_stored(snap.get::<Option<String>, _>("insight").as_deref()),
+    };
+    // The files above are already the member's; the totals follow them.
+    if !include.is_empty() {
+        snapshot.file_count = files.len() as i64;
+        snapshot.total_size_bytes = files.iter().map(|f| f.size_bytes).sum();
+        snapshot.insight = None;
+    }
+
+    Ok(Json(SnapshotDetail { snapshot, files }))
 }
 
 // ─── GET /v1/saves/:save_id/snapshots/:version/download ─────────────────────
@@ -1098,10 +1269,14 @@ pub async fn download(
     Path((save_id, version)): Path<(String, i64)>,
 ) -> Result<Response, (StatusCode, Json<serde_json::Value>)> {
     let user_id = user.user_id.to_string();
-    let (game_slug, label) = ownership_check(&state.pool, &save_id, &user_id)
+    let access = save_access(&state.pool, &save_id, &user_id)
         .await
-        .map_err(|e| internal_logged("ownership lookup", e))?
+        .map_err(|e| internal_logged("access lookup", e))?
         .ok_or_else(|| err(StatusCode::NOT_FOUND, "save not found"))?;
+    let include = read_include(&state.pool, &save_id, &access)
+        .await
+        .map_err(|e| internal_logged("include lookup", e))?;
+    let (game_slug, label) = (access.game_slug, access.label);
 
     let snap_id: Option<String> = sqlx::query_scalar(
         "SELECT id FROM snapshots WHERE save_id=? AND version_num=? AND deleted_at IS NULL",
@@ -1127,7 +1302,8 @@ pub async fn download(
     .await
     .map_err(|e| internal_logged("listing snapshot rows", e))?;
 
-    let uid = user_id.clone();
+    // The bytes live in the save's namespace, whoever is asking.
+    let ns = Namespace::of(&access.owner_user_id, access.group_id.as_deref());
 
     // How to source one entry's bytes when building the tar, as storage-backend
     // keys (resolved to readable local paths inside the tar-builder task).
@@ -1140,6 +1316,10 @@ pub async fn download(
     for r in &file_rows {
         let file_id: String = r.get("id");
         let rel: String = r.get("relative_path");
+        // A member of a share that names its files gets those, on every version.
+        if !included(&include, &rel) {
+            continue;
+        }
         let size: i64 = r.get("size_bytes");
         let sha: String = r.get("sha256");
 
@@ -1153,13 +1333,13 @@ pub async fn download(
         .map_err(|e| internal_logged("listing snapshot rows", e))?;
 
         if chunk_rows.is_empty() {
-            entries.push((rel, DlSource::Blob(crate::store::blob_key(&uid, &sha))));
+            entries.push((rel, DlSource::Blob(ns.blob_key(&sha))));
         } else {
             let keys = chunk_rows
                 .iter()
                 .map(|c| {
                     let csha: String = c.get("chunk_sha256");
-                    crate::store::chunk_key(&uid, &csha)
+                    ns.chunk_key(&csha)
                 })
                 .collect();
             entries.push((

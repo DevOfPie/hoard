@@ -36,11 +36,12 @@ use std::time::{Duration, Instant};
 use hoard_agent::agent::{self, AgentConfig, AgentEvent, AgentHandle};
 use hoard_agent::api::ApiClient;
 use hoard_agent::config::CliConfig;
+use hoard_agent::lease::LeaseHandle;
 use hoard_agent::prefs::Prefs;
 use hoard_agent::presence::PresenceHandle;
 use hoard_agent::state::CliState;
 use hoard_agent::supervisor::Finished;
-use hoard_agent::{cloud_live, library, presence};
+use hoard_agent::{cloud_live, lease, library, presence, selfhosted_live};
 use hoard_core::ipc::{EngineDownReason, EngineStatus, KeyringFault};
 use time::OffsetDateTime;
 use tokio::sync::mpsc;
@@ -88,6 +89,9 @@ struct Running {
     handle: AgentHandle,
     task: JoinHandle<()>,
     presence: PresenceHandle,
+    /// The hosting leases this machine holds. Released on the way down, like
+    /// the presence beat: a lease left behind blocks the world for 300 s.
+    lease: LeaseHandle,
     /// The live engine's client. `Reload` rebuilds the watched set and for that it
     /// has to ask again which saves are archived: without this, archiving a save
     /// would have no effect until the next start. It shares its token cell with the
@@ -188,6 +192,21 @@ impl Engine {
             .unwrap_or_else(|| "the engine is still starting".to_string())
     }
 
+    /// The error a request gets while there is no engine: the readable reason
+    /// and its classification, so a client asks for a sign-in only when a
+    /// sign-in fixes it.
+    pub fn down_error(&self) -> hoard_core::ipc::IpcError {
+        let kind = if self.lock().stopping {
+            hoard_core::ipc::EngineDownReason::Other
+        } else {
+            self.status().reason
+        };
+        hoard_core::ipc::IpcError::EngineDown {
+            reason: self.down_reason(),
+            kind,
+        }
+    }
+
     pub fn set_watched(&self, count: usize) {
         self.lock().status.watched = count;
     }
@@ -270,6 +289,7 @@ impl Engine {
             last_error: None,
             reason: EngineDownReason::Unknown,
             keyring: None,
+            prompts: Vec::new(),
         };
         // A previous engine (the one that died and is being replaced, say) is dropped
         // here: `Running::aux` aborts its tasks when released.
@@ -392,8 +412,22 @@ impl Engine {
         }
     }
 
+    /// Takes a client's restart request. Taking one forgets why the last start
+    /// failed: the request is the answer to it (a sign-in, most often), and a
+    /// command sent right behind it must hear "starting", not the old refusal.
     fn take_restart_request(&self) -> Option<String> {
-        self.lock().restart_requested.take()
+        let mut guard = self.lock();
+        let taken = guard.restart_requested.take();
+        if taken.is_some() {
+            forget_last_failure(&mut guard.status);
+        }
+        taken
+    }
+
+    /// A start is about to run: until it answers, the engine is starting, and
+    /// the reason the previous one failed is not this one's.
+    fn begin_start(&self) {
+        forget_last_failure(&mut self.lock().status);
     }
 
     /// A clean shutdown of the live engine so it can be started again. Keeper only.
@@ -409,10 +443,14 @@ impl Engine {
         };
         let Some(mut running) = running else { return };
         tracing::info!(reason, "hoardd: restarting the engine");
+        // The engine first: the releases below, and the live frames saying so,
+        // are answers to this stop, not lost leases.
+        let _ = tokio::time::timeout(STATUS_TIMEOUT, running.handle.stopping()).await;
         // One last presence beat with the old token, which is still good: it leaves
         // this machine greyed out on the other machines' panel instead of going dark
         // without a word.
         running.presence.closing().await;
+        running.lease.closing().await;
         if let Err(err) = running.handle.shutdown().await {
             tracing::warn!(error = %err, "hoardd: the engine didn't acknowledge the restart");
         }
@@ -436,9 +474,13 @@ impl Engine {
             guard.running.take()
         };
         let Some(mut running) = running else { return };
+        // The engine first: the releases below, and the live frames saying so,
+        // are answers to this stop, not lost leases.
+        let _ = tokio::time::timeout(STATUS_TIMEOUT, running.handle.stopping()).await;
         // One last presence beat while the token is good: it greys this machine out
         // on the other machines' panel straight away.
         running.presence.closing().await;
+        running.lease.closing().await;
         if let Err(err) = running.handle.shutdown().await {
             tracing::warn!(error = %err, "hoardd: the engine didn't acknowledge shutdown");
         }
@@ -497,6 +539,7 @@ pub async fn keeper(engine: Engine, events_tx: mpsc::Sender<AgentEvent>) -> Fini
             // Drop the corpse (and its tasks) before trying another start.
             engine.forget();
         }
+        engine.begin_start();
         match start(events_tx.clone()).await {
             Ok(started) => {
                 tracing::info!(
@@ -529,6 +572,14 @@ pub async fn keeper(engine: Engine, events_tx: mpsc::Sender<AgentEvent>) -> Fini
             }
         }
     }
+}
+
+/// Clears what a failed start left in `status`, so [`Engine::down_error`]
+/// reads "still starting" (`Unknown`, no text) until the next start answers.
+fn forget_last_failure(status: &mut EngineStatus) {
+    status.reason = EngineDownReason::Unknown;
+    status.last_error = None;
+    status.keyring = None;
 }
 
 /// Why it would not start, so the window can say so.
@@ -585,6 +636,7 @@ async fn start(events_tx: mpsc::Sender<AgentEvent>) -> anyhow::Result<Started> {
         Ok(r) if r.changed() => tracing::info!(
             relinked = r.relinked,
             dropped = r.dropped,
+            reshared = r.reshared,
             "hoardd: reconciled tracked saves with the server"
         ),
         Ok(_) => {}
@@ -606,10 +658,20 @@ async fn start(events_tx: mpsc::Sender<AgentEvent>) -> anyhow::Result<Started> {
     let live_client = active.client.clone();
     let refresh_client = active.client.clone();
     let reload_client = active.client.clone();
+    let lease_client = active.client.clone();
     let global_sync = config.global_sync;
     let (handle, task) = agent::spawn(active.client, config, saves, events_tx);
 
     let mut aux = vec![presence_task];
+    // The lease task needs the engine's handle to answer through, so it comes
+    // after `spawn` and is attached; the live stream feeds the same command.
+    // Both are gated inside on the server advertising groups.
+    let (lease_handle, lease_task) = lease::spawn(lease_client, handle.clone());
+    handle.attach_lease(lease_handle.clone()).await?;
+    aux.push(lease_task);
+    if !active.is_cloud {
+        aux.push(selfhosted_live::spawn(live_client.clone(), handle.clone()));
+    }
     // The low-latency Cloud push (Realtime plus a backup poll). Cloud only, and only
     // with global sync: `backup_only` never writes.
     if active.is_cloud && global_sync {
@@ -630,6 +692,7 @@ async fn start(events_tx: mpsc::Sender<AgentEvent>) -> anyhow::Result<Started> {
             handle,
             task,
             presence: presence_handle,
+            lease: lease_handle,
             client: reload_client,
             aux,
         },
@@ -753,6 +816,26 @@ fn spawn_cloud_live_pair(client: &ApiClient, handle: &AgentHandle) -> Vec<JoinHa
     )
 }
 
+/// The claim prompts the engine is still waiting on, with the same ceiling.
+/// Empty with no engine, or with one that does not answer: a status with no
+/// prompt is what an older daemon sent, and the client draws nothing.
+pub async fn prompt_status(engine: &Engine) -> Vec<hoard_core::ipc::WorldPrompt> {
+    let Some(handle) = engine.handle() else {
+        return Vec::new();
+    };
+    match tokio::time::timeout(STATUS_TIMEOUT, handle.prompts()).await {
+        Ok(Ok(prompts)) => prompts,
+        Ok(Err(err)) => {
+            tracing::warn!(error = %err, "hoardd: the engine didn't answer a prompts query");
+            Vec::new()
+        }
+        Err(_) => {
+            tracing::warn!("hoardd: the engine took too long to answer a prompts query");
+            Vec::new()
+        }
+    }
+}
+
 /// Estado de los slots vigilados, con tope de espera. Lo usa el `Status` del IPC.
 pub async fn slot_status(engine: &Engine) -> Vec<hoard_core::ipc::AgentSlotStatus> {
     let Some(handle) = engine.handle() else {
@@ -837,20 +920,26 @@ pub async fn pump(
 /// cursor and the anti-reupload signature. Without this, every daemon restart would
 /// re-upload identical snapshots and re-download to diff them.
 fn persist(event: &AgentEvent) {
-    let (save_id, version, set_hash) = match event {
+    let (save_id, version, set_hash, world_hash) = match event {
         AgentEvent::BackupSuccess {
             save_id,
             version_num,
             set_hash,
+            world_hash,
             ..
-        } => (save_id, Some(*version_num), set_hash.clone()),
+        } => (
+            save_id,
+            Some(*version_num),
+            set_hash.clone(),
+            world_hash.clone(),
+        ),
         // After a restore the slot is synced to that version: remembering it is what
         // makes the version gate survive a restart.
         AgentEvent::SaveAutoRestored {
             save_id,
             version_num,
             ..
-        } => (save_id, Some(*version_num), None),
+        } => (save_id, Some(*version_num), None, None),
         _ => return,
     };
 
@@ -870,6 +959,12 @@ fn persist(event: &AgentEvent) {
     }
     if let Some(hash) = set_hash {
         entry.set_hash = Some(hash);
+    }
+    // The world's signature travels with the set's: a backup that knows the
+    // one knows the other, and a stale world hash beside a fresh set hash
+    // would let the owner push past a lease on the next start.
+    if matches!(event, AgentEvent::BackupSuccess { .. }) {
+        entry.world_hash = world_hash;
     }
     if matches!(event, AgentEvent::BackupSuccess { .. }) {
         entry.last_backup_at = Some(OffsetDateTime::now_utc());
@@ -915,6 +1010,34 @@ pub async fn reload(engine: &Engine) -> anyhow::Result<usize> {
     let watched = desired_ids.len();
     engine.set_watched(watched);
     Ok(watched)
+}
+
+/// Applies what a settings change asks of the live engine: a `Reseat` seats
+/// the slot again, so it picks up what changed on the row (a share's include
+/// list, a cleared one), where [`reload`] only diffs by id and would leave the
+/// old slot. The slot keeps what it knows is synced: re-learning it made a
+/// share push the folder again under the lease. The row is already written, so
+/// a slot that cannot be touched is logged, not reported: the next `Reload` or
+/// restart seats it.
+pub async fn apply_reseat(engine: &Engine, reseat: library::LiveReseat) {
+    let Some(handle) = engine.handle() else {
+        return;
+    };
+    let applied = match reseat {
+        library::LiveReseat::Noop => Ok(()),
+        library::LiveReseat::Detach(id) => handle.remove_save(id).await,
+        library::LiveReseat::Attach(save) => handle.add_save(*save).await,
+        library::LiveReseat::Reseat(id, save) if id == save.save_id => {
+            handle.reseat_save(*save).await
+        }
+        library::LiveReseat::Reseat(id, save) => match handle.remove_save(id).await {
+            Ok(()) => handle.add_save(*save).await,
+            Err(e) => Err(e),
+        },
+    };
+    if let Err(err) = applied {
+        tracing::warn!(error = %format!("{err:#}"), "hoardd: couldn't re-seat the save");
+    }
 }
 
 #[cfg(test)]
@@ -1052,6 +1175,53 @@ mod tests {
                 doing: "reading the self-hosted session",
             });
         assert_eq!(classify(&refused), EngineDownReason::KeyringUnreadable);
+    }
+
+    /// What a request gets while there is no engine, as the kind and the text.
+    fn down(engine: &Engine) -> (EngineDownReason, String) {
+        match engine.down_error() {
+            hoard_core::ipc::IpcError::EngineDown { reason, kind } => (kind, reason),
+            other => panic!("not an EngineDown: {other:?}"),
+        }
+    }
+
+    /// `hoard login` after a start refused for want of a session: the login's
+    /// restart request is taken, and a command sent before the new start
+    /// answers hears "starting" (`engine_down`), not the old `no_session` that
+    /// would send the user to sign in again.
+    #[test]
+    fn a_taken_restart_request_forgets_the_last_failure() {
+        let engine = down_with(EngineDownReason::NoSession, false);
+        engine.lock().status.last_error = Some("no session. Sign in".into());
+        engine.request_restart("a client handed us a new self-hosted session");
+        assert_eq!(
+            down(&engine).0,
+            EngineDownReason::NoSession,
+            "not taken yet"
+        );
+
+        assert!(engine.take_restart_request().is_some());
+        assert_eq!(
+            down(&engine),
+            (
+                EngineDownReason::Unknown,
+                "the engine is still starting".to_string()
+            )
+        );
+    }
+
+    /// A start retried after the backoff is starting too, whatever the last
+    /// one failed on.
+    #[test]
+    fn a_start_beginning_forgets_the_last_failure() {
+        let engine = down_with(EngineDownReason::KeyringUnreadable, true);
+        engine.lock().status.last_error = Some("the keyring did not answer".into());
+        engine.begin_start();
+        let status = engine.status();
+        assert_eq!(status.reason, EngineDownReason::Unknown);
+        assert_eq!(status.last_error, None);
+        assert!(status.keyring.is_none());
+        assert_eq!(down(&engine).1, "the engine is still starting");
     }
 
     /// And what we do not recognise is said not to be recognised, rather than

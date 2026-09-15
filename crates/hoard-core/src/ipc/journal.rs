@@ -217,6 +217,14 @@ impl Journal {
 ///   different file or a different error opens a row.
 /// - `HeavyProcessDetected`. Seeing the same heavy process again is not a new
 ///   discovery.
+/// - `WorldHostedElsewhere`, once per hold, and a restarted engine can hold
+///   again.
+/// - `WorldClaimWanted`, per game: a re-prompt (the same game started again, or
+///   its worlds changed) replaces the question, it does not stack. Keyed by
+///   hand on the game, so a prompt with a different holder still refreshes the
+///   row rather than opening a second one.
+/// - `ViewSessionWriting`, per save: one warning a session, and the session
+///   after it is the same warning.
 ///
 /// What does not collapse even when it repeats: `BackupScheduled`. It looks like
 /// a rest, but every emission is new information, because the debounce *reset*
@@ -237,6 +245,9 @@ pub fn collapse_key(event: &AgentEvent) -> Option<String> {
     {
         return Some(format!("quota_full:{plan}:{used_bytes}:{limit_bytes}"));
     }
+    if let AgentEvent::WorldClaimWanted { game_slug, .. } = event {
+        return Some(format!("world_claim_wanted:{game_slug}"));
+    }
     let restful = matches!(
         event,
         AgentEvent::RestoreDeferred { .. }
@@ -246,6 +257,8 @@ pub fn collapse_key(event: &AgentEvent) -> Option<String> {
             | AgentEvent::BackupFilesUnreadable { .. }
             | AgentEvent::BackupNeedsAttention { .. }
             | AgentEvent::HeavyProcessDetected { .. }
+            | AgentEvent::WorldHostedElsewhere { .. }
+            | AgentEvent::ViewSessionWriting { .. }
     );
     if !restful {
         return None;
@@ -383,6 +396,59 @@ mod tests {
         assert_eq!(from_scratch.entries.len(), 2);
         // A client that already had row 1 lost nothing.
         assert!(!j.since(1).gap);
+    }
+
+    /// The prompt is one question per game: asked again with a different
+    /// holder, the row refreshes rather than a second one opening. A second
+    /// game is a second question.
+    #[test]
+    fn a_re_prompt_for_the_same_game_is_one_row() {
+        fn wanted(game: &str, holder: Option<&str>) -> AgentEvent {
+            AgentEvent::WorldClaimWanted {
+                game_slug: game.to_string(),
+                worlds: vec![crate::ipc::WorldChoice {
+                    save_id: "w1".into(),
+                    label: "Midgard".into(),
+                    group_name: "friends".into(),
+                    holder: holder.map(String::from),
+                    lease: crate::ipc::WorldLease::Free,
+                }],
+            }
+        }
+        let mut j = Journal::default();
+        j.append(ts(0), wanted("valheim", None));
+        assert!(matches!(
+            j.append(ts(1), wanted("valheim", Some("bob"))),
+            Appended::Collapsed { seq: 1, repeat: 2 }
+        ));
+        assert!(matches!(
+            j.append(ts(2), wanted("enshrouded", None)),
+            Appended::Recorded(_)
+        ));
+        assert_eq!(j.len(), 2);
+    }
+
+    /// A viewer's writes are told once per save; the same save writing on is
+    /// the same warning, another save is another.
+    #[test]
+    fn a_viewer_writing_on_collapses_per_save() {
+        fn writing(save: &str) -> AgentEvent {
+            AgentEvent::ViewSessionWriting {
+                save_id: save.to_string(),
+                game_slug: "valheim".to_string(),
+            }
+        }
+        let mut j = Journal::default();
+        j.append(ts(0), writing("w1"));
+        assert!(matches!(
+            j.append(ts(1), writing("w1")),
+            Appended::Collapsed { seq: 1, repeat: 2 }
+        ));
+        assert!(matches!(
+            j.append(ts(2), writing("w2")),
+            Appended::Recorded(_)
+        ));
+        assert_eq!(j.len(), 2);
     }
 
     /// A cursor from the future, usually a previous daemon's, is a gap, so the

@@ -7,6 +7,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+- **A self-hosted server can share a save between accounts.** Create a group,
+  invite the people you play with, and share a save into it: every member sees
+  it in their own list, pulls it, and pushes to it, and the bytes move into the
+  group's storage so the group's owner pays for them rather than whoever
+  happened to push last. A shared world is played on one machine at a time, so
+  each shared save carries a hosting lease: the member holding it is the only
+  one who can push, the others read, and the lease expires five minutes after
+  its last heartbeat, so a machine that dies mid-session frees the world on its
+  own instead of holding it until somebody notices.
+- **A shared save names its files.** Sharing a Valheim world sends only that
+  world (`worlds_local/<name>` and its backups), never the characters, and every
+  member's backup, restore and fingerprint honour the same list, while the
+  owner's own versions keep the whole folder, so sharing a world never stops
+  their characters and other worlds being backed up. A world shared with you
+  appears in `hoard save list` with its group, ready to adopt with `hoard adopt`.
+- **The CLI shares saves and hosts worlds.** `hoard group` creates a group,
+  lists yours, mints an invite token and joins or leaves with one. `hoard share
+  <save_id> --group <group>` moves a save into a group and `hoard unshare` takes
+  it back; a game that keeps several worlds in one folder, Valheim among them,
+  is refused until `--world` names one, with the worlds it found. `hoard world`
+  claims a shared world to host or only view, releases it, forces an idle lease
+  off its holder, and shows who holds it. `hoard saves` gains a HOST column and
+  `hoard status` lists the shared saves, both saying who hosts each as the
+  sync service last heard it. The group, share and world commands go through
+  the service, which holds the session, so they need it running (`hoard sync
+  start`); without it the tables print as before, with no HOST column.
+- **The desktop app shares saves and hosts worlds.** A *Groups* page creates
+  groups, mints invite links and joins with one, and *Share* on a save's menu
+  in the Library moves it into a group, picking the world for Valheim and
+  listing what travels. When a game with shared worlds starts, Hoard asks in
+  the app and in the in-game HUD whether to host, view or sit it out, and with
+  one free world and no answer it hosts on its own after 60 seconds. Library
+  rows say who hosts each world, their menu releases it or takes over a lease
+  nobody has pushed under, and a session that could not push ends in a side
+  copy with a notice that opens it.
+
 ## [1.1.7] - 2026-09-13
 
 ### Added

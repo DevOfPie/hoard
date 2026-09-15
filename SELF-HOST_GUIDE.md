@@ -218,6 +218,26 @@ your own config — since 1.1.3 that cap applies per file rather than per save,
 so it only bites if a single save file is over 100 MB; if one is, use a tunnel
 to a hostname that isn't proxied, or connect over your LAN/VPN.
 
+### Shared worlds and the owner's quota
+
+This fork's server can share a save between accounts: a group, one world
+shared into it, one member hosting it at a time, everybody else pulling. The
+routes (`/v1/groups`, `/v1/saves/{id}/share`, `/v1/saves/{id}/lease`) are in
+this fork's server from the release after 1.1.7, and are not in upstream's or
+in Hoard Cloud; an older client simply never sees them.
+
+Sharing is a move: the save's versions leave the sharer's namespace for the
+group's, and **the bytes count against the group owner's quota**, whoever
+pushed them. On a server with no per-user limits that is bookkeeping; if you
+set quotas in the web panel, the group's owner is the account that needs the
+room. Unsharing moves it back. Deleting a group needs every save unshared
+first.
+
+Nothing to configure. The per-file body cap under
+[Behind a reverse proxy](#behind-a-reverse-proxy) applies to shared worlds like
+any other save, and a Valheim world's `.db` is the file most likely to pass
+Cloudflare's 100 MB. The [sharing guide](SHARING_GUIDE.md) has the player side.
+
 ### How uploads travel
 
 Hoard has always stored each unique file once (keyed by its SHA-256) and let

@@ -1,0 +1,26 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT refcount, size_bytes FROM group_chunks WHERE group_id = ? AND sha256 = ?",
+  "describe": {
+    "columns": [
+      {
+        "name": "refcount",
+        "ordinal": 0,
+        "type_info": "Integer"
+      },
+      {
+        "name": "size_bytes",
+        "ordinal": 1,
+        "type_info": "Integer"
+      }
+    ],
+    "parameters": {
+      "Right": 2
+    },
+    "nullable": [
+      false,
+      false
+    ]
+  },
+  "hash": "b501415e285e03cbd5cb629b44a8cbb05329b265c9954386ef375dbb3e3d4dcc"
+}

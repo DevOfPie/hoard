@@ -9,19 +9,23 @@
 //! the request down. Hard rejection here would be exactly the bricking the ADR
 //! forbids, only server-side and for all of the user's saves at once.
 
+pub mod access;
 pub mod admin;
 pub mod auth;
 pub mod cas;
 pub mod devices;
 pub mod events;
 pub mod games;
+pub mod groups;
 pub mod health;
+pub mod leases;
 pub mod logs;
 pub mod overview;
 pub mod panel;
 pub mod playtime;
 pub mod saves;
 pub mod session;
+pub mod share;
 pub mod snapshots;
 
 use hoard_core::ids::{GameSlug, Repair, SaveId, Username};

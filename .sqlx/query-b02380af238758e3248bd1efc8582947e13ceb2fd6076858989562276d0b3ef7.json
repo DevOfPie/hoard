@@ -1,0 +1,20 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT user_id AS \"user_id!: String\" FROM saves WHERE id = ?\n               UNION\n               SELECT gm.user_id FROM shared_saves ss\n               JOIN group_members gm ON gm.group_id = ss.group_id\n               WHERE ss.save_id = ?",
+  "describe": {
+    "columns": [
+      {
+        "name": "user_id!: String",
+        "ordinal": 0,
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Right": 2
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "b02380af238758e3248bd1efc8582947e13ceb2fd6076858989562276d0b3ef7"
+}

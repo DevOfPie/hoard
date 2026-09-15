@@ -78,7 +78,17 @@ export type NotificationAction = {
   url: string;
   label: string;
   icon?: string;
+  /** An in-app action instead of a link, for notifications the app pushes
+   *  itself. Serialisable on purpose (it survives the reload with the rest of
+   *  the entry); the panel maps it to the verb. `url` is then the action's
+   *  key and is never opened. */
+  op?: NotificationOp;
 };
+
+/** What an in-app notification button does. */
+export type NotificationOp =
+  | { kind: "claim_world"; save_id: string; role: "host" | "view" }
+  | { kind: "open_folder"; path: string };
 
 export type AppNotification = {
   /** Stable id for dedup. Server notifications use the server's id; app-side
@@ -219,6 +229,26 @@ export function pushNotification(
       actions: n.actions,
     };
     const next = [entry, ...list].slice(0, MAX_ENTRIES);
+    persist(next);
+    return next;
+  });
+}
+
+/** Change an app notification in place (its actions, once the side copy has
+ *  a folder). A new `at` is the same event happening again: the row moves to
+ *  the top. Nothing happens when the id is gone: the user dismissed it. */
+export function updateNotification(
+  id: string,
+  patch: Partial<Pick<AppNotification, "title" | "body" | "actions" | "at">>,
+): void {
+  notifications.update((list) => {
+    const old = list.find((n) => n.id === id);
+    if (!old) return list;
+    const updated = { ...old, ...patch };
+    const next =
+      patch.at === undefined
+        ? list.map((n) => (n.id === id ? updated : n))
+        : [updated, ...list.filter((n) => n.id !== id)];
     persist(next);
     return next;
   });

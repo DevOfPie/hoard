@@ -1,0 +1,20 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT refcount FROM blobs WHERE user_id = ? AND sha256 = ?",
+  "describe": {
+    "columns": [
+      {
+        "name": "refcount",
+        "ordinal": 0,
+        "type_info": "Integer"
+      }
+    ],
+    "parameters": {
+      "Right": 2
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "4deae65949cccca316a7526e1e86c79067fc9539ad64be52609d74f62f3c3f6f"
+}

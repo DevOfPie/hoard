@@ -33,6 +33,7 @@
     PauseCircle,
     Cloud,
     History,
+    Users,
   } from "@lucide/svelte";
   import { push } from "svelte-spa-router";
   import { _ } from "svelte-i18n";
@@ -45,6 +46,7 @@
   import LinkOrphanModal from "../lib/components/LinkOrphanModal.svelte";
   import ManualTrackModal from "../lib/components/ManualTrackModal.svelte";
   import ScanFolderModal from "../lib/components/ScanFolderModal.svelte";
+  import ShareWorldModal from "../lib/components/ShareWorldModal.svelte";
   import * as api from "../lib/api";
   import type {
     Confidence,
@@ -57,6 +59,7 @@
   } from "../lib/api";
   import { toastError, toastSuccess } from "../lib/stores/toasts";
   import { showError } from "../lib/stores/error_dialog";
+  import { leases, refreshLease } from "../lib/stores/groups";
   import {
     archivedSaves,
     refreshArchivedSaves,
@@ -139,6 +142,70 @@
   let folderTargetGame = $state<DetectedGame | null>(null);
   /** Currently-open untrack confirmation. Same single-modal pattern. */
   let untrackTarget = $state<TrackedSave | null>(null);
+
+  // Sharing: the dialog's target, and the unshare confirm's. The lease chips
+  // draw from the groups store; every shared row's lease is read once on load.
+  let shareTarget = $state<TrackedSave | null>(null);
+  let unshareTarget = $state<TrackedSave | null>(null);
+  let unsharing = $state(false);
+
+  function seedLeases(rows: TrackedSave[]) {
+    for (const s of rows) {
+      if (s.shared) void refreshLease(s.save_id).catch(() => {});
+    }
+  }
+
+  /** The group chip on a tracked row: who hosts, as the store last heard. */
+  function groupChip(save: TrackedSave): { text: string; cls: string } | null {
+    if (!save.shared) return null;
+    const l = $leases[save.save_id];
+    const group = save.shared.group_name;
+    switch (l?.state) {
+      case "mine":
+        return {
+          text: $_("lease.row_hosted_here", { values: { group } }),
+          cls: "bg-emerald-500/15 text-emerald-300",
+        };
+      case "other":
+        return {
+          text: $_("lease.row_hosted_by", { values: { group, name: l.holder ?? "" } }),
+          cls: "bg-amber-500/15 text-amber-300",
+        };
+      case "free":
+        return {
+          text: $_("lease.row_free", { values: { group } }),
+          cls: "bg-zinc-700/40 text-zinc-400",
+        };
+      default:
+        return { text: group, cls: "bg-zinc-700/40 text-zinc-400" };
+    }
+  }
+
+  async function onShared() {
+    try {
+      tracked = await api.listTrackedSaves();
+      seedLeases(tracked);
+    } catch (e) {
+      toastError(typeof e === "string" ? e : (e as Error).message);
+    }
+    toastSuccess($_("share.shared_toast"));
+  }
+
+  async function confirmUnshare() {
+    if (!unshareTarget || unsharing) return;
+    const target = unshareTarget;
+    unsharing = true;
+    try {
+      await api.unshareSave(target.save_id);
+      tracked = await api.listTrackedSaves();
+      toastSuccess($_("share.unshared_toast"));
+      unshareTarget = null;
+    } catch (e) {
+      showError(e);
+    } finally {
+      unsharing = false;
+    }
+  }
   let untracking = $state(false);
 
   /** Currently-open "delete completely" confirmation. Destructive: wipes the
@@ -197,6 +264,7 @@
       report = cached;
       tracked = t;
       playtimeGames = pg;
+      seedLeases(t);
     } catch (e) {
       toastError(typeof e === "string" ? e : (e as Error).message);
     }
@@ -1378,9 +1446,43 @@
                               {slotLabel(save)}
                             </span>
                           {/if}
+                          <!-- The group this save is shared into and who hosts
+                               it now, as the groups store last heard. -->
+                          {#if groupChip(save)}
+                            {@const chip = groupChip(save)}
+                            <span
+                              class="inline-flex min-w-0 items-center gap-1 truncate rounded-full px-1.5 py-0.5 text-[10px] font-medium {chip?.cls}"
+                              title={chip?.text}
+                            >
+                              <Users size={9} class="shrink-0" />
+                              <span class="truncate">{chip?.text}</span>
+                            </span>
+                          {/if}
                         </span>
                       {/if}
                       <div class="flex shrink-0 items-center gap-0.5">
+                        <!-- Share first: into a group, or back out of one. -->
+                        {#if save.shared}
+                          <button
+                            type="button"
+                            onclick={() => (unshareTarget = save)}
+                            aria-label={$_("share.menu_unshare")}
+                            title={$_("share.menu_unshare")}
+                            class="shrink-0 rounded p-1 text-emerald-400 transition-colors hover:bg-zinc-700/40 hover:text-zinc-200"
+                          >
+                            <Users size={11} />
+                          </button>
+                        {:else}
+                          <button
+                            type="button"
+                            onclick={() => (shareTarget = save)}
+                            aria-label={$_("share.menu_share")}
+                            title={$_("share.menu_share")}
+                            class="shrink-0 rounded p-1 text-zinc-500 transition-colors hover:bg-zinc-700/40 hover:text-emerald-300"
+                          >
+                            <Users size={11} />
+                          </button>
+                        {/if}
                         {#if purgeDate(save.save_id)}
                           <button
                             type="button"
@@ -1747,6 +1849,29 @@
               </div>
             </div>
 
+            {#if save.shared}
+              <!-- Another member's world, no folder here yet: adopting binds
+                   it to this machine's folder for the game, the same flow as
+                   any cloud-only row. -->
+              <p class="mt-1.5 flex items-center gap-1 text-[10px] text-emerald-300">
+                <Users size={10} class="shrink-0" />
+                <span class="truncate">
+                  {$_("share.shared_with_you", {
+                    values: { label: save.label, group: save.shared.group_name, owner: save.shared.owner_username },
+                  })}
+                </span>
+              </p>
+              <p class="mt-1 text-[10px] text-zinc-500">
+                {$_("share.adopt_hint", { values: { game: displayName(save.game_slug) } })}
+              </p>
+              <div class="mt-2">
+                <Button size="md" class="w-full !py-1.5 !text-xs" onclick={() => linkOrphan(save)}>
+                  <Link size={12} />
+                  {$_("share.adopt_button")}
+                </Button>
+              </div>
+            {/if}
+
             <div class="mt-1.5 flex items-center justify-between text-[10px]">
               <span class="flex items-center gap-1.5 text-zinc-500">
                 <span class="inline-block h-1.5 w-1.5 shrink-0 rounded-full bg-zinc-500"></span>
@@ -1859,6 +1984,36 @@
       tracked = [...tracked, saved];
     }}
   />
+
+  <ShareWorldModal
+    save={shareTarget}
+    onClose={() => (shareTarget = null)}
+    onShared={onShared}
+  />
+
+  <!-- Unshare: the save goes back to its owner's namespace; members lose it. -->
+  <Modal
+    open={unshareTarget !== null}
+    title={$_("share.unshare_title")}
+    dismissible={!unsharing}
+    onClose={() => {
+      if (!unsharing) unshareTarget = null;
+    }}
+  >
+    <p class="text-sm text-zinc-300">
+      {$_("share.unshare_body", {
+        values: { label: unshareTarget?.label ?? "", group: unshareTarget?.shared?.group_name ?? "" },
+      })}
+    </p>
+    {#snippet footer()}
+      <Button variant="ghost" onclick={() => (unshareTarget = null)} disabled={unsharing}>
+        {$_("common.cancel")}
+      </Button>
+      <Button variant="danger" onclick={confirmUnshare} loading={unsharing}>
+        {$_("share.menu_unshare")}
+      </Button>
+    {/snippet}
+  </Modal>
 
   <LinkOrphanModal
     open={linkingOrphan !== null}

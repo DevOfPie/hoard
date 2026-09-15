@@ -16,6 +16,7 @@ pub mod covers;
 pub mod devices;
 pub mod emulators;
 pub mod error;
+pub mod groups;
 pub mod history;
 pub mod library;
 pub mod loopback;

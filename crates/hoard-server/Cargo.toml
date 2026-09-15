@@ -37,10 +37,8 @@ cloud = [
     "sqlx/postgres",
     "dep:jsonwebtoken",
     "dep:hmac",
-    "dep:base64",
     "dep:zip",
     "dep:tempfile",
-    "dep:rand",
 ]
 
 [dependencies]
@@ -79,6 +77,11 @@ reqwest = { workspace = true }
 # lets us derive `#[async_trait]` on our own trait.
 async-trait = { workspace = true }
 
+# Group invite tokens: 32 random bytes, base64url on the wire, sha256 in the DB
+# (`routes::groups`). Cloud's device-pairing codes and webhooks use them too.
+rand = { workspace = true }
+base64 = { workspace = true }
+
 # Release signature verification for `hoard-server upgrade`. Pure-Rust
 # Ed25519 minisign verifier, no libsodium link. See ADR 0017.
 minisign-verify = "0.2"
@@ -90,17 +93,12 @@ aws-credential-types = { version = "1", optional = true }
 aws-smithy-runtime-api = { version = "1", optional = true }
 jsonwebtoken = { version = "9", optional = true }
 hmac = { version = "0.12", optional = true }
-# Polar webhooks use Standard Webhooks: base64-encoded HMAC-SHA256 over
-# `id.timestamp.body`.
-base64 = { version = "0.22", optional = true }
 # Account-export ZIP writer. Entries are `Stored` (game saves are already
 # compressed) so this is just the container format.
 zip = { workspace = true, optional = true }
 # Export worker builds the ZIP on a temp file (streamed to R2) to keep the
 # whole archive off the heap.
 tempfile = { workspace = true, optional = true }
-# Device-pairing codes (CLI browserless login): random device_code + user_code.
-rand = { workspace = true, optional = true }
 
 [package.metadata.cargo-machete]
 # Enabled (under `--features cloud`) to pull the matching aws-smithy

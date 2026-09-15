@@ -1,0 +1,20 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT size_bytes FROM group_chunks WHERE group_id = ? AND sha256 = ?",
+  "describe": {
+    "columns": [
+      {
+        "name": "size_bytes",
+        "ordinal": 0,
+        "type_info": "Integer"
+      }
+    ],
+    "parameters": {
+      "Right": 2
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "02e097a94a98801187cee7e4c2e2c501a7fb4b10507fa6e0e2b17f704ace45da"
+}

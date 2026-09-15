@@ -33,6 +33,7 @@ Rolls back when things go wrong. That's it. That's Hoard.
 | **Compact** | Content-hash deduplication: 10 versions of a 2 GB save cost ~2 GB, not 20 GB. Transfers are zstd-compressed; restores byte-for-byte (SHA-256 verified). The same dedup applies on upload: a second backup of the same game moves only the files that changed, only megabytes, not the whole folder. |
 | **Auto-detect** | +20,000 games from the Ludusavi manifest, found through 10 signals: Steam libraries, Epic/GOG/Xbox launchers, running processes, filesystem scan, Windows registry, Steam Cloud stubs, Proton/Wine prefixes, wrappers and +20 emulators. Zero config. |
 | **Emulator support** | PCSX2, RPCS3, DuckStation, PPSSPP, Dolphin, Cemu, Ryujinx, yuzu, Citra/Azahar, RetroArch, mGBA, melonDS, Project64, shadPS4, Vita3K, Eden, Suyu, Citron, Sudachi, xemu and Flycast. Pick from presets, tracked like any other game, you can manually add others, is easy. |
+| **Shared worlds** | Self-hosted only: make a group, share a Valheim world into it, and the people you play with pull it. One machine hosts at a time; the lease expires on its own when a host's PC dies. Characters never travel. [Sharing guide](SHARING_GUIDE.md). |
 | **Self-hosted storage** | The server keeps your blobs on local disk or any S3-compatible bucket — MinIO, Backblaze B2, Cloudflare R2, or an `rclone serve s3` bridge in front of OneDrive/Drive/Dropbox. |
 |**Why a cloud and not P2P?**|Your other PC is off. Your laptop is dead. Who has the save? An always-on server does, every version, ready before you sit down.|
 | **Cross-platform** | Windows · Linux · macOS · SteamOS · BazziteOS - If you can play doom you can run Hoard, not a joke. |
@@ -89,6 +90,7 @@ here is the [installer](https://hoard.services/cli).
 ## Documentation
 
 - **[Self-hosting guide](SELF-HOST_GUIDE.md)** — Docker, Unraid, bare-metal + systemd, and the headless CLI.
+- **[Sharing guide](SHARING_GUIDE.md)** — groups, sharing a world, hosting and viewing, and what goes into a side copy.
 - **[Contributing](CONTRIBUTING.md)** — building from source, the release flow, and the architecture.
 - **[Funding](FUNDING.md)** — where the money goes and what your sponsorship covers.
 

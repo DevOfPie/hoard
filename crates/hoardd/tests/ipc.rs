@@ -242,6 +242,107 @@ async fn commands_without_an_engine_say_why() {
     );
 }
 
+/// The shared-world verbs cross the wire and need an engine: `ClaimWorld` is an
+/// engine command, `ListGroups` a server call on the engine's client, and with
+/// no engine both say so rather than hanging up.
+#[tokio::test]
+async fn the_world_and_group_verbs_round_trip_and_want_an_engine() {
+    let fx = Fixture::start();
+    let mut client = fx.client().await;
+
+    let err = client
+        .request(Request::ClaimWorld {
+            save_id: "w1".into(),
+            role: hoard_core::ipc::WorldRole::Host,
+        })
+        .await
+        .expect_err("no engine, no claim");
+    let text = err.to_string();
+    assert!(text.contains("no engine"), "{text}");
+    assert!(
+        !text.contains("EngineDown"),
+        "leaked the Debug shape: {text}"
+    );
+
+    let err = client
+        .request(Request::ListGroups)
+        .await
+        .expect_err("no engine, no client to list with");
+    let text = err.to_string();
+    assert!(text.contains("no engine"), "{text}");
+
+    // "Not playing" is an engine command like the claim: same answer without one.
+    let err = client
+        .request(Request::DismissWorld {
+            save_id: "w1".into(),
+        })
+        .await
+        .expect_err("no engine, nothing to dismiss");
+    let text = err.to_string();
+    assert!(text.contains("no engine"), "{text}");
+
+    // The world list is read off this machine's disk, and still wants an engine:
+    // without one the fixture would be reading the tester's own `state.json`.
+    let err = client
+        .request(Request::ListWorlds {
+            save_id: "w1".into(),
+        })
+        .await
+        .expect_err("no engine, no world list");
+    let text = err.to_string();
+    assert!(text.contains("no engine"), "{text}");
+    assert!(
+        !text.contains("EngineDown"),
+        "leaked the Debug shape: {text}"
+    );
+
+    // The owner's verbs are server calls like the listing: same answer.
+    for request in [
+        Request::RemoveMember {
+            group_id: "g1".into(),
+            user_id: "u2".into(),
+        },
+        Request::DeleteGroup {
+            group_id: "g1".into(),
+        },
+    ] {
+        let err = client
+            .request(request)
+            .await
+            .expect_err("no engine, no client to call with");
+        let text = err.to_string();
+        assert!(text.contains("no engine"), "{text}");
+    }
+
+    // Still connected: a refused request is an answer, not a farewell.
+    let (_, pid) = client.ping().await.unwrap();
+    assert_eq!(pid, std::process::id());
+}
+
+/// With no engine, `GetLease` is refused promptly with an error the user can
+/// read, and the connection stays up. The engine is never reached, so no lease
+/// payload is built here: that it encodes is pinned by `the_lease_payload_is_frozen`
+/// and `every_payload_round_trips_through_a_frame` in `hoard_core::ipc`.
+#[tokio::test]
+async fn asking_who_hosts_without_an_engine_answers_promptly() {
+    let fx = Fixture::start();
+    let mut client = fx.client().await;
+
+    let answered = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        client.request(Request::GetLease {
+            save_id: "w1".into(),
+        }),
+    )
+    .await
+    .expect("the lease query hung");
+    let text = answered.expect_err("no engine, no lease").to_string();
+    assert!(text.contains("no engine"), "{text}");
+
+    let (_, pid) = client.ping().await.unwrap();
+    assert_eq!(pid, std::process::id());
+}
+
 /// Asking for an engine restart is **not** answered with `EngineDown` when there is
 /// no engine: it is precisely the request that can bring it back (the keeper
 /// resolves the session again). Answering "I cannot because it is broken" would

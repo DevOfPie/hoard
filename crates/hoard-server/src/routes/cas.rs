@@ -74,10 +74,12 @@ use tracing::{info, warn};
 use uuid::Uuid;
 
 use crate::auth::AuthUser;
+use crate::namespace::{self, Namespace};
+use crate::routes::access::{read_include, save_access};
 use crate::routes::health::ServerState;
 use crate::routes::snapshots::{
     blob_in_db, chunk_in_db, err, internal, internal_logged, is_safe_relative_path,
-    ownership_check, prune_over_version_cap, snapshot_too_large, snapshot_too_large_declared,
+    namespace_changed, prune_over_version_cap, snapshot_too_large, snapshot_too_large_declared,
 };
 
 type ApiError = (StatusCode, Json<serde_json::Value>);
@@ -105,46 +107,105 @@ impl Stored {
     }
 }
 
-/// Does the server already have this sha's bytes for this user, and in what shape?
+/// Does the server already have this sha's bytes in this namespace, and in what
+/// shape?
 ///
-/// It asks `blobs` first (the normal case) and, failing that, looks for one of the
-/// user's `snapshot_files` with that sha and chunks. Trashed snapshots are
-/// deliberately included: a deleted snapshot still pins its bytes against the
+/// It asks the blob table first (the normal case) and, failing that, looks for one
+/// of the namespace's `snapshot_files` with that sha and chunks. Trashed snapshots
+/// are deliberately included: a deleted snapshot still pins its bytes against the
 /// quota until the purge frees them, so its content is available and referencing
 /// it is correct.
 async fn stored_representation(
-    pool: &sqlx::SqlitePool,
-    user_id: &str,
+    conn: &mut sqlx::SqliteConnection,
+    ns: &Namespace,
     sha: &str,
 ) -> Result<Option<Stored>, sqlx::Error> {
-    if let Some(size) =
-        sqlx::query_scalar::<_, i64>("SELECT size_bytes FROM blobs WHERE user_id=? AND sha256=?")
-            .bind(user_id)
-            .bind(sha)
-            .fetch_optional(pool)
-            .await?
-    {
+    if let Some(size) = namespace::blob_size(&mut *conn, ns, sha).await? {
         return Ok(Some(Stored::Blob { size_bytes: size }));
     }
 
-    let row = sqlx::query(
-        "SELECT sf.id AS id, sf.size_bytes AS size_bytes
-           FROM snapshot_files sf
-           JOIN snapshots s ON s.id = sf.snapshot_id
-           JOIN saves sv ON sv.id = s.save_id
-          WHERE sv.user_id = ? AND sf.sha256 = ?
-            AND EXISTS (SELECT 1 FROM snapshot_file_chunks c WHERE c.snapshot_file_id = sf.id)
-          LIMIT 1",
-    )
-    .bind(user_id)
-    .bind(sha)
-    .fetch_optional(pool)
-    .await?;
+    let (sql, scope) = match ns {
+        Namespace::User(id) => (
+            "SELECT sf.id AS id, sf.size_bytes AS size_bytes
+               FROM snapshot_files sf
+               JOIN snapshots s ON s.id = sf.snapshot_id
+               JOIN saves sv ON sv.id = s.save_id
+              WHERE sv.user_id = ? AND sf.sha256 = ?
+                AND EXISTS (SELECT 1 FROM snapshot_file_chunks c WHERE c.snapshot_file_id = sf.id)
+              LIMIT 1",
+            id,
+        ),
+        Namespace::Group(id) => (
+            "SELECT sf.id AS id, sf.size_bytes AS size_bytes
+               FROM snapshot_files sf
+               JOIN snapshots s ON s.id = sf.snapshot_id
+               JOIN shared_saves ss ON ss.save_id = s.save_id
+              WHERE ss.group_id = ? AND sf.sha256 = ?
+                AND EXISTS (SELECT 1 FROM snapshot_file_chunks c WHERE c.snapshot_file_id = sf.id)
+              LIMIT 1",
+            id,
+        ),
+    };
+    let row = sqlx::query(sql)
+        .bind(scope)
+        .bind(sha)
+        .fetch_optional(conn)
+        .await?;
 
     Ok(row.map(|r| Stored::Chunks {
         size_bytes: r.get("size_bytes"),
         file_id: r.get("id"),
     }))
+}
+
+/// May this push reference stored content without sending its bytes?
+///
+/// Referencing a sha is reading it: the next download hands the bytes back. A
+/// user's own namespace holds only what that user uploaded, so there it always
+/// may. A group's holds every save shared into it, whole, so there it may only
+/// when an entry of this save that the caller can read already references the
+/// sha: any entry for the owner, an included one for a member (`include` is
+/// [`read_include`]). Otherwise the sha is reported missing like absent content,
+/// which neither confirms that it exists nor lets it through without its bytes.
+///
+/// `reusable` is [`reusable_shas`], read once per request.
+fn may_reuse(reusable: &Option<HashSet<String>>, sha: &str) -> bool {
+    match reusable {
+        None => true,
+        Some(shas) => shas.contains(sha),
+    }
+}
+
+/// The shas of this save that [`may_reuse`] lets through: `None` in a user's
+/// own namespace, where everything may be. In a group's, one read of the save's
+/// `(sha, path)` pairs across every version, kept where an entry's path is
+/// included, so a push decides every sha from the map instead of walking the
+/// save's file rows once per sha under the write lock.
+async fn reusable_shas(
+    conn: &mut sqlx::SqliteConnection,
+    ns: &Namespace,
+    save_id: &str,
+    include: &[String],
+) -> Result<Option<HashSet<String>>, sqlx::Error> {
+    if let Namespace::User(_) = ns {
+        return Ok(None);
+    }
+    let pairs: Vec<(String, String)> = sqlx::query_as(
+        "SELECT DISTINCT sf.sha256, sf.relative_path
+           FROM snapshot_files sf
+           JOIN snapshots s ON s.id = sf.snapshot_id
+          WHERE s.save_id = ?",
+    )
+    .bind(save_id)
+    .fetch_all(conn)
+    .await?;
+    Ok(Some(
+        pairs
+            .into_iter()
+            .filter(|(_, p)| hoard_core::kernel::fileclass::included(include, p))
+            .map(|(sha, _)| sha)
+            .collect(),
+    ))
 }
 
 /// An upload's staging folder. It sits flush against `tmp/` so
@@ -191,6 +252,14 @@ fn unique_shas(files: &[CasFile]) -> Vec<(String, i64)> {
     out
 }
 
+/// The manifest as `(path, sha)`, the shape the push gate compares.
+fn manifest_rows(files: &[CasFile]) -> Vec<(&str, &str)> {
+    files
+        .iter()
+        .map(|f| (f.relative_path.as_str(), f.sha256.as_str()))
+        .collect()
+}
+
 /// Checks that apply to both init and commit: a non-empty manifest, within the
 /// file cap, with safe paths.
 fn validate_manifest(files: &[CasFile]) -> Result<(), ApiError> {
@@ -219,10 +288,17 @@ pub async fn init(
     Json(body): Json<CasInit>,
 ) -> Result<Json<CasInitOut>, ApiError> {
     let user_id = user.user_id.to_string();
-    ownership_check(&state.pool, &save_id, &user_id)
+    let access = save_access(&state.pool, &save_id, &user_id)
         .await
-        .map_err(|e| internal_logged("ownership lookup", e))?
+        .map_err(|e| internal_logged("access lookup", e))?
         .ok_or_else(|| err(StatusCode::NOT_FOUND, "save not found"))?;
+    // A shared save's bytes live in its group and the group's owner pays,
+    // whoever pushes.
+    let ns = Namespace::of(&access.owner_user_id, access.group_id.as_deref());
+    let billing = ns
+        .billing_user(&state.pool)
+        .await
+        .map_err(|e| internal_logged("billing lookup", e))?;
 
     validate_manifest(&body.files)?;
 
@@ -242,14 +318,47 @@ pub async fn init(
         return Err(snapshot_too_large_declared(max_per_snapshot, logical));
     }
 
+    // Everything below depends on the namespace: the lease, what is missing,
+    // who pays. One write-locked transaction reads it all against the
+    // namespace as it stands now, and a share since the access lookup is a
+    // 409 rather than a missing list computed against the wrong tables.
+    let mut tx = state
+        .pool
+        .begin_with("BEGIN IMMEDIATE")
+        .await
+        .map_err(|e| internal_logged("opening the init transaction", e))?;
+    let now = Namespace::for_save(&mut *tx, &save_id)
+        .await
+        .map_err(|e| internal_logged("namespace lookup", e))?;
+    if now.as_ref() != Some(&ns) {
+        return Err(namespace_changed());
+    }
+    let reuse_include = read_include(&mut *tx, &save_id, &access)
+        .await
+        .map_err(|e| internal_logged("include lookup", e))?;
+
     // Reject the non-fast-forward *before* a byte moves. In the multipart this
     // check arrives after the whole save has been uploaded; here it is the first
     // thing, which is half the reason for having an `init` at all.
     let head: i64 = sqlx::query_scalar("SELECT latest_version_num FROM saves WHERE id=?")
         .bind(&save_id)
-        .fetch_one(&state.pool)
+        .fetch_one(&mut *tx)
         .await
         .map_err(|e| internal_logged("reading the save's latest version", e))?;
+    // A shared save's lease and include list (`share::push_gate`). Before the
+    // superset exception below, which it must not be able to bypass.
+    let gate = crate::routes::share::push_gate(
+        &mut tx,
+        &ns,
+        &access,
+        &save_id,
+        &user_id,
+        head,
+        body.base_version,
+        body.world_base_version,
+        &manifest_rows(&body.files),
+    )
+    .await?;
     if let Some(base) = body.base_version {
         // A base that does not match the head is rejected so a push cannot bury
         // a version it never saw. But a manifest that brings that version
@@ -260,7 +369,9 @@ pub async fn init(
         // do it themselves. Reading the head out of a 409 body is from aug-2026,
         // and before that a rejection left them knowing they had diverged but not
         // from what.
-        if base != head && !manifest_covers_head(&state.pool, &save_id, head, &body.files).await? {
+        if !gate.base_accepted(&mut tx, &save_id, base, head).await?
+            && !manifest_covers_head(&mut tx, &save_id, head, &body.files).await?
+        {
             return Err(non_fast_forward(&save_id, head, base));
         }
         if base != head {
@@ -278,15 +389,19 @@ pub async fn init(
     // charge is made by the commit against whatever actually landed.
     let mut missing = Vec::new();
     let mut missing_bytes: i64 = 0;
+    let may = reusable_shas(&mut tx, &ns, &save_id, &reuse_include)
+        .await
+        .map_err(|e| internal_logged("blob dedup lookup", e))?;
     for (sha, size) in unique_shas(&body.files) {
         if !valid_sha256(&sha) {
             return Err(err(StatusCode::BAD_REQUEST, "invalid sha256 in manifest"));
         }
-        if stored_representation(&state.pool, &user_id, &sha)
+        let reusable = stored_representation(&mut tx, &ns, &sha)
             .await
             .map_err(|e| internal_logged("blob dedup lookup", e))?
-            .is_none()
-        {
+            .is_some()
+            && may_reuse(&may, &sha);
+        if !reusable {
             missing_bytes += size;
             missing.push(CasMissing {
                 sha256: body
@@ -305,13 +420,17 @@ pub async fn init(
     // only to have them refused at the end.
     let (quota, used): (i64, i64) =
         sqlx::query_as("SELECT storage_quota_bytes, storage_used_bytes FROM users WHERE id=?")
-            .bind(&user_id)
-            .fetch_one(&state.pool)
+            .bind(&billing)
+            .fetch_one(&mut *tx)
             .await
             .map_err(|e| internal_logged("quota lookup", e))?;
     if used + missing_bytes > quota {
         return Err(err(StatusCode::PAYLOAD_TOO_LARGE, "storage quota exceeded"));
     }
+    // Nothing was written; the commit only gives the lock back.
+    tx.commit()
+        .await
+        .map_err(|e| internal_logged("closing the init transaction", e))?;
 
     let upload_id = Uuid::new_v4().to_string();
     let dir = staging_dir(&state.config.storage.data_dir, &upload_id);
@@ -351,7 +470,7 @@ pub async fn init(
 /// half-built version, or one from before content-addressing) concedes nothing
 /// either: there is nothing to compare against.
 async fn manifest_covers_head(
-    pool: &sqlx::SqlitePool,
+    conn: &mut sqlx::SqliteConnection,
     save_id: &str,
     head: i64,
     files: &[CasFile],
@@ -367,7 +486,7 @@ async fn manifest_covers_head(
     )
     .bind(save_id)
     .bind(head)
-    .fetch_all(pool)
+    .fetch_all(conn)
     .await
     .map_err(|e| internal_logged("reading the head's manifest", e))?;
     if head_files.is_empty() {
@@ -389,6 +508,19 @@ async fn manifest_covers_head(
 /// that field is the canonical row the push was rejected against, which may not be
 /// the one the client thought it was writing to, and the client parses one
 /// structure instead of branching on which server answered.
+/// 400 with a code the client can name: the manifest carries a file the share
+/// does not include.
+pub(crate) fn outside_include(path: &str) -> ApiError {
+    (
+        StatusCode::BAD_REQUEST,
+        Json(serde_json::json!({
+            "error": format!("{path} is not part of what this shared save consists of"),
+            "code": "outside_include",
+            "path": path,
+        })),
+    )
+}
+
 fn non_fast_forward(save_id: &str, head: i64, base: i64) -> ApiError {
     (
         StatusCode::CONFLICT,
@@ -630,10 +762,15 @@ pub async fn commit(
     Json(body): Json<CasCommit>,
 ) -> Result<(StatusCode, Json<Snapshot>), ApiError> {
     let user_id = user.user_id.to_string();
-    ownership_check(&state.pool, &save_id, &user_id)
+    let access = save_access(&state.pool, &save_id, &user_id)
         .await
-        .map_err(|e| internal_logged("ownership lookup", e))?
+        .map_err(|e| internal_logged("access lookup", e))?
         .ok_or_else(|| err(StatusCode::NOT_FOUND, "save not found"))?;
+    let ns = Namespace::of(&access.owner_user_id, access.group_id.as_deref());
+    let billing = ns
+        .billing_user(&state.pool)
+        .await
+        .map_err(|e| internal_logged("billing lookup", e))?;
     validate_manifest(&body.files)?;
     if !valid_upload_id(&body.upload_id) {
         return Err(err(StatusCode::BAD_REQUEST, "invalid upload id"));
@@ -660,6 +797,22 @@ pub async fn commit(
     // was uploaded, and gets rejected before the store is touched.
     let mut staged: HashMap<String, (PathBuf, i64)> = HashMap::new();
     let mut reused: HashMap<String, Stored> = HashMap::new();
+    let mut conn = state.pool.acquire().await.map_err(|e| {
+        cleanup_staging();
+        internal_logged("blob dedup lookup", e)
+    })?;
+    let reuse_include = read_include(&mut *conn, &save_id, &access)
+        .await
+        .map_err(|e| {
+            cleanup_staging();
+            internal_logged("include lookup", e)
+        })?;
+    let may = reusable_shas(&mut conn, &ns, &save_id, &reuse_include)
+        .await
+        .map_err(|e| {
+            cleanup_staging();
+            internal_logged("blob dedup lookup", e)
+        })?;
     for (sha, _declared) in unique_shas(&body.files) {
         if !valid_sha256(&sha) {
             cleanup_staging();
@@ -674,12 +827,13 @@ pub async fn commit(
                 staged.insert(sha, (path, meta.len() as i64));
             }
             Err(_) => {
-                let Some(stored) = stored_representation(&state.pool, &user_id, &sha)
-                    .await
-                    .map_err(|e| {
-                        cleanup_staging();
-                        internal_logged("blob dedup lookup", e)
-                    })?
+                let Some(stored) =
+                    stored_representation(&mut conn, &ns, &sha)
+                        .await
+                        .map_err(|e| {
+                            cleanup_staging();
+                            internal_logged("blob dedup lookup", e)
+                        })?
                 else {
                     cleanup_staging();
                     warn!(sha = %sha, save_id = %save_id, "cas commit: manifest references a blob that was never uploaded");
@@ -688,10 +842,21 @@ pub async fn commit(
                         "manifest references a blob that was not uploaded",
                     ));
                 };
+                // Content the caller cannot read is refused exactly like
+                // content that is not there: see `may_reuse`.
+                if !may_reuse(&may, &sha) {
+                    cleanup_staging();
+                    warn!(sha = %sha, save_id = %save_id, "cas commit: manifest references content the caller cannot read");
+                    return Err(err(
+                        StatusCode::BAD_REQUEST,
+                        "manifest references a blob that was not uploaded",
+                    ));
+                }
                 reused.insert(sha, stored);
             }
         }
     }
+    drop(conn);
 
     // ---- chunk whatever deserves it (ADR 0019)
     // Planning only (hashing), no writing: if the quota refuses further down there
@@ -723,7 +888,7 @@ pub async fn commit(
                 if new_chunks.contains(&c.sha256) {
                     continue;
                 }
-                if !chunk_in_db(&state.pool, &user_id, &c.sha256)
+                if !chunk_in_db(&state.pool, &ns, &c.sha256)
                     .await
                     .map_err(|e| {
                         cleanup_staging();
@@ -734,14 +899,20 @@ pub async fn commit(
                     new_bytes += c.len as i64;
                 }
             }
-        } else {
+        } else if !blob_in_db(&state.pool, &ns, sha).await.map_err(|e| {
+            cleanup_staging();
+            internal_logged("blob dedup lookup", e)
+        })? {
+            // A blob can be staged and stored at once: `may_reuse` asks a
+            // member for bytes the group already holds. It is referenced again,
+            // not charged again.
             new_bytes += size;
         }
     }
 
     let (quota, used): (i64, i64) =
         sqlx::query_as("SELECT storage_quota_bytes, storage_used_bytes FROM users WHERE id=?")
-            .bind(&user_id)
+            .bind(&billing)
             .fetch_one(&state.pool)
             .await
             .map_err(|e| {
@@ -784,13 +955,13 @@ pub async fn commit(
     let rollback = {
         let store = store.clone();
         let pool = state.pool.clone();
-        let user_id = user_id.clone();
+        let ns = ns.clone();
         move |done: &[Placed]| {
             let keys: Vec<(String, String, bool)> = done
                 .iter()
                 .map(|p| (p.key.clone(), p.sha.clone(), p.chunk))
                 .collect();
-            let (store, pool, user_id) = (store.clone(), pool.clone(), user_id.clone());
+            let (store, pool, ns) = (store.clone(), pool.clone(), ns.clone());
             tokio::spawn(async move {
                 for (key, sha, is_chunk) in keys {
                     // Only what nothing references gets deleted: between the
@@ -799,9 +970,9 @@ pub async fn commit(
                     // error we assume it is referenced: an orphan costs space, an
                     // over-eager delete costs data.
                     let referenced = if is_chunk {
-                        chunk_in_db(&pool, &user_id, &sha).await.unwrap_or(true)
+                        chunk_in_db(&pool, &ns, &sha).await.unwrap_or(true)
                     } else {
-                        blob_in_db(&pool, &user_id, &sha).await.unwrap_or(true)
+                        blob_in_db(&pool, &ns, &sha).await.unwrap_or(true)
                     };
                     if !referenced {
                         let _ = store.delete(&key).await;
@@ -817,7 +988,7 @@ pub async fn commit(
                 if !new_chunks.contains(&c.sha256) || !placed_chunks.insert(c.sha256.clone()) {
                     continue;
                 }
-                let key = crate::store::chunk_key(&user_id, &c.sha256);
+                let key = ns.chunk_key(&c.sha256);
                 let stage = dir.join("_stage").join(&c.sha256);
                 if let Some(parent) = stage.parent() {
                     let _ = tokio::fs::create_dir_all(parent).await;
@@ -840,7 +1011,7 @@ pub async fn commit(
             }
             continue;
         }
-        let key = crate::store::blob_key(&user_id, sha);
+        let key = ns.blob_key(sha);
         if store.put_from_file(&key, path).await.is_err() {
             warn!(sha = %sha, "cas: blob placement failed");
             rollback(&placed);
@@ -856,11 +1027,29 @@ pub async fn commit(
 
     // ---- transaction: rows only
     let snapshot_id = Uuid::new_v4().to_string();
-    let mut tx = state.pool.begin().await.map_err(|e| {
+    let mut tx = state
+        .pool
+        .begin_with("BEGIN IMMEDIATE")
+        .await
+        .map_err(|e| {
+            rollback(&placed);
+            cleanup_staging();
+            internal_logged("opening the commit transaction", e)
+        })?;
+
+    // The namespace was read before the bytes were placed; a share or unshare
+    // since then means they sit under the wrong keys. Checked under the write
+    // lock, so nothing can move the save between here and the rows.
+    let now = Namespace::for_save(&mut *tx, &save_id).await.map_err(|e| {
         rollback(&placed);
         cleanup_staging();
-        internal_logged("opening the commit transaction", e)
+        internal_logged("namespace lookup", e)
     })?;
+    if now.as_ref() != Some(&ns) {
+        rollback(&placed);
+        cleanup_staging();
+        return Err(namespace_changed());
+    }
 
     let head: i64 = sqlx::query_scalar("SELECT latest_version_num FROM saves WHERE id=?")
         .bind(&save_id)
@@ -872,9 +1061,38 @@ pub async fn commit(
             internal_logged("reading the save's latest version", e)
         })?;
     // The init already looked, but minutes can pass between init and commit and
-    // another machine may have pushed. This is the check that counts.
+    // another machine may have pushed, or the lease may have moved. These are
+    // the checks that count.
+    let gate = match crate::routes::share::push_gate(
+        &mut tx,
+        &ns,
+        &access,
+        &save_id,
+        &user_id,
+        head,
+        body.base_version,
+        body.world_base_version,
+        &manifest_rows(&body.files),
+    )
+    .await
+    {
+        Ok(g) => g,
+        Err(e) => {
+            rollback(&placed);
+            cleanup_staging();
+            return Err(e);
+        }
+    };
     if let Some(base) = body.base_version {
-        if base != head {
+        let accepted = match gate.base_accepted(&mut tx, &save_id, base, head).await {
+            Ok(a) => a,
+            Err(e) => {
+                rollback(&placed);
+                cleanup_staging();
+                return Err(e);
+            }
+        };
+        if !accepted {
             rollback(&placed);
             cleanup_staging();
             return Err(non_fast_forward(&save_id, head, base));
@@ -882,9 +1100,32 @@ pub async fn commit(
     }
     let new_version = head + 1;
     let parent_version: Option<i64> = (head > 0).then_some(head);
-    let file_count = body.files.len() as i64;
 
     let fail = |e: sqlx::Error, step: &'static str| internal_logged(step, e);
+
+    // A member's push names the world only; the head's other files come
+    // forward so the version stays whole for the owner. An owner's push that
+    // only the world moved past takes the head's world instead of its own
+    // (HRD-D-0019).
+    let carried = gate.carried(&mut tx, &save_id, head).await.map_err(|e| {
+        rollback(&placed);
+        cleanup_staging();
+        fail(e, "reading the head's other files")
+    })?;
+    let written: Vec<&CasFile> = body
+        .files
+        .iter()
+        .filter(|f| !gate.replaces(&f.relative_path))
+        .collect();
+    // What the caller pushed, which is what the response describes; the row
+    // holds the whole version.
+    let pushed_count = body.files.len() as i64;
+    let file_count = written.len() as i64 + carried.len() as i64;
+    let stored_size = written
+        .iter()
+        .map(|f| size_by_sha.get(f.sha256.as_str()).copied().unwrap_or(0))
+        .sum::<i64>()
+        + carried.iter().map(|r| r.size_bytes()).sum::<i64>();
 
     sqlx::query(
         "INSERT INTO snapshots (id, save_id, version_num, device_name, notes,
@@ -896,7 +1137,7 @@ pub async fn commit(
     .bind(new_version)
     .bind(&body.device_name)
     .bind(&body.notes)
-    .bind(total_size)
+    .bind(stored_size)
     .bind(file_count)
     .bind(parent_version)
     .execute(&mut *tx)
@@ -907,7 +1148,7 @@ pub async fn commit(
         fail(e, "recording the snapshot")
     })?;
 
-    for f in &body.files {
+    for f in written {
         let file_id = Uuid::new_v4().to_string();
         let sha = f.sha256.as_str();
         let size = size_by_sha.get(sha).copied().unwrap_or(0);
@@ -937,45 +1178,25 @@ pub async fn commit(
                 .map(|c| (c.sha256.clone(), c.len as i64))
                 .collect()
         } else if let Some(Stored::Chunks { file_id: src, .. }) = reused.get(sha) {
-            sqlx::query(
-                "SELECT c.chunk_sha256 AS sha, COALESCE(k.size_bytes, 0) AS size
-                   FROM snapshot_file_chunks c
-                   LEFT JOIN chunks k ON k.user_id = ? AND k.sha256 = c.chunk_sha256
-                  WHERE c.snapshot_file_id = ?
-                  ORDER BY c.ordinal",
-            )
-            .bind(&user_id)
-            .bind(src)
-            .fetch_all(&mut *tx)
-            .await
-            .map_err(|e| {
-                rollback(&placed);
-                cleanup_staging();
-                fail(e, "copying a chunk list")
-            })?
-            .into_iter()
-            .map(|r| (r.get::<String, _>("sha"), r.get::<i64, _>("size")))
-            .collect()
+            namespace::chunk_list(&mut *tx, &ns, src)
+                .await
+                .map_err(|e| {
+                    rollback(&placed);
+                    cleanup_staging();
+                    fail(e, "copying a chunk list")
+                })?
         } else {
             Vec::new()
         };
 
         if chunks.is_empty() {
-            sqlx::query(
-                "INSERT INTO blobs (user_id, sha256, size_bytes, refcount)
-                 VALUES (?,?,?,1)
-                 ON CONFLICT(user_id, sha256) DO UPDATE SET refcount = refcount + 1",
-            )
-            .bind(&user_id)
-            .bind(sha)
-            .bind(size)
-            .execute(&mut *tx)
-            .await
-            .map_err(|e| {
-                rollback(&placed);
-                cleanup_staging();
-                fail(e, "reference-counting a blob")
-            })?;
+            namespace::blob_incref(&mut tx, &ns, sha, size, 1)
+                .await
+                .map_err(|e| {
+                    rollback(&placed);
+                    cleanup_staging();
+                    fail(e, "reference-counting a blob")
+                })?;
             continue;
         }
 
@@ -994,23 +1215,22 @@ pub async fn commit(
                 cleanup_staging();
                 fail(e, "recording a file's chunks")
             })?;
-            sqlx::query(
-                "INSERT INTO chunks (user_id, sha256, size_bytes, refcount)
-                 VALUES (?,?,?,1)
-                 ON CONFLICT(user_id, sha256) DO UPDATE SET refcount = refcount + 1",
-            )
-            .bind(&user_id)
-            .bind(csha)
-            .bind(csize)
-            .execute(&mut *tx)
-            .await
-            .map_err(|e| {
-                rollback(&placed);
-                cleanup_staging();
-                fail(e, "reference-counting a chunk")
-            })?;
+            namespace::chunk_incref(&mut tx, &ns, csha, *csize, 1)
+                .await
+                .map_err(|e| {
+                    rollback(&placed);
+                    cleanup_staging();
+                    fail(e, "reference-counting a chunk")
+                })?;
         }
     }
+    crate::routes::share::insert_carried(&mut tx, &ns, &snapshot_id, &carried)
+        .await
+        .map_err(|e| {
+            rollback(&placed);
+            cleanup_staging();
+            fail(e, "carrying the head's other files forward")
+        })?;
 
     sqlx::query("UPDATE saves SET latest_version_num=? WHERE id=?")
         .bind(new_version)
@@ -1023,24 +1243,28 @@ pub async fn commit(
             fail(e, "advancing the save head")
         })?;
 
-    let new_used = used + new_bytes;
-    sqlx::query("UPDATE users SET storage_used_bytes=? WHERE id=?")
-        .bind(new_used)
-        .bind(&user_id)
-        .execute(&mut *tx)
-        .await
-        .map_err(|e| {
-            rollback(&placed);
-            cleanup_staging();
-            fail(e, "updating storage accounting")
-        })?;
+    ns.charge(&mut tx, &billing, new_bytes).await.map_err(|e| {
+        rollback(&placed);
+        cleanup_staging();
+        fail(e, "updating storage accounting")
+    })?;
+    if gate.hosted {
+        crate::routes::leases::mark_pushed(&mut *tx, &save_id, &user_id)
+            .await
+            .map_err(|e| {
+                rollback(&placed);
+                cleanup_staging();
+                fail(e, "marking the lease pushed")
+            })?;
+    }
 
     let metadata = serde_json::json!({
         "save_id": save_id,
         "version_num": new_version,
         "files": file_count,
-        "bytes": total_size,
+        "bytes": stored_size,
         "new_bytes": new_bytes,
+        "carried_files": carried.len(),
         "transport": "cas",
     })
     .to_string();
@@ -1080,9 +1304,10 @@ pub async fn commit(
         "cas commit"
     );
 
+    // The cap is the save owner's, whoever pushed.
     {
         let pool = state.pool.clone();
-        let uid = user_id.clone();
+        let uid = access.owner_user_id.clone();
         let sid = save_id.clone();
         tokio::spawn(async move {
             if let Err(e) = prune_over_version_cap(&pool, &uid, Some(&sid)).await {
@@ -1091,13 +1316,26 @@ pub async fn commit(
         });
     }
 
-    state.events.publish(
-        user.user_id,
-        crate::routes::events::SaveEvent {
-            save_id: save_id.clone(),
-            version_num: new_version,
-        },
-    );
+    // The owner and, on a shared save, every member of its group.
+    if let Err(e) = state
+        .events
+        .publish_save(
+            &state.pool,
+            &save_id,
+            crate::routes::events::Frame::Save(crate::routes::events::SaveEvent {
+                save_id: save_id.clone(),
+                version_num: new_version,
+            }),
+        )
+        .await
+    {
+        warn!(error = %e, save_id = %save_id, "save event: recipients not resolved");
+    }
+    // Only a push that went through the lease is the host's news; the owner's
+    // push past an unchanged world leaves the lease as it was.
+    if gate.hosted {
+        crate::routes::leases::announce_push(&state, &save_id, &user_id).await;
+    }
 
     // What the history row will say. After the commit and never fatal: the
     // version is stored, and a row that fails to get a label is cosmetic.
@@ -1120,7 +1358,7 @@ pub async fn commit(
             device_name: body.device_name,
             notes: body.notes,
             total_size_bytes: total_size,
-            file_count,
+            file_count: pushed_count,
             is_pinned: false,
             deleted_at: None,
             created_at: time::OffsetDateTime::now_utc(),
@@ -1251,10 +1489,14 @@ mod tests {
         .await
         .unwrap();
 
-        let got = stored_representation(&pool, "u1", &whole).await.unwrap();
+        let u1 = Namespace::User("u1".into());
+        let mut conn = pool.acquire().await.unwrap();
+        let got = stored_representation(&mut conn, &u1, &whole).await.unwrap();
         assert!(matches!(got, Some(Stored::Blob { size_bytes: 100 })));
 
-        let got = stored_representation(&pool, "u1", &chunked).await.unwrap();
+        let got = stored_representation(&mut conn, &u1, &chunked)
+            .await
+            .unwrap();
         match got {
             Some(Stored::Chunks {
                 size_bytes,
@@ -1266,14 +1508,103 @@ mod tests {
             other => panic!("expected chunked, got {other:?}"),
         }
 
-        assert!(stored_representation(&pool, "u1", &absent)
+        assert!(stored_representation(&mut conn, &u1, &absent)
             .await
             .unwrap()
             .is_none());
         // Dedup does not cross accounts: another user does not see this content.
-        assert!(stored_representation(&pool, "u2", &whole)
+        assert!(
+            stored_representation(&mut conn, &Namespace::User("u2".into()), &whole)
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    /// The map read once per request decides every sha as the per-sha query it
+    /// replaced did, for the owner (empty include) and a member, on a save whose
+    /// versions reference the same sha under included and excluded paths.
+    #[tokio::test]
+    async fn the_reuse_map_decides_like_the_per_sha_query() {
+        let pool = mem_pool().await;
+        let world = sha("aa"); // included in v1
+        let moved = sha("bb"); // excluded in v1, included in v2
+        let character = sha("cc"); // excluded in both
+        let absent = sha("dd");
+
+        sqlx::query("INSERT INTO users (id, username, password_hash) VALUES ('u1','user','x')")
+            .execute(&pool)
             .await
-            .unwrap()
-            .is_none());
+            .unwrap();
+        sqlx::query("INSERT INTO games (slug, display_name) VALUES ('g','G')")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO saves (id, user_id, game_slug, label, latest_version_num) VALUES ('sv','u1','g','default',2)")
+            .execute(&pool).await.unwrap();
+        for (id, v) in [("s1", 1), ("s2", 2)] {
+            sqlx::query("INSERT INTO snapshots (id, save_id, version_num, total_size_bytes, file_count) VALUES (?,'sv',?,3,3)")
+                .bind(id).bind(v).execute(&pool).await.unwrap();
+        }
+        for (id, snap, path, s) in [
+            ("f1", "s1", "worlds_local/Alpha.db", &world),
+            ("f2", "s1", "characters_local/x.fch", &moved),
+            ("f3", "s1", "characters_local/y.fch", &character),
+            ("f4", "s2", "worlds_local/Alpha.db", &world),
+            ("f5", "s2", "worlds_local/Alpha.fwl", &moved),
+            ("f6", "s2", "characters_local/y.fch", &character),
+        ] {
+            sqlx::query("INSERT INTO snapshot_files (id, snapshot_id, relative_path, size_bytes, sha256) VALUES (?,?,?,1,?)")
+                .bind(id).bind(snap).bind(path).bind(s).execute(&pool).await.unwrap();
+        }
+
+        // The query this replaced, verbatim, as the oracle.
+        async fn per_sha(conn: &mut sqlx::SqliteConnection, include: &[String], sha: &str) -> bool {
+            let paths: Vec<String> = sqlx::query_scalar(
+                "SELECT sf.relative_path
+                   FROM snapshot_files sf
+                   JOIN snapshots s ON s.id = sf.snapshot_id
+                  WHERE s.save_id = ? AND sf.sha256 = ?",
+            )
+            .bind("sv")
+            .bind(sha)
+            .fetch_all(conn)
+            .await
+            .unwrap();
+            paths
+                .iter()
+                .any(|p| hoard_core::kernel::fileclass::included(include, p))
+        }
+
+        let group = Namespace::Group("g1".into());
+        let owner: Vec<String> = Vec::new();
+        let member = vec![
+            "worlds_local/Alpha.db".to_string(),
+            "worlds_local/Alpha.fwl".to_string(),
+        ];
+        let mut conn = pool.acquire().await.unwrap();
+        for (include, want) in [
+            (&owner, [true, true, true, false]),
+            (&member, [true, true, false, false]),
+        ] {
+            let may = reusable_shas(&mut conn, &group, "sv", include)
+                .await
+                .unwrap();
+            for (s, want) in [&world, &moved, &character, &absent].into_iter().zip(want) {
+                assert_eq!(may_reuse(&may, s), want, "{include:?} {s}");
+                assert_eq!(
+                    per_sha(&mut conn, include, s).await,
+                    want,
+                    "{include:?} {s}"
+                );
+            }
+        }
+
+        // A user's own namespace reuses anything, with no read at all.
+        let mine = reusable_shas(&mut conn, &Namespace::User("u1".into()), "sv", &member)
+            .await
+            .unwrap();
+        assert!(mine.is_none());
+        assert!(may_reuse(&mine, &absent));
     }
 }

@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "UPDATE save_leases\n             SET renewed_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now'),\n                 holder_device_fp = ?, base_version = ?\n             WHERE save_id = ?",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 3
+    },
+    "nullable": []
+  },
+  "hash": "89aad27a02677140a1a70425e6732c534c30d3bb3c0cc2b28cd151ec1991b0a2"
+}

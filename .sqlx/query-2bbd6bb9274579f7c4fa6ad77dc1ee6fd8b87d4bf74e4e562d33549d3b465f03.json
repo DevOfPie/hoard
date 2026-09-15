@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "DELETE FROM shared_saves WHERE save_id = ?",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": []
+  },
+  "hash": "2bbd6bb9274579f7c4fa6ad77dc1ee6fd8b87d4bf74e4e562d33549d3b465f03"
+}

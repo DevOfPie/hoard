@@ -1,0 +1,20 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT owner_user_id FROM groups WHERE id = ?",
+  "describe": {
+    "columns": [
+      {
+        "name": "owner_user_id",
+        "ordinal": 0,
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "4e649ffe1b92d09c9996554b24c7b00b35d640d2df375f9ddf1dd9f6a07b4fec"
+}

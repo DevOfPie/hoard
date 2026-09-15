@@ -6,6 +6,7 @@ pub mod clientip;
 pub mod config;
 pub mod db;
 pub mod insight;
+pub mod namespace;
 pub mod ratelimit;
 pub mod retention;
 pub mod routes;

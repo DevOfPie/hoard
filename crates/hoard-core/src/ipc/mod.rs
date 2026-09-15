@@ -47,7 +47,7 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 
-pub use events::{AgentEvent, AgentSlotStatus, BackupReason};
+pub use events::{AgentEvent, AgentSlotStatus, BackupReason, WorldChoice, WorldLease, WorldRole};
 pub use journal::{Backlog, JournalEntry};
 
 /// Protocol version. Goes up only on an incompatible change; adding a field with
@@ -362,6 +362,86 @@ pub enum Request {
     SnoozeUpdate {
         hours: u32,
     },
+    /// Take a role on a shared world. `Host` acquires the lease; `View` only
+    /// records the role. Answers `Ack`; the outcome arrives as
+    /// [`events::AgentEvent::WorldClaimed`] or `WorldHostedElsewhere`.
+    ClaimWorld {
+        save_id: String,
+        role: WorldRole,
+    },
+    /// Give the hosting lease back.
+    ReleaseWorld {
+        save_id: String,
+    },
+    /// Take the lease off its holder (only while they have pushed nothing under
+    /// it) and acquire it.
+    ForceWorld {
+        save_id: String,
+    },
+    /// "Not playing": the answer to [`events::AgentEvent::WorldClaimWanted`]
+    /// that takes no role. No auto-host and no second prompt this session;
+    /// a write to the world still claims it by evidence.
+    DismissWorld {
+        save_id: String,
+    },
+    /// The groups this account belongs to. Answers [`Payload::Groups`].
+    ListGroups,
+    /// Answers [`Payload::Group`].
+    CreateGroup {
+        name: String,
+    },
+    /// Mint an invite token. Answers [`Payload::Invite`].
+    InviteToGroup {
+        group_id: String,
+        #[serde(default)]
+        expires_in_secs: Option<u64>,
+    },
+    /// Redeem an invite token. Answers [`Payload::Group`].
+    JoinGroup {
+        token: String,
+    },
+    /// Leave a group one is a member of (not its owner).
+    LeaveGroup {
+        group_id: String,
+    },
+    /// The owner takes a member out of the group. Same server route as
+    /// leaving, another user's id.
+    RemoveMember {
+        group_id: String,
+        user_id: String,
+    },
+    /// The owner deletes the group: its shares go back to their owners.
+    DeleteGroup {
+        group_id: String,
+    },
+    /// The worlds a tracked save holds, each with the include list a share of
+    /// it would carry. Answers [`Payload::Worlds`]; empty for a game with no
+    /// world template (it shares whole). Needs the save tracked on this
+    /// machine: the list comes from its folder.
+    ListWorlds {
+        save_id: String,
+    },
+    /// Move a save into a group's namespace. Answers [`Payload::Save`].
+    ///
+    /// `world` names the world inside the save's root (`Alpha` for Valheim's
+    /// `worlds_local/Alpha.db`); the daemon turns it into the include list the
+    /// share carries, so members pull that world and nothing else. `None`
+    /// shares the whole folder. A game with no template or a name that is not
+    /// a file stem answers [`IpcError::Invalid`].
+    ShareSave {
+        save_id: String,
+        group_id: String,
+        #[serde(default)]
+        world: Option<String>,
+    },
+    /// Move a save back into the owner's namespace.
+    UnshareSave {
+        save_id: String,
+    },
+    /// Who is hosting a shared save. Answers [`Payload::Lease`].
+    GetLease {
+        save_id: String,
+    },
     /// A request this daemon does not know, sent by a newer client.
     ///
     /// Without this variant the first unknown request would be a *framing* error,
@@ -372,6 +452,54 @@ pub enum Request {
     /// lets requests be added without bumping the protocol version (C.6).
     #[serde(other)]
     Unknown,
+}
+
+impl Request {
+    /// The request's wire name (`get_lease`), the serde tag, for a log line. A
+    /// `match` rather than an encode: it runs before every dispatch, and some
+    /// requests carry tokens that have no business in a scratch buffer. Pinned to
+    /// the tag by `every_request_kind_is_its_serde_tag`.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Request::Ping => "ping",
+            Request::Status => "status",
+            Request::Subscribe { .. } => "subscribe",
+            Request::BackupNow { .. } => "backup_now",
+            Request::SweepAll { .. } => "sweep_all",
+            Request::ForceRestore { .. } => "force_restore",
+            Request::SetAutoRestore { .. } => "set_auto_restore",
+            Request::SetGlobalSync { .. } => "set_global_sync",
+            Request::Reload => "reload",
+            Request::SetProbeCandidates { .. } => "set_probe_candidates",
+            Request::CloudToken { .. } => "cloud_token",
+            Request::AdoptSession { .. } => "adopt_session",
+            Request::ForgetSession => "forget_session",
+            Request::AdoptServerSession { .. } => "adopt_server_session",
+            Request::ForgetServerSession => "forget_server_session",
+            Request::ServerToken => "server_token",
+            Request::RestartEngine => "restart_engine",
+            Request::Shutdown => "shutdown",
+            Request::UpdateStatus => "update_status",
+            Request::ApplyUpdate { .. } => "apply_update",
+            Request::SnoozeUpdate { .. } => "snooze_update",
+            Request::ClaimWorld { .. } => "claim_world",
+            Request::DismissWorld { .. } => "dismiss_world",
+            Request::ReleaseWorld { .. } => "release_world",
+            Request::ForceWorld { .. } => "force_world",
+            Request::ListGroups => "list_groups",
+            Request::CreateGroup { .. } => "create_group",
+            Request::InviteToGroup { .. } => "invite_to_group",
+            Request::JoinGroup { .. } => "join_group",
+            Request::LeaveGroup { .. } => "leave_group",
+            Request::RemoveMember { .. } => "remove_member",
+            Request::DeleteGroup { .. } => "delete_group",
+            Request::ListWorlds { .. } => "list_worlds",
+            Request::ShareSave { .. } => "share_save",
+            Request::UnshareSave { .. } => "unshare_save",
+            Request::GetLease { .. } => "get_lease",
+            Request::Unknown => "unknown",
+        }
+    }
 }
 
 /// The answer to a request.
@@ -401,6 +529,38 @@ pub enum Payload {
     /// How the update is going (answer to [`Request::UpdateStatus`] and to
     /// [`Request::ApplyUpdate`]).
     Update(UpdateState),
+    /// A struct variant, not a newtype: an internally tagged enum cannot
+    /// serialize a variant that wraps a bare sequence (serde refuses at run
+    /// time), so the list travels under a field.
+    Groups {
+        groups: Vec<crate::wire::Group>,
+    },
+    /// Boxed, like the two below: a reply is mostly `Ack`, and the enum must
+    /// not grow to the size of a `Save` for it.
+    Group(Box<crate::wire::Group>),
+    Invite(crate::wire::InviteOut),
+    /// `None` when nobody is hosting. A struct variant, not a newtype: serde
+    /// cannot put an `Option` inside an internally tagged newtype variant, and
+    /// it refuses at runtime, not at compile time.
+    Lease {
+        lease: Option<Box<crate::wire::Lease>>,
+    },
+    Save(Box<crate::wire::Save>),
+    /// The worlds of a save (answer to [`Request::ListWorlds`]). A struct
+    /// variant for the same reason as `Groups`.
+    Worlds {
+        worlds: Vec<WorldFiles>,
+    },
+}
+
+/// One world a save holds and what a share of it carries: the patterns the
+/// game's template resolves for that name, `/`-separated and relative to the
+/// save root. Computed by the service so no frontend re-implements the
+/// template.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorldFiles {
+    pub name: String,
+    pub include: Vec<String>,
 }
 
 /// Everything the service knows about the update, which is all of it: what is
@@ -585,7 +745,14 @@ pub enum IpcError {
     /// session, another agent holds the engine, a failing start). A client that
     /// only saw "error" would retry forever with nothing to tell the user.
     #[error("the Hoard service has no engine: {reason}")]
-    EngineDown { reason: String },
+    EngineDown {
+        reason: String,
+        /// The same reason classified, so a client can tell "sign in" from
+        /// "wait for it to start". `Unknown` from a service older than this
+        /// field (append only, the protocol does not go up).
+        #[serde(default)]
+        kind: EngineDownReason,
+    },
     /// There is no Cloud session to lend and rotating will not fix it: either
     /// there is no session on disk, or GoTrue revoked the whole token family
     /// (reuse detection). Only a fresh login gets it back.
@@ -608,6 +775,24 @@ pub enum IpcError {
     /// That request does not exist in this version of the protocol.
     #[error("this Hoard service doesn't support `{op}`")]
     Unsupported { op: String },
+    /// The server refused with a 409. `code` is its stable tag (`held`,
+    /// `stale`, `pushed`, `not_shared`...), for a client that branches on it;
+    /// `message` is what the user reads.
+    #[error("{message}")]
+    Conflict { code: String, message: String },
+    /// The request itself is wrong (a world name that is not a file stem, a
+    /// game with no world template): retrying will not help, the user has to
+    /// change what they asked for.
+    #[error("{message}")]
+    Invalid { message: String },
+    /// The server refused for a reason other than a 409: `code` is one of
+    /// `unauthorized`, `forbidden`, `not_found`, `bad_request`, `throttled`,
+    /// `quota_full`, for a client that sorts refusals into its own groups;
+    /// `message` is what the user reads. The engine refuses a world verb the
+    /// same way: `not_watched` for a save it does not track, `not_shared` for
+    /// one that is not shared with a group.
+    #[error("{message}")]
+    Refused { code: String, message: String },
     #[error("the Hoard service couldn't do it: {message}")]
     Internal { message: String },
 }
@@ -669,6 +854,31 @@ pub struct EngineStatus {
     /// which is what it showed before this field existed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub keyring: Option<KeyringFault>,
+    /// The claim prompts still waiting for an answer, one per game
+    /// ([`events::AgentEvent::WorldClaimWanted`] as state rather than as an
+    /// event). A surface that reads the status instead of listening (the
+    /// desktop's HUD, born after the event went out) draws the prompt from
+    /// here. Empty is not serialised, so an older client keeps parsing.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub prompts: Vec<WorldPrompt>,
+}
+
+/// One claim prompt the engine is still waiting on: the game started, it has
+/// shared worlds here, and nothing says which one this machine plays. It
+/// leaves the status on the answer (`ClaimWorld`, `DismissWorld`), on the
+/// engine hosting by itself, or on the game closing.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorldPrompt {
+    pub game_slug: String,
+    /// The worlds still unanswered, in the same shape the event offered.
+    pub worlds: Vec<WorldChoice>,
+    /// When the engine will host on its own if nobody answers. Only set while
+    /// the clock is armed: exactly one world of the game, its lease free.
+    #[serde(default, with = "time::serde::rfc3339::option")]
+    pub auto_host_at: Option<OffsetDateTime>,
+    /// When the prompt went out.
+    #[serde(with = "time::serde::rfc3339")]
+    pub raised_at: OffsetDateTime,
 }
 
 /// Why there is no engine, classified at source.
@@ -818,6 +1028,7 @@ mod tests {
             version_num: 42,
             total_bytes: 1024,
             set_hash: Some("cheap:content".into()),
+            world_hash: None,
             already_landed: false,
             deliberate: true,
         };
@@ -859,6 +1070,108 @@ mod tests {
         )
         .unwrap();
         assert!(matches!(deferred, AgentEvent::RestoreDeferred { .. }));
+
+        // The shared-world events: the desktop keys its toasts off these names
+        // and the CLI prints them.
+        let claimed = AgentEvent::WorldClaimed {
+            save_id: "s1".into(),
+            game_slug: "valheim".into(),
+            role: WorldRole::Host,
+            auto: true,
+        };
+        let json = serde_json::to_value(&claimed).unwrap();
+        assert_eq!(json["type"], "world_claimed");
+        assert_eq!(json["role"], "host");
+        assert_eq!(json["auto"], true);
+        let released = serde_json::to_value(AgentEvent::WorldReleased {
+            save_id: "s1".into(),
+            game_slug: "valheim".into(),
+        })
+        .unwrap();
+        assert_eq!(released["type"], "world_released");
+        let hosted = serde_json::to_value(AgentEvent::WorldHostedElsewhere {
+            save_id: "s1".into(),
+            game_slug: "valheim".into(),
+            holder: "bob".into(),
+        })
+        .unwrap();
+        assert_eq!(hosted["type"], "world_hosted_elsewhere");
+        assert_eq!(hosted["holder"], "bob");
+        let lost: AgentEvent = serde_json::from_str(
+            r#"{"type":"world_lease_lost","save_id":"s1","game_slug":"valheim"}"#,
+        )
+        .unwrap();
+        assert!(matches!(lost, AgentEvent::WorldLeaseLost { .. }));
+        let wanted = serde_json::to_value(AgentEvent::WorldClaimWanted {
+            game_slug: "valheim".into(),
+            worlds: vec![WorldChoice {
+                save_id: "s1".into(),
+                label: "Midgard".into(),
+                group_name: "friends".into(),
+                holder: Some("bob".into()),
+                lease: WorldLease::Other,
+            }],
+        })
+        .unwrap();
+        assert_eq!(wanted["type"], "world_claim_wanted");
+        assert_eq!(wanted["worlds"][0]["lease"], "other");
+        assert_eq!(wanted["worlds"][0]["holder"], "bob");
+        // `holder` is optional on the way in: a free world names nobody.
+        let wanted: AgentEvent = serde_json::from_str(
+            r#"{"type":"world_claim_wanted","game_slug":"valheim","worlds":[{"save_id":"s1","label":"Midgard","group_name":"friends","lease":"free"}]}"#,
+        )
+        .unwrap();
+        assert!(
+            matches!(wanted, AgentEvent::WorldClaimWanted { worlds, .. } if worlds[0].holder.is_none())
+        );
+        let writing = serde_json::to_value(AgentEvent::ViewSessionWriting {
+            save_id: "s1".into(),
+            game_slug: "valheim".into(),
+        })
+        .unwrap();
+        assert_eq!(writing["type"], "view_session_writing");
+    }
+
+    /// The pending prompts ride on the engine status. Empty ones are left out
+    /// of the JSON and a status without the field still parses, so a client
+    /// and a daemon of different ages keep talking (C.6, append only).
+    #[test]
+    fn the_engine_status_carries_its_pending_prompts() {
+        let status: EngineStatus = serde_json::from_str(r#"{"running":true}"#).unwrap();
+        assert!(status.prompts.is_empty());
+        let json = serde_json::to_value(&status).unwrap();
+        assert!(json.get("prompts").is_none());
+
+        let raised = OffsetDateTime::from_unix_timestamp(1_760_000_000).unwrap();
+        let status = EngineStatus {
+            running: true,
+            prompts: vec![WorldPrompt {
+                game_slug: "valheim".into(),
+                worlds: vec![WorldChoice {
+                    save_id: "s1".into(),
+                    label: "Midgard".into(),
+                    group_name: "friends".into(),
+                    holder: None,
+                    lease: WorldLease::Free,
+                }],
+                auto_host_at: Some(raised + time::Duration::seconds(60)),
+                raised_at: raised,
+            }],
+            ..EngineStatus::default()
+        };
+        let json = serde_json::to_value(&status).unwrap();
+        assert_eq!(json["prompts"][0]["game_slug"], "valheim");
+        assert_eq!(json["prompts"][0]["worlds"][0]["lease"], "free");
+        assert_eq!(json["prompts"][0]["raised_at"], "2025-10-09T08:53:20Z");
+        assert_eq!(json["prompts"][0]["auto_host_at"], "2025-10-09T08:54:20Z");
+        let back: EngineStatus = serde_json::from_value(json).unwrap();
+        assert_eq!(back.prompts, status.prompts);
+        // The clock is optional on the way in: two worlds arm none.
+        let back: EngineStatus = serde_json::from_str(
+            r#"{"running":true,"prompts":[{"game_slug":"valheim","worlds":[],"raised_at":"2025-10-09T08:53:20Z"}]}"#,
+        )
+        .unwrap();
+        assert!(back.prompts[0].auto_host_at.is_none());
     }
 
     /// The goodbye carries its reason, so the client can show it ("`hoard sync
@@ -939,12 +1252,62 @@ mod tests {
             ),
             (Request::ForgetServerSession, "forget_server_session"),
             (Request::ServerToken, "server_token"),
+            (
+                Request::DismissWorld {
+                    save_id: "w1".into(),
+                },
+                "dismiss_world",
+            ),
+            (
+                Request::ListWorlds {
+                    save_id: "w1".into(),
+                },
+                "list_worlds",
+            ),
+            (
+                Request::RemoveMember {
+                    group_id: "g1".into(),
+                    user_id: "u2".into(),
+                },
+                "remove_member",
+            ),
+            (
+                Request::DeleteGroup {
+                    group_id: "g1".into(),
+                },
+                "delete_group",
+            ),
             (Request::Shutdown, "shutdown"),
         ];
         for (request, op) in cases {
             let json = serde_json::to_value(&request).unwrap();
             assert_eq!(json["op"], op, "wire name changed for {request:?}");
         }
+    }
+
+    /// The world list travels as `{name, include}` rows under the `worlds`
+    /// payload tag: the share dialog lists the names and shows the include
+    /// list as "what travels", so both halves are contract.
+    #[test]
+    fn a_world_list_carries_each_worlds_include_list() {
+        let payload = Payload::Worlds {
+            worlds: vec![WorldFiles {
+                name: "Alpha".into(),
+                include: vec!["worlds_local/Alpha.db".into()],
+            }],
+        };
+        let json = serde_json::to_value(&payload).unwrap();
+        assert_eq!(json["payload"], "worlds");
+        // The sibling list payload has to survive the same trip: an internally
+        // tagged enum cannot carry a bare sequence, which is why both are
+        // struct variants.
+        serde_json::to_value(Payload::Groups { groups: Vec::new() }).unwrap();
+        assert_eq!(json["worlds"][0]["name"], "Alpha");
+        assert_eq!(json["worlds"][0]["include"][0], "worlds_local/Alpha.db");
+        let back: Payload = serde_json::from_value(json).unwrap();
+        assert!(
+            matches!(back, Payload::Worlds { worlds } if worlds.len() == 1 && worlds[0].name == "Alpha")
+        );
     }
 
     /// Older desktops send `force_restore` without `version_num`. New daemon
@@ -1159,5 +1522,384 @@ mod tests {
         assert!(matches!(back, IpcError::CloudSessionExpired { .. }));
         // It reaches the user readable (toast, stdout), not as `{:?}`.
         assert!(back.to_string().contains("revoked"));
+    }
+
+    /// A server refusal keeps its code on the wire; the shape is contract.
+    #[test]
+    fn a_server_refusal_keeps_its_code() {
+        let err = IpcError::Refused {
+            code: "not_found".into(),
+            message: "not found (404)".into(),
+        };
+        let json = serde_json::to_value(&err).unwrap();
+        assert_eq!(
+            json,
+            serde_json::json!({
+                "error": "refused",
+                "code": "not_found",
+                "message": "not found (404)",
+            })
+        );
+        let back: IpcError = serde_json::from_value(json).unwrap();
+        assert!(matches!(back, IpcError::Refused { ref code, .. } if code == "not_found"));
+        assert_eq!(back.to_string(), "not found (404)");
+    }
+
+    fn at() -> OffsetDateTime {
+        OffsetDateTime::from_unix_timestamp(1_800_000_000).unwrap()
+    }
+
+    fn lease() -> crate::wire::Lease {
+        crate::wire::Lease {
+            save_id: "w1".into(),
+            holder_user_id: "u1".into(),
+            holder_username: crate::ids::Username::parse("alice").unwrap(),
+            holder_device_fp: None,
+            acquired_at: at(),
+            renewed_at: at(),
+            base_version: 4,
+            pushed_since: true,
+            live: true,
+        }
+    }
+
+    /// Who hosts, both ways: nobody and somebody. The newtype this replaced
+    /// (`Lease(Option<..>)`) compiled and could not be encoded at all, so
+    /// `hoard world lease` never got an answer. The bytes are contract.
+    #[test]
+    fn the_lease_payload_is_frozen() {
+        let nobody = Payload::Lease { lease: None };
+        let json = serde_json::to_string(&nobody).unwrap();
+        assert_eq!(json, r#"{"payload":"lease","lease":null}"#);
+        let back: Payload = serde_json::from_str(&json).unwrap();
+        assert!(matches!(back, Payload::Lease { lease: None }));
+
+        let somebody = Payload::Lease {
+            lease: Some(Box::new(lease())),
+        };
+        let json = serde_json::to_string(&somebody).unwrap();
+        assert_eq!(
+            json,
+            concat!(
+                r#"{"payload":"lease","lease":{"save_id":"w1","holder_user_id":"u1","#,
+                r#""holder_username":"alice","acquired_at":"2027-01-15T08:00:00Z","#,
+                r#""renewed_at":"2027-01-15T08:00:00Z","base_version":4,"#,
+                r#""pushed_since":true,"live":true}}"#
+            )
+        );
+        let back: Payload = serde_json::from_str(&json).unwrap();
+        match back {
+            Payload::Lease { lease: Some(l) } => assert_eq!(*l, lease()),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// Every payload crosses the wire as a reply frame and comes back the same.
+    /// Serde checks an internally tagged enum's shapes at runtime, so a variant it
+    /// cannot encode compiles and fails only on a live connection; this is where
+    /// it fails instead. Adding a variant breaks the `match` in `index` until it
+    /// has a case, and a case with no sample fails the coverage check.
+    #[test]
+    fn every_payload_round_trips_through_a_frame() {
+        use crate::ids::{GameSlug, SaveId, Username};
+        use crate::wire::{Group, GroupMember, InviteOut, Save, SharedInfo};
+
+        const VARIANTS: usize = 14;
+        fn index(p: &Payload) -> usize {
+            match p {
+                Payload::Ack => 0,
+                Payload::Pong { .. } => 1,
+                Payload::Status(_) => 2,
+                Payload::Backlog(_) => 3,
+                Payload::CloudToken(_) => 4,
+                Payload::ServerSession(_) => 5,
+                Payload::Update(_) => 6,
+                Payload::Groups { .. } => 7,
+                Payload::Group(_) => 8,
+                Payload::Invite(_) => 9,
+                Payload::Lease { lease: None } => 10,
+                Payload::Lease { lease: Some(_) } => 11,
+                Payload::Save(_) => 12,
+                Payload::Worlds { .. } => 13,
+            }
+        }
+
+        let group = Group {
+            id: "g1".into(),
+            name: "friends".into(),
+            owner_user_id: "u1".into(),
+            created_at: at(),
+            members: vec![GroupMember {
+                user_id: "u2".into(),
+                username: Username::parse("bob").unwrap(),
+                role: "member".into(),
+                joined_at: at(),
+            }],
+        };
+        let samples = vec![
+            Payload::Ack,
+            Payload::Pong {
+                daemon_version: "7.7.16".into(),
+                pid: 42,
+            },
+            Payload::Status(DaemonStatus {
+                daemon_version: "7.7.16".into(),
+                protocol: PROTOCOL_VERSION,
+                pid: 42,
+                epoch: "e".into(),
+                uptime_secs: 3,
+                cursor: 7,
+                notifications: true,
+                engine: EngineStatus {
+                    running: false,
+                    reason: EngineDownReason::KeyringUnreadable,
+                    keyring: Some(KeyringFault::Locked),
+                    since: Some(at()),
+                    ..EngineStatus::default()
+                },
+                slots: vec![],
+            }),
+            Payload::Backlog(Backlog {
+                entries: vec![],
+                cursor: 7,
+                gap: true,
+            }),
+            Payload::CloudToken(CloudToken {
+                access_token: "jwt".into(),
+                server_url: "https://api.hoard.services".into(),
+                expires_at: Some(1_800_000_000),
+                rotated: false,
+            }),
+            Payload::ServerSession(ServerSession {
+                server_url: "https://hoard.example".into(),
+                token: "hoard_v1_dead".into(),
+                user: Some(ServerUser {
+                    user_id: "u1".into(),
+                    username: "alice".into(),
+                    is_admin: false,
+                }),
+            }),
+            Payload::Update(UpdateState {
+                current: "1.0.0".into(),
+                latest: Some("1.0.1".into()),
+                staged: Some("1.0.1".into()),
+                phase: UpdatePhase::Waiting {
+                    hold: UpdateHold::GameRunning,
+                },
+                deadline: Some(at()),
+                mandatory: false,
+                unattended: true,
+                last_error: None,
+            }),
+            Payload::Groups {
+                groups: vec![group.clone()],
+            },
+            Payload::Group(Box::new(group)),
+            Payload::Invite(InviteOut {
+                invite_id: "i1".into(),
+                token: "invite-token".into(),
+                expires_at: at(),
+            }),
+            Payload::Lease { lease: None },
+            Payload::Lease {
+                lease: Some(Box::new(lease())),
+            },
+            Payload::Save(Box::new(Save {
+                id: SaveId::parse("0b9c7c7e-8f3a-4d2b-9c1e-5a6b7c8d9e0f").unwrap(),
+                user_id: None,
+                game_slug: GameSlug::parse("valheim").unwrap(),
+                label: "World".into(),
+                local_path_hint: Some("/saves/world".into()),
+                client_os: Some("linux".into()),
+                latest_version_num: Some(4),
+                snapshot_count: Some(4),
+                total_size_bytes: Some(1024),
+                created_at: at(),
+                updated_at: at(),
+                shared: Some(SharedInfo {
+                    group_id: "g1".into(),
+                    group_name: "friends".into(),
+                    owner_user_id: "u1".into(),
+                    owner_username: Username::parse("alice").unwrap(),
+                    include: Vec::new(),
+                    caller_owns: false,
+                }),
+            })),
+            Payload::Worlds {
+                worlds: vec![WorldFiles {
+                    name: "Alpha".into(),
+                    include: vec!["worlds_local/Alpha.fwl".into()],
+                }],
+            },
+        ];
+
+        let mut seen = [false; VARIANTS];
+        for payload in samples {
+            seen[index(&payload)] = true;
+            let sent = serde_json::to_value(&payload)
+                .unwrap_or_else(|e| panic!("{payload:?} cannot be encoded: {e}"));
+            let bytes = encode_frame(&ServerFrame::Reply {
+                id: 1,
+                reply: Reply::Ok(payload),
+            })
+            .expect("a reply frame encodes");
+            let frame: ServerFrame = decode_frame(&bytes[HEADER_BYTES..]).expect("and decodes");
+            let ServerFrame::Reply {
+                id: 1,
+                reply: Reply::Ok(back),
+            } = frame
+            else {
+                panic!("came back as another frame: {sent}");
+            };
+            assert_eq!(serde_json::to_value(&back).unwrap(), sent);
+        }
+        let missing: Vec<usize> = (0..VARIANTS).filter(|i| !seen[*i]).collect();
+        assert!(
+            missing.is_empty(),
+            "payload cases with no sample: {missing:?}"
+        );
+    }
+
+    /// `Request::kind` is the `op` tag serde writes, for every variant. Adding a
+    /// variant breaks the `match` in `index` until it has a case, and a case with
+    /// no sample fails the coverage check.
+    #[test]
+    fn every_request_kind_is_its_serde_tag() {
+        const VARIANTS: usize = 37;
+        fn index(r: &Request) -> usize {
+            match r {
+                Request::Ping => 0,
+                Request::Status => 1,
+                Request::Subscribe { .. } => 2,
+                Request::BackupNow { .. } => 3,
+                Request::SweepAll { .. } => 4,
+                Request::ForceRestore { .. } => 5,
+                Request::SetAutoRestore { .. } => 6,
+                Request::SetGlobalSync { .. } => 7,
+                Request::Reload => 8,
+                Request::SetProbeCandidates { .. } => 9,
+                Request::CloudToken { .. } => 10,
+                Request::AdoptSession { .. } => 11,
+                Request::ForgetSession => 12,
+                Request::AdoptServerSession { .. } => 13,
+                Request::ForgetServerSession => 14,
+                Request::ServerToken => 15,
+                Request::RestartEngine => 16,
+                Request::Shutdown => 17,
+                Request::UpdateStatus => 18,
+                Request::ApplyUpdate { .. } => 19,
+                Request::SnoozeUpdate { .. } => 20,
+                Request::ClaimWorld { .. } => 21,
+                Request::ReleaseWorld { .. } => 22,
+                Request::ForceWorld { .. } => 23,
+                Request::ListGroups => 24,
+                Request::CreateGroup { .. } => 25,
+                Request::InviteToGroup { .. } => 26,
+                Request::JoinGroup { .. } => 27,
+                Request::LeaveGroup { .. } => 28,
+                Request::ShareSave { .. } => 29,
+                Request::UnshareSave { .. } => 30,
+                Request::GetLease { .. } => 31,
+                Request::Unknown => 32,
+                Request::DismissWorld { .. } => 33,
+                Request::RemoveMember { .. } => 34,
+                Request::DeleteGroup { .. } => 35,
+                Request::ListWorlds { .. } => 36,
+            }
+        }
+
+        let id = || "w1".to_string();
+        let samples = vec![
+            Request::Ping,
+            Request::Status,
+            Request::Subscribe { since: Some(3) },
+            Request::BackupNow { save_id: id() },
+            Request::SweepAll { window_secs: 60 },
+            Request::ForceRestore {
+                save_id: id(),
+                version_num: Some(4),
+            },
+            Request::SetAutoRestore { enabled: true },
+            Request::SetGlobalSync { enabled: false },
+            Request::Reload,
+            Request::SetProbeCandidates {
+                dirs: vec!["/saves".into()],
+            },
+            Request::CloudToken { rejected: None },
+            Request::AdoptSession {
+                session: AdoptedSession {
+                    server_url: "https://api.hoard.services".into(),
+                    access_token: "jwt".into(),
+                    refresh_token: "refresh".into(),
+                },
+            },
+            Request::ForgetSession,
+            Request::AdoptServerSession {
+                session: ServerSession {
+                    server_url: "https://hoard.example".into(),
+                    token: "hoard_v1_dead".into(),
+                    user: None,
+                },
+            },
+            Request::ForgetServerSession,
+            Request::ServerToken,
+            Request::RestartEngine,
+            Request::Shutdown,
+            Request::UpdateStatus,
+            Request::ApplyUpdate { version: None },
+            Request::SnoozeUpdate { hours: 2 },
+            Request::ClaimWorld {
+                save_id: id(),
+                role: WorldRole::View,
+            },
+            Request::ReleaseWorld { save_id: id() },
+            Request::ForceWorld { save_id: id() },
+            Request::ListGroups,
+            Request::CreateGroup {
+                name: "friends".into(),
+            },
+            Request::InviteToGroup {
+                group_id: "g1".into(),
+                expires_in_secs: Some(60),
+            },
+            Request::JoinGroup {
+                token: "invite-token".into(),
+            },
+            Request::LeaveGroup {
+                group_id: "g1".into(),
+            },
+            Request::ShareSave {
+                save_id: id(),
+                group_id: "g1".into(),
+                world: None,
+            },
+            Request::UnshareSave { save_id: id() },
+            Request::GetLease { save_id: id() },
+            Request::DismissWorld {
+                save_id: "s1".into(),
+            },
+            Request::RemoveMember {
+                group_id: "g1".into(),
+                user_id: "u2".into(),
+            },
+            Request::DeleteGroup {
+                group_id: "g1".into(),
+            },
+            Request::ListWorlds { save_id: id() },
+            Request::Unknown,
+        ];
+
+        let mut seen = [false; VARIANTS];
+        for request in samples {
+            seen[index(&request)] = true;
+            let sent = serde_json::to_value(&request)
+                .unwrap_or_else(|e| panic!("{request:?} cannot be encoded: {e}"));
+            assert_eq!(sent["op"], request.kind(), "{sent}");
+        }
+        let missing: Vec<usize> = (0..VARIANTS).filter(|i| !seen[*i]).collect();
+        assert!(
+            missing.is_empty(),
+            "request cases with no sample: {missing:?}"
+        );
     }
 }

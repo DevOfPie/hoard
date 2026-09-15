@@ -259,6 +259,18 @@ export type TrackedSave = {
    *  `.cfg`, settings) instead of skipping them. `null` = undecided: they are
    *  not written and the restore dialog keeps asking each time. */
   allow_device_local: boolean | null;
+  /** The group this save is shared into, from the server's row. Absent when
+   *  not shared. Set together with `orphan` it is another member's world this
+   *  machine has not adopted yet: offer adopt, not "no local state". */
+  shared?: SharedRef;
+};
+
+/** Where a shared save lives: the group and its owner. */
+export type SharedRef = {
+  group_id: string;
+  group_name: string;
+  owner_user_id: string;
+  owner_username: string;
 };
 
 /** Run a full auto-detection sweep. Subscribe to `library://scan-progress`
@@ -599,6 +611,16 @@ export type AgentSlotStatus = {
   last_fs_event_at: string | null;
   /** RFC3339 UTC or null if no backup pending. */
   next_scheduled_backup_at: string | null;
+  /** Shared into a group. The two below only mean something when set; an
+   *  older service sends neither, and the HUD draws no lease. */
+  shared?: boolean;
+  /** The lease as the engine last heard it, for a shared save. */
+  lease?: WorldLease | null;
+  /** Who hosts it, when the lease is somebody else's. */
+  lease_holder?: string | null;
+  /** The acquire was refused as behind the head: the service is pulling the
+   *  latest version before it can host. Absent from an older service. */
+  lease_behind?: boolean;
 };
 
 export type BackupReason = "filesystem_settled" | "game_stopped" | "manual";
@@ -749,6 +771,44 @@ export type AgentEvent =
       type: "backup_attention_cleared";
       save_id: string;
       game_slug: string;
+    }
+  | {
+      /** This machine took a role on a shared world. `auto` is the engine
+       *  deciding on its own (the unanswered prompt). */
+      type: "world_claimed";
+      save_id: string;
+      game_slug: string;
+      role: WorldRole;
+      auto: boolean;
+    }
+  | { type: "world_released"; save_id: string; game_slug: string }
+  | {
+      /** Local changes on a world another member hosts: they stay local. */
+      type: "world_hosted_elsewhere";
+      save_id: string;
+      game_slug: string;
+      holder: string;
+    }
+  | {
+      /** The lease this machine held is gone: forced, or expired offline. */
+      type: "world_lease_lost";
+      save_id: string;
+      game_slug: string;
+          /** Who holds it now, when the engine knew; absent when nobody does. */
+      holder?: string | null;
+    }
+  | {
+      /** A game with shared worlds started and nothing says which world this
+       *  machine plays, or how. Answered with `claimWorld` or `dismissWorld`. */
+      type: "world_claim_wanted";
+      game_slug: string;
+      worlds: WorldChoice[];
+    }
+  | {
+      /** A second write landed on a world this machine only views. */
+      type: "view_session_writing";
+      save_id: string;
+      game_slug: string;
     };
 
 /** Ensure the sync service is up and report its engine status. */
@@ -792,6 +852,10 @@ export type UiSnapshot = {
    *  those are *state*, and rebuilding state by replaying events means keeping
    *  the `game_started` row forever or lying about who's playing. */
   slots: AgentSlotStatus[];
+  /** The claim prompts the engine is still waiting on, from the same status
+   *  the slots come from. State, not history: the HUD draws the question from
+   *  here because `world_claim_wanted` went out before the HUD existed. */
+  prompts: WorldPrompt[];
   /** Oldest first, like the backlog. */
   rows: JournalRow[];
   cloud: CloudPulse;
@@ -1237,10 +1301,14 @@ export type RestorePreview = {
   modified: string[];
   added: string[];
   local_only: string[];
+  /** On the owner's restore of a shared save: overwritten files outside the
+   *  share's list, which the restore copies to the side-copy folder first. */
+  outside_share: string[];
   /** Real totals, whatever the lists above had room for. */
   modified_count: number;
   added_count: number;
   local_only_count: number;
+  outside_share_count: number;
   bytes_to_write: number;
   comparable: boolean;
 };
@@ -1480,4 +1548,183 @@ export function catalogStatus(): Promise<CatalogStatus> {
 
 export function updateCatalog(): Promise<CatalogUpdateResult> {
   return invoke<CatalogUpdateResult>("update_catalog");
+}
+
+// ---- Groups, shares and world leases (commands/groups.rs) -----------------
+//
+// Field names mirror `hoard_core::wire` and `hoard_core::ipc::events` exactly:
+// these rows come off the service unchanged.
+
+/** One member of a group. `role` is `owner` or `member`. */
+export type GroupMember = {
+  user_id: string;
+  username: string;
+  role: string;
+  joined_at: string;
+};
+
+/** A group as the caller sees it, members included. */
+export type Group = {
+  id: string;
+  name: string;
+  owner_user_id: string;
+  created_at: string;
+  members: GroupMember[];
+};
+
+/** A freshly minted invite. `token` is shown once: the server keeps only
+ *  its hash. */
+export type InviteOut = {
+  invite_id: string;
+  token: string;
+  expires_at: string;
+};
+
+/** Who is hosting a shared save. `live` is computed on read: unreleased and
+ *  renewed within the server's TTL. */
+export type Lease = {
+  save_id: string;
+  holder_user_id: string;
+  holder_username: string;
+  holder_device_fp?: string | null;
+  acquired_at: string;
+  renewed_at: string;
+  base_version: number;
+  /** The holder has pushed under this lease: it cannot be forced any more. */
+  pushed_since: boolean;
+  live: boolean;
+};
+
+/** The lease as the card draws it: the row, and whether this machine holds
+ *  it (by device fingerprint, decided on the Rust side). */
+export type LeaseView = {
+  lease: Lease | null;
+  here: boolean;
+};
+
+/** What a machine does with a shared world during a session. */
+export type WorldRole = "host" | "view";
+
+/** The lease as the engine last heard it, for the prompt. */
+export type WorldLease = "unknown" | "free" | "mine" | "other";
+
+/** One shared world the claim prompt offers. */
+export type WorldChoice = {
+  save_id: string;
+  label: string;
+  group_name: string;
+  holder?: string | null;
+  lease: WorldLease;
+};
+
+/** One claim prompt the engine is still waiting on (`EngineStatus.prompts`):
+ *  the game started, it has shared worlds here, nothing says which one this
+ *  machine plays. It leaves the status on the answer, on the engine hosting
+ *  by itself, or on the game closing. */
+export type WorldPrompt = {
+  game_slug: string;
+  worlds: WorldChoice[];
+  /** RFC3339: when the engine hosts on its own if nobody answers. Only set
+   *  while its clock is armed (one world of the game, lease free). */
+  auto_host_at?: string | null;
+  /** RFC3339: when the prompt went out. */
+  raised_at: string;
+};
+
+/** One world a save holds and what a share of it carries: `/`-separated
+ *  patterns relative to the save root, resolved by the service. */
+export type WorldFiles = {
+  name: string;
+  include: string[];
+};
+
+export function listGroups(): Promise<Group[]> {
+  return invoke<Group[]>("list_groups");
+}
+
+export function createGroup(name: string): Promise<Group> {
+  return invoke<Group>("create_group", { name });
+}
+
+/** Mint an invite token. `expiresInSecs` defaults to seven days on the server. */
+export function inviteToGroup(
+  groupId: string,
+  expiresInSecs?: number,
+): Promise<InviteOut> {
+  return invoke<InviteOut>("invite_to_group", {
+    groupId,
+    expiresInSecs: expiresInSecs ?? null,
+  });
+}
+
+export function joinGroup(token: string): Promise<Group> {
+  return invoke<Group>("join_group", { token });
+}
+
+export function leaveGroup(groupId: string): Promise<void> {
+  return invoke<void>("leave_group", { groupId });
+}
+
+export function removeMember(groupId: string, userId: string): Promise<void> {
+  return invoke<void>("remove_member", { groupId, userId });
+}
+
+export function deleteGroup(groupId: string): Promise<void> {
+  return invoke<void>("delete_group", { groupId });
+}
+
+/** Move a save into a group. `world` names the world for a game that shares
+ *  by world; `null` shares the whole folder. Answers the server's row. */
+export function shareSave(
+  saveId: string,
+  groupId: string,
+  world: string | null,
+): Promise<unknown> {
+  return invoke<unknown>("share_save", { saveId, groupId, world });
+}
+
+export function unshareSave(saveId: string): Promise<void> {
+  return invoke<void>("unshare_save", { saveId });
+}
+
+/** Accepted at once; the outcome arrives as `agent://world-claimed` or
+ *  `agent://world-hosted-elsewhere`. */
+export function claimWorld(saveId: string, role: WorldRole): Promise<void> {
+  return invoke<void>("claim_world", { saveId, role });
+}
+
+export function releaseWorld(saveId: string): Promise<void> {
+  return invoke<void>("release_world", { saveId });
+}
+
+/** Take the lease off its holder. Refused once they have pushed under it. */
+export function forceWorld(saveId: string): Promise<void> {
+  return invoke<void>("force_world", { saveId });
+}
+
+/** "Not playing": answers the claim prompt without taking a role. */
+export function dismissWorld(saveId: string): Promise<void> {
+  return invoke<void>("dismiss_world", { saveId });
+}
+
+export function getLease(saveId: string): Promise<LeaseView> {
+  return invoke<LeaseView>("get_lease", { saveId });
+}
+
+/** Raise the HUD over the game (the Alt+H window). Created on first use,
+ *  shown with focus so Escape and its buttons work; the toggle and the hide
+ *  live in `stores/gameOverlay.ts`. */
+export function overlayShow(): Promise<boolean> {
+  return invoke<boolean>("overlay_set_visible", { visible: true });
+}
+
+/** Show a folder in the file manager. Refused for anything that is not an
+ *  existing absolute directory. */
+export function openFolder(path: string): Promise<void> {
+  return invoke<void>("open_folder", { path });
+}
+
+/** The worlds a tracked save holds. Empty for a game that shares whole. */
+export function listWorlds(saveId: string): Promise<WorldFiles[]> {
+  return invoke<WorldFiles[]>("list_worlds", { saveId });
 }
