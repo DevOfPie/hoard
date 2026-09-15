@@ -42,15 +42,15 @@ reads. When the host stops, the next person can take the seat.
 - **Steam Cloud off for Valheim, on every member's machine.** Steam's cloud
   sync and Hoard both want to be the one that decides which copy of
   `worlds_local/<world>.db` is newest, and Steam will overwrite the world Hoard
-  just pulled. In Steam: Valheim → Properties → General → uncheck *Keep games
-  saves in the Steam Cloud*. The share dialog reminds you, because it bites
-  every time.
+  just pulled. In Steam: Valheim → Properties → General → uncheck *Keep game
+  saves in the Steam Cloud for Valheim*. The share dialog reminds you, because
+  it bites every time.
 
 ## Create a group and invite
 
 A group is one owner plus members. The owner cannot leave it, and the
 owner's account is the one whose quota holds every world shared into the
-group (`HRD-D-0001`). Invites are one-time tokens: shown once, valid for a set
+group. Invites are one-time tokens: shown once, valid for a set
 time, and whoever redeems one becomes a member.
 
 **Desktop.** Open *Groups* in the sidebar.
@@ -83,9 +83,10 @@ or seconds.
 
 Sharing is a move, not a copy: every version of the save moves from your
 namespace into the group's, and its storage moves onto the group owner's
-quota. Only the save's owner can share or unshare it, and it has to be tracked
-on the machine you share from, because the list of worlds comes from its
-folder.
+quota. Only the save's owner can share or unshare it. The desktop needs the
+save tracked on the machine you share from, because the list of worlds comes
+from its folder; `hoard share` also takes a save this machine does not track,
+but cannot list its worlds, so name one with `--world`.
 
 **What travels.** For Valheim, the share names the world's files and nothing
 else:
@@ -103,6 +104,13 @@ not the world's. Every member keeps their own. For any other game the whole
 save folder is shared, because Hoard has no template that says which files
 are the world.
 
+**What stops being backed up.** Once shared, Hoard backs up only the shared
+world's files from that folder, on the owner's machine too: characters and
+other worlds there get no new versions until you unshare. The server refuses
+any push to a shared save outside its file list, whoever sends it. If you
+keep playing characters in that folder, back them up some other way while the
+world is shared.
+
 **Desktop.** In the *Library*, open the save's menu and pick *Share*. The
 *Share a world* dialog asks for the *Group*, and for a game with worlds the
 *World*; *What travels* lists the files above. Confirm with *Share <World>*.
@@ -116,9 +124,10 @@ hoard share <SAVE_ID> --group "The Thursday crew" --world Midgard
 hoard share <SAVE_ID> --group "The Thursday crew"    # a game with no world layout: whole folder
 ```
 
-Leave `--world` off for Valheim and the command refuses and lists the worlds
-it found under the folder. `<SAVE_ID>` is the UUID from `hoard saves`; there is
-no `game/label` form yet.
+Leave `--world` off for Valheim and the command refuses; on a save this
+machine tracks it lists the worlds it found under the folder, on one it does
+not it has no folder to look in. `<SAVE_ID>` is the UUID from `hoard saves`;
+there is no `game/label` form yet.
 
 The share is refused while the save is already shared (unshare first to move
 it to another group), and unsharing is refused while somebody holds its lease.
@@ -171,12 +180,13 @@ offers, per world:
 If the game has exactly one shared world and nobody holds its lease, the
 prompt shows *Hosting <World> in <n> s unless you choose*. After 60 seconds
 with no answer, Hoard hosts on its own and tells you it was the engine's
-choice (`HRD-D-0002`). With two shared worlds, or a lease that is not free,
+choice. With two shared worlds, or a lease that is not free,
 there is no clock: nothing happens until you answer.
 
 Evidence beats a prompt: if the game writes to the world before you have
 answered and the lease is free, Hoard takes the lease then rather than wait
-the clock out. You are hosting whatever you would have said.
+the clock out. You end up hosting even if you meant to view; answer *View*
+first if you did.
 
 ### What View means
 
@@ -190,7 +200,7 @@ and the folder goes back to the shared version.
 ### The lease, and who pays
 
 The host's machine renews its lease every 30 seconds, and the server lets a
-lease expire 5 minutes after the last renewal (`HRD-D-0003`). A machine that
+lease expire 5 minutes after the last renewal. A machine that
 loses power or its network stops holding the world on its own; nobody has to
 notice it left. While you hold a lease the Library row reads *hosting ·
 <group>* and members see *hosted by <name> · <elapsed>*.
@@ -203,7 +213,7 @@ owner's quota, whoever pushed it. A self-hosted server has no quota unless the
 admin set one, so on most servers this is bookkeeping; on one with per-user
 limits, the owner is the account that needs the room.
 
-**CLI.** The same four answers, and the lease:
+**CLI.** The same three answers, plus release and the lease:
 
 ```sh
 hoard world claim <SAVE_ID>            # host (the default)
@@ -217,8 +227,8 @@ A claim on a save that is not a shared world on this machine is refused on the s
 What the server makes of an accepted one shows in `hoard sync logs` and
 `hoard world lease`. `hoard saves` and `hoard status` say who hosts each shared
 row as the sync service last heard it: *hosted here*, *hosted by <name>*,
-*nobody* or *unknown*. With the service stopped the column is left out rather
-than guessed.
+*hosted elsewhere*, *nobody* or *unknown*. With the service stopped the column
+is left out rather than guessed.
 
 ## When things go wrong
 
@@ -251,12 +261,12 @@ share's own files move there, nothing else in the folder. They land next to
 the restore conflict copies, under the sync service's state folder:
 
 ```
-~/.local/share/hoard/conflicts/<save_id>/<timestamp>/     # Linux
+~/.local/share/hoard/conflicts/<save_id>/<timestamp>/                            # Linux
+%APPDATA%\hoard\hoard\data\conflicts\<save_id>\<timestamp>\                      # Windows
+~/Library/Application Support/dev.hoard.hoard/conflicts/<save_id>/<timestamp>/   # macOS
 ```
 
-On Windows and macOS it is the same `conflicts/` folder under the state
-directory the [client-side table](SELF-HOST_GUIDE.md#the-client-side-where-things-live)
-maps to. The notice about the side copy has an *Open side copy* button that
+The notice about the side copy has an *Open side copy* button that
 opens it. The same retention sweep as restore conflicts applies, 14 days by
 default, so copy out anything you want to keep. To bring a side copy back
 into play, host the world and copy the files over the ones in
@@ -267,16 +277,18 @@ into play, host the world and copy the files over the ones in
 *Take over* (the Library row's menu, or `hoard world force <SAVE_ID>`) takes
 a live lease off its holder and makes you the host. It works only while the
 holder has pushed nothing under that lease: a session that has already
-uploaded cannot be taken, and the server refuses with *the host has pushed
-under this lease; it ends when they release it*. The menu shows *Take over
+uploaded cannot be taken, and the app refuses with *The holder already pushed
+under their lease. It can't be taken over; ask them to release it.* (the CLI
+says *<holder> has pushed to <SAVE_ID> under their lease, so it cannot be
+taken; ask them to release it*). The menu shows *Take over
 (<name> pushed)* when that is the case, so you know before you try. Its use
 is a machine that grabbed the lease and then went quiet, or a host who
 launched by mistake; for anything else, ask them to release it.
 
-Hosting also needs your copy to be current: a claim is refused with *the save
-moved past your version: pull before hosting* if the server has a newer
-version than your machine has pulled. Close the game, let the pull happen,
-claim again.
+Hosting also needs your copy to be current: a claim is refused as behind the
+latest version (the CLI says *Hoard is pulling it, then claim again*) if the
+server has a newer version than your machine has pulled. Close the game, let
+the pull happen, claim again.
 
 ### Unshare and leave
 
@@ -296,6 +308,9 @@ they had shared into the group goes back to them.
   its whole save folder, and its members' own profiles in that folder travel
   with it. More templates are a matter of naming the files; ask, or send a
   pull request.
+- **Version history stays the owner's.** Only the save's owner can delete or
+  undelete versions of a shared world; members see its history limited to the
+  world's files.
 - **Self-hosted only.** Sharing is not supported on Hoard Cloud. A client
   signed into both uses it only against the self-hosted server.
 - **Cloudflare's 100 MB body cap.** A proxied hostname on Cloudflare's free
