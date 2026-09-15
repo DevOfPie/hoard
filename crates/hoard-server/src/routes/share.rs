@@ -198,7 +198,7 @@ pub struct PushGate {
     /// server since the base) or the rest (a member).
     carry_world: bool,
     /// The owner's base behind the head that only the world moved past.
-    world_base: Option<i64>,
+    accepted_base: Option<i64>,
 }
 
 /// A row of the head a push does not carry, taken forward as is.
@@ -225,11 +225,17 @@ impl CarriedRow {
 ///
 /// - the manifest's listed files equal the head's: no lease, and the base must
 ///   be the head, as for any push;
-/// - they differ from the head's but equal the base's: the world moved on the
-///   server, not here. No lease. When nothing else moved from the base to the
-///   head the base is accepted and the new version takes the head's world with
-///   the manifest's other files; otherwise the base must be the head;
+/// - they differ from the head's but equal the world base's (`world_base`, or
+///   the base when the client names none): the world moved on the server, not
+///   here. No lease. When the base is the head, or nothing else moved from the
+///   base to the head, the base is accepted and the new version takes the
+///   head's world with the manifest's other files; otherwise the base must be
+///   the head;
 /// - otherwise the owner changed the world, and holds the lease for it.
+///
+/// The world base lets an owner whose push was carried forward take that
+/// version as its base while its folder still holds the older world: its next
+/// push, base the head and world the same, lands too.
 #[allow(clippy::too_many_arguments)]
 pub async fn push_gate(
     conn: &mut SqliteConnection,
@@ -239,6 +245,7 @@ pub async fn push_gate(
     user_id: &str,
     head: i64,
     base: Option<i64>,
+    world_base: Option<i64>,
     files: &[(&str, &str)],
 ) -> Result<PushGate, ApiError> {
     if let Namespace::User(_) = ns {
@@ -268,21 +275,26 @@ pub async fn push_gate(
         {
             return Ok(PushGate::default());
         }
-        if let Some(base) = base.filter(|b| *b < head) {
+        let base = base.filter(|b| *b <= head);
+        let from = world_base
+            .or(base)
+            .filter(|w| *w < head && base.is_some_and(|b| *w <= b));
+        if let (Some(base), Some(from)) = (base, from) {
             if manifest_world
-                == included_rows(conn, save_id, base, &include)
+                == included_rows(conn, save_id, from, &include)
                     .await
                     .map_err(read)?
             {
-                // The world is the base's: this owner did not touch it. Other
-                // files that moved since the base are a plain divergence for
-                // the base check, not a reason to want the lease.
-                let rest_unmoved = excluded_rows(conn, save_id, base, &include)
-                    .await
-                    .map_err(read)?
-                    == excluded_rows(conn, save_id, head, &include)
+                // The world is the world base's: this owner did not touch it.
+                // Other files that moved since the base are a plain divergence
+                // for the base check, not a reason to want the lease.
+                let rest_unmoved = base == head
+                    || excluded_rows(conn, save_id, base, &include)
                         .await
-                        .map_err(read)?;
+                        .map_err(read)?
+                        == excluded_rows(conn, save_id, head, &include)
+                            .await
+                            .map_err(read)?;
                 if !rest_unmoved {
                     return Ok(PushGate::default());
                 }
@@ -290,7 +302,7 @@ pub async fn push_gate(
                     hosted: false,
                     carry_include: include,
                     carry_world: true,
-                    world_base: Some(base),
+                    accepted_base: Some(base),
                 });
             }
         }
@@ -314,7 +326,7 @@ impl PushGate {
         base: i64,
         head: i64,
     ) -> Result<bool, ApiError> {
-        if base == head || self.world_base == Some(base) {
+        if base == head || self.accepted_base == Some(base) {
             return Ok(true);
         }
         if self.carry_world {

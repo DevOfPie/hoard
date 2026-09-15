@@ -182,6 +182,17 @@ async fn backup_as(
     files: &[(&str, &[u8])],
     base: Option<i64>,
 ) -> (Vec<String>, hoard_core::wire::Snapshot) {
+    backup_on(h, who, files, base, None).await
+}
+
+/// [`backup_as`] naming the version the manifest's world came from.
+async fn backup_on(
+    h: &Harness,
+    who: &AuthUser,
+    files: &[(&str, &[u8])],
+    base: Option<i64>,
+    world_base: Option<i64>,
+) -> (Vec<String>, hoard_core::wire::Snapshot) {
     let m = manifest(files);
     let init = cas::init(
         st(h),
@@ -189,6 +200,7 @@ async fn backup_as(
         Path(SAVE.to_string()),
         Json(CasInit {
             base_version: base,
+            world_base_version: world_base,
             files: m.clone(),
         }),
     )
@@ -226,6 +238,7 @@ async fn backup_as(
         Json(CasCommit {
             upload_id: init.upload_id,
             base_version: base,
+            world_base_version: world_base,
             device_name: Some("desk".into()),
             notes: None,
             files: m,
@@ -564,6 +577,7 @@ async fn a_strangers_init_on_a_shared_save_is_404() {
         Path(SAVE.to_string()),
         Json(CasInit {
             base_version: Some(2),
+            world_base_version: None,
             files: manifest(&[("world.db", &f.a)]),
         }),
     )
@@ -749,6 +763,7 @@ async fn a_push_outside_the_include_list_is_refused() {
         Path(SAVE.to_string()),
         Json(CasInit {
             base_version: Some(3),
+            world_base_version: None,
             files: manifest(stray),
         }),
     )
@@ -932,6 +947,7 @@ async fn a_member_cannot_reach_an_excluded_blob_by_its_hash() {
         Path(SAVE.to_string()),
         Json(CasInit {
             base_version: Some(1),
+            world_base_version: None,
             files: m.clone(),
         }),
     )
@@ -951,6 +967,7 @@ async fn a_member_cannot_reach_an_excluded_blob_by_its_hash() {
         Json(CasCommit {
             upload_id: init.upload_id,
             base_version: Some(1),
+            world_base_version: None,
             device_name: Some("desk".into()),
             notes: None,
             files: m,
@@ -1237,6 +1254,7 @@ async fn a_share_between_init_and_commit_is_read_by_the_commit() {
         Path(SAVE.to_string()),
         Json(CasInit {
             base_version: Some(2),
+            world_base_version: None,
             files: m.clone(),
         }),
     )
@@ -1264,6 +1282,7 @@ async fn a_share_between_init_and_commit_is_read_by_the_commit() {
             Json(CasCommit {
                 upload_id: init.upload_id.clone(),
                 base_version: Some(2),
+                world_base_version: None,
                 device_name: Some("desk".into()),
                 notes: None,
                 files: m.clone(),
@@ -1590,13 +1609,27 @@ async fn multipart_as(
     files: &[(&str, &[u8])],
     base: Option<i64>,
 ) -> Result<Snapshot, (StatusCode, serde_json::Value)> {
+    multipart_on(h, who, files, base, None).await
+}
+
+/// [`multipart_as`] naming the version the files' world came from.
+async fn multipart_on(
+    h: &Harness,
+    who: &AuthUser,
+    files: &[(&str, &[u8])],
+    base: Option<i64>,
+    world_base: Option<i64>,
+) -> Result<Snapshot, (StatusCode, serde_json::Value)> {
     use axum::extract::{FromRequest, Multipart};
     let boundary = "hoard-test-boundary";
     let mut body: Vec<u8> = Vec::new();
-    if let Some(b) = base {
+    for (name, value) in [("base_version", base), ("world_base_version", world_base)] {
+        let Some(v) = value else {
+            continue;
+        };
         body.extend(
             format!(
-                "--{boundary}\r\nContent-Disposition: form-data; name=\"base_version\"\r\n\r\n{b}\r\n"
+                "--{boundary}\r\nContent-Disposition: form-data; name=\"{name}\"\r\n\r\n{v}\r\n"
             )
             .as_bytes(),
         );
@@ -1688,6 +1721,7 @@ async fn the_owner_backs_up_the_whole_folder_without_the_lease_while_the_world_i
         Path(SAVE.to_string()),
         Json(CasInit {
             base_version: Some(2),
+            world_base_version: None,
             files: manifest(&with_alpha(&f, &changed)),
         }),
     )
@@ -1986,6 +2020,7 @@ async fn a_member_based_before_an_owner_backup_lands_on_top_of_it() {
         Path(SAVE.to_string()),
         Json(CasInit {
             base_version: Some(2),
+            world_base_version: None,
             files: manifest(&alpha_only(&f, &alpha3)),
         }),
     )
@@ -2124,6 +2159,7 @@ async fn an_owner_behind_a_member_push_who_moved_more_is_refused() {
                 Path(SAVE.to_string()),
                 Json(CasInit {
                     base_version: Some(base),
+                    world_base_version: None,
                     files: manifest(&refs),
                 }),
             )
@@ -2176,6 +2212,120 @@ async fn an_owner_behind_a_member_push_who_moved_more_is_refused() {
     );
     let lease = lease_as(&h, &h.owner).await.expect("still hosted");
     assert_eq!(lease.holder_user_id, MEMBER);
+}
+
+/// The folder with the character replaced by `character`.
+fn with_character<'a>(
+    files: &[(&'static str, &'a [u8])],
+    character: &'a [u8],
+) -> Vec<(&'static str, &'a [u8])> {
+    files
+        .iter()
+        .map(|(p, b)| {
+            (
+                *p,
+                if *p == "characters_local/x.fch" {
+                    character
+                } else {
+                    b
+                },
+            )
+        })
+        .collect()
+}
+
+/// The owner's push the server carried a member's world into is the base of
+/// its next one, while its folder still holds the older world. Named as the
+/// world base, that push lands without the lease too: v1 synced, the member
+/// hosts v2, the owner's character goes up as v3 and again as v4 on base 3.
+/// Without the world base the second push is the divergence it was before.
+async fn an_owner_behind_a_member_push_backs_up_twice(multipart: bool) {
+    let h = harness().await;
+    let f = Folder::new();
+    folder_shared_as_alpha(&h, &f).await;
+    acquire_as(&h, &h.member, 1).await.expect("hosting");
+    let alpha2 = vec![9u8; 7_000];
+    let (_, snap) = backup_as(&h, &h.member, &alpha_only(&f, &alpha2), Some(1)).await;
+    assert_eq!(snap.version_num, 2);
+
+    let first = b"alice levelled up".to_vec();
+    let (_, snap) = backup_as(&h, &h.owner, &with_character(&f.files(), &first), Some(1)).await;
+    assert_eq!(snap.version_num, 3);
+
+    let second = b"alice levelled up twice".to_vec();
+    let files = with_character(&f.files(), &second);
+    let init = |base: i64, world_base: Option<i64>, files: Vec<(&'static str, Vec<u8>)>| {
+        let h = &h;
+        async move {
+            let refs: Vec<(&str, &[u8])> = files.iter().map(|(p, b)| (*p, &b[..])).collect();
+            match cas::init(
+                st(h),
+                Extension(h.owner.clone()),
+                Path(SAVE.to_string()),
+                Json(CasInit {
+                    base_version: Some(base),
+                    world_base_version: world_base,
+                    files: manifest(&refs),
+                }),
+            )
+            .await
+            {
+                Err(e) => (e.0, e.1 .0["code"].as_str().unwrap_or_default().to_string()),
+                Ok(_) => panic!("accepted"),
+            }
+        }
+    };
+    let owned = |files: &[(&'static str, &[u8])]| -> Vec<(&'static str, Vec<u8>)> {
+        files.iter().map(|(p, b)| (*p, b.to_vec())).collect()
+    };
+    // An older client still sends base 1: v3's character is not v1's.
+    assert_eq!(
+        init(1, None, owned(&files)).await,
+        (StatusCode::CONFLICT, "non_fast_forward".to_string())
+    );
+
+    let snap = if multipart {
+        multipart_on(&h, &h.owner, &files, Some(3), Some(1))
+            .await
+            .expect("multipart push")
+    } else {
+        backup_on(&h, &h.owner, &files, Some(3), Some(1)).await.1
+    };
+    assert_eq!(snap.version_num, 4);
+    let v4 = detail_files_as(&h, &h.owner, 4).await;
+    assert_eq!(v4.len(), 5, "{v4:?}");
+    assert!(v4.contains(&("worlds_local/Alpha.db".into(), sha_of(&alpha2))));
+    assert!(v4.contains(&("characters_local/x.fch".into(), sha_of(&second))));
+    assert!(v4.contains(&("worlds_local/Beta.db".into(), sha_of(&f.beta_db))));
+    let lease = lease_as(&h, &h.owner).await.expect("still hosted");
+    assert_eq!(lease.holder_user_id, MEMBER);
+
+    // The owner who changed the world still needs the lease for it.
+    let changed = vec![18u8; 7_000];
+    let world_changed = with_character(&with_alpha(&f, &changed), &second);
+    assert_eq!(
+        init(4, Some(1), owned(&world_changed)).await,
+        (StatusCode::CONFLICT, "lease_required".to_string())
+    );
+    assert_eq!(
+        count(
+            &h.state.pool,
+            "SELECT COUNT(*) FROM snapshots WHERE save_id=?",
+            SAVE
+        )
+        .await,
+        4
+    );
+}
+
+#[tokio::test]
+async fn an_owner_behind_a_member_push_backs_up_twice_before_the_pull() {
+    an_owner_behind_a_member_push_backs_up_twice(false).await;
+}
+
+#[tokio::test]
+async fn an_owner_behind_a_member_push_backs_up_twice_through_the_multipart_too() {
+    an_owner_behind_a_member_push_backs_up_twice(true).await;
 }
 
 /// Only the save's owner reads `caller_owns`, in the list and on its own.

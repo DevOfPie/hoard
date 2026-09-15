@@ -608,6 +608,12 @@ pub struct CasInit {
     /// this is rejected, here *before* a byte moves, which is the whole point.
     #[serde(default)]
     pub base_version: Option<i64>,
+    /// The version the manifest's shared world came from, when it is not
+    /// `base_version`: an owner who took a version the server carried a newer
+    /// world into as its base, before that world came down (HRD-D-0019).
+    /// Absent from older clients, which means the base's world.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub world_base_version: Option<i64>,
     pub files: Vec<CasFile>,
 }
 
@@ -648,6 +654,9 @@ pub struct CasCommit {
     pub upload_id: String,
     #[serde(default)]
     pub base_version: Option<i64>,
+    /// As in [`CasInit::world_base_version`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub world_base_version: Option<i64>,
     #[serde(default)]
     pub device_name: Option<String>,
     #[serde(default)]

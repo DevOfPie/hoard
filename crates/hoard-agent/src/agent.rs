@@ -937,6 +937,10 @@ struct BackupDone {
     /// tell this no-op from the 409 settled onto the head: that one wrote into the
     /// folder (and stamps `last_restore_at`), this one touched nothing.
     landed: bool,
+    /// The version an owner's push made with the head's world carried in
+    /// (HRD-D-0019). Not adopted as synced, since the folder's world is older,
+    /// but the next push bases on it: [`SaveSlot::version_base`].
+    carried_version: Option<i64>,
 }
 
 /// Internal per-save bookkeeping.
@@ -1124,6 +1128,12 @@ pub(crate) struct SaveSlot {
     /// (another device committed a higher version) still pulls; our own folder
     /// churn no longer does.
     pub(crate) known_version: Option<i64>,
+    /// The version an owner's last push made with the head's world carried in,
+    /// while the folder still holds the world of `known_version` (HRD-D-0019).
+    /// The next push bases on it and names `known_version` as its world base,
+    /// so the server does not read the owner's own push as a divergence.
+    /// Cleared whenever `known_version` moves: a pull or an ordinary push.
+    pub(crate) version_base: Option<i64>,
     /// A cross-device update is waiting to land in this slot, but a pull was vetoed
     /// by [`mid_session_reason`]. Set instead of dropping the `ForceRestore`
     /// outright: "the sweep re-runs every tick, so it lands as soon as the session
@@ -1308,6 +1318,7 @@ fn apply_state_to_slot(slot: &mut SaveSlot, next: kernel::State) {
     // not before: the request is re-armed with the version, nowhere else.
     if slot.known_version != next.known_version {
         slot.lease_requested = false;
+        slot.version_base = None;
     }
     slot.known_version = next.known_version;
     slot.synced_fingerprint = next.synced_fingerprint;
@@ -2130,7 +2141,7 @@ fn execute_backup(
     slot.next_scheduled_backup_at = None;
     let save = slot.save.clone();
     let prev_set_hash = slot.last_set_hash.clone();
-    let base_version = slot.known_version;
+    let (base_version, world_base_version) = push_bases(slot);
     // The owner's push is held rather than reconciled into a live folder when
     // the head moved (HRD-D-0019, resolution 2).
     let hold_when_behind = slot.save.owns_whole_folder() && slot.is_running;
@@ -2158,6 +2169,7 @@ fn execute_backup(
             save,
             prev_set_hash,
             base_version,
+            world_base_version,
             head,
             origin,
             hold_when_behind,
@@ -3142,11 +3154,29 @@ pub(crate) fn world_pending(slot: &SaveSlot) -> bool {
 }
 
 /// Did the server carry the head's world into this owner's push instead of
-/// the one it sent (HRD-D-0019)? It lands an owner's push on a base behind
-/// the head only when nothing but the world moved in between, so the version
-/// it makes is past `base + 1` exactly then.
-pub(crate) fn world_carried_forward(save: &WatchedSave, base: Option<i64>, version: i64) -> bool {
-    save.owns_whole_folder() && base.is_some_and(|b| version > b + 1)
+/// the one it sent (HRD-D-0019)? `world_base` is the version the folder's
+/// world came from: the push's world base, or its base when it named none.
+/// Every other push lands on the head, so the version it makes is past
+/// `world_base + 1` only when the world moved on the server since. The one
+/// exception, a head whose world came back to the folder's, reads as carried
+/// too, which costs a pull that writes nothing.
+pub(crate) fn world_carried_forward(
+    save: &WatchedSave,
+    world_base: Option<i64>,
+    version: i64,
+) -> bool {
+    save.owns_whole_folder() && world_base.is_some_and(|b| version > b + 1)
+}
+
+/// The base a push declares and, apart from it, the world's base. After a
+/// push the server carried the head's world into, the base is that version and
+/// the world's base the one the folder synced (HRD-D-0019); otherwise the base
+/// is the synced version and names the world too.
+pub(crate) fn push_bases(slot: &SaveSlot) -> (Option<i64>, Option<i64>) {
+    match (slot.known_version, slot.version_base) {
+        (Some(known), Some(carried)) => (Some(carried), Some(known)),
+        (known, _) => (known, None),
+    }
 }
 
 /// A finished upload, translated for the reducer (ADR 0021 D.7): `committed`
@@ -3174,6 +3204,10 @@ fn apply_backup_done(slot: &mut SaveSlot, done: BackupDone) {
     // `last_restore_at`.
     if done.landed {
         slot.pending_upload_landed = Some(true);
+    }
+    // `known_version` stays, and with it the pull; the next push bases here.
+    if done.carried_version.is_some() {
+        slot.version_base = done.carried_version;
     }
 }
 
@@ -3254,6 +3288,7 @@ fn handle_add(
         last_restore_error: None,
         last_conflict_error: None,
         known_version,
+        version_base: None,
         pull_pending: false,
         deferred_notified: false,
         lease: kernel::LeaseObs::Unknown,
@@ -4607,6 +4642,10 @@ async fn run_backup_with_retry(
     // `None` only for a save never synced from this device (no head yet) and the
     // empty/missing-folder restore path, which never uploads.
     mut base_version: Option<i64>,
+    // The version the folder's shared world came from when it is not the base:
+    // an owner's push the server carried the head's world into became the base
+    // (HRD-D-0019). A reconcile below syncs the folder and drops it.
+    mut world_base_version: Option<i64>,
     // The server's head (version plus its content's digest) for D.8.3's anti-relaunch
     // check: if what we were about to upload is already that head, the previous upload
     // landed and uploading again would only create a duplicate version.
@@ -4644,6 +4683,7 @@ async fn run_backup_with_retry(
             new_world_hash: None,
             committed: false,
             version_num: None,
+            carried_version: None,
             landed: false,
         });
         if !auto_restore {
@@ -4686,6 +4726,7 @@ async fn run_backup_with_retry(
             // which the `ApiError::Conflict` arm below catches to reconcile +
             // retry instead of clobbering the newer remote version.
             base_version,
+            world_base_version,
             head.as_ref(),
             origin,
             |_, _| {},
@@ -4720,6 +4761,7 @@ async fn run_backup_with_retry(
                     new_world_hash: Some(world),
                     committed: false,
                     version_num: None,
+                    carried_version: None,
                     landed: false,
                 });
                 return;
@@ -4739,6 +4781,7 @@ async fn run_backup_with_retry(
                     new_world_hash: Some(world),
                     committed: false,
                     version_num: None,
+                    carried_version: None,
                     landed: false,
                 });
                 return;
@@ -4784,6 +4827,7 @@ async fn run_backup_with_retry(
                     // regression (D.8.2). The version is adopted, though.
                     committed: false,
                     version_num: Some(version_num),
+                    carried_version: None,
                     landed: true,
                 });
                 return;
@@ -4793,8 +4837,11 @@ async fn run_backup_with_retry(
                 signature,
                 world,
             }) => {
-                let world_behind =
-                    world_carried_forward(&save, base_version, o.snapshot.version_num);
+                let world_behind = world_carried_forward(
+                    &save,
+                    world_base_version.or(base_version),
+                    o.snapshot.version_num,
+                );
                 if world_behind {
                     tracing::info!(
                         save_id = %save.save_id,
@@ -4874,13 +4921,15 @@ async fn run_backup_with_retry(
                 // ahead and gets pulled, and the world's fingerprint stays the
                 // base's, which is still what the folder holds. The folder's
                 // own signature is adopted: what it has went up, and the pull
-                // must not wait on it.
+                // must not wait on it. The version becomes the next push's
+                // base, so a second push before the pull lands too.
                 let _ = done_tx.try_send(BackupDone {
                     save_id: save.save_id.clone(),
                     new_set_hash: Some(signature),
                     new_world_hash: (!world_behind).then_some(world),
                     committed: true,
                     version_num: (!world_behind).then_some(o.snapshot.version_num),
+                    carried_version: world_behind.then_some(o.snapshot.version_num),
                     landed: false,
                 });
                 return;
@@ -5045,6 +5094,7 @@ async fn run_backup_with_retry(
                                         new_world_hash: outcome.disk_world_hash.clone(),
                                         committed: false,
                                         version_num: Some(outcome.version_num),
+                                        carried_version: None,
                                         landed: false,
                                     })
                                     .await;
@@ -5059,6 +5109,7 @@ async fn run_backup_with_retry(
                             // left stale so the retry sees the divergence and
                             // uploads.
                             base_version = Some(outcome.version_num);
+                            world_base_version = None;
                             continue;
                         }
                         // The reconcile pulled nothing because this folder
@@ -5088,6 +5139,7 @@ async fn run_backup_with_retry(
                                 "agent: backup conflict: the local tree already holds head; fast-forwarding the base and retrying"
                             );
                             base_version = Some(version_num);
+                            world_base_version = None;
                             continue;
                         }
                         // The server named head 0: the save it is holding for
@@ -5112,6 +5164,7 @@ async fn run_backup_with_retry(
                                 "agent: backup conflict: the server has no history for this save; restarting from version 1"
                             );
                             base_version = Some(0);
+                            world_base_version = None;
                             continue;
                         }
                         Ok(AutoRestorePull::AlreadyAtHead { .. })
@@ -5247,6 +5300,7 @@ async fn run_backup_with_retry(
                         new_world_hash: None,
                         committed: false,
                         version_num: None,
+                        carried_version: None,
                         landed: false,
                     });
                     return;
@@ -5290,6 +5344,7 @@ async fn run_backup_with_retry(
                         new_world_hash: None,
                         committed: false,
                         version_num: None,
+                        carried_version: None,
                         landed: false,
                     });
                     let _ = events_tx
@@ -5366,6 +5421,7 @@ async fn run_backup_with_retry(
                         new_world_hash: None,
                         committed: false,
                         version_num: None,
+                        carried_version: None,
                         landed: false,
                     });
                     return;
@@ -5394,6 +5450,7 @@ async fn run_backup_with_retry(
                         new_world_hash: None,
                         committed: false,
                         version_num: None,
+                        carried_version: None,
                         landed: false,
                     });
                     return;
@@ -5435,6 +5492,7 @@ async fn run_backup_with_retry(
                         new_world_hash: None,
                         committed: false,
                         version_num: None,
+                        carried_version: None,
                         landed: false,
                     });
                     let _ = events_tx
@@ -6504,6 +6562,7 @@ pub(crate) fn test_slot(save: WatchedSave) -> SaveSlot {
         last_restore_error: None,
         last_conflict_error: None,
         known_version: None,
+        version_base: None,
         pull_pending: false,
         deferred_notified: false,
         lease: kernel::LeaseObs::Unknown,
@@ -7759,6 +7818,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             VersionOrigin::Automatic,
             false,
             events_tx,
@@ -7846,6 +7906,7 @@ mod tests {
             "main",
             root,
             Some(prev),
+            None,
             None,
             None,
             VersionOrigin::Automatic,
@@ -8094,6 +8155,7 @@ mod tests {
             None,
             Some(3),
             None,
+            None,
             VersionOrigin::Automatic,
             hold_when_behind,
             events_tx,
@@ -8241,6 +8303,7 @@ mod tests {
             None,
             slot.known_version,
             None,
+            None,
             VersionOrigin::Automatic,
             false,
             events_tx,
@@ -8294,6 +8357,137 @@ mod tests {
         let ds = tick(&mut held, &cloud, later + time::Duration::seconds(1));
         assert!(no_lease_hold(&ds), "{ds:?}");
         assert!(!ds.contains(&Decision::Act(Action::Backup)), "{ds:?}");
+    }
+
+    const INIT_V6: &str = r#"{"upload_id":"u2","version_num":6,"missing":[],"missing_bytes":0}"#;
+    const COMMIT_V6: &str = r#"{"id":"s6","version_num":6,"parent_version":5,"total_size_bytes":30,"file_count":3,"is_pinned":false,"created_at":"2026-09-14T09:20:11Z"}"#;
+
+    /// Medium 1 of the review of b0cfdf6: the owner synced at v3 plays while a
+    /// member hosts v4. Two character autosaves both go out: the first as v5
+    /// with the member's world carried in, the second on base 5 naming v3 as
+    /// its world's base, not held as behind. Once the game closes the pull
+    /// brings the member's world and the push bases are the synced version
+    /// again.
+    #[tokio::test(flavor = "current_thread")]
+    async fn an_owner_playing_behind_a_members_push_backs_up_every_autosave() {
+        use kernel::{Action, Decision};
+
+        fn tick(slot: &mut SaveSlot, cloud: &CloudHeads, now: OffsetDateTime) -> Vec<Decision> {
+            let obs = observe_slot(slot, cloud);
+            let state = state_from_slot(slot, &AgentConfig::default(), now);
+            let (next, ds) =
+                kernel::reconcile::reconcile(&state, &obs, kernel::World { now, seed: 0 });
+            apply_state_to_slot(slot, next);
+            ds
+        }
+        async fn push(
+            slot: &SaveSlot,
+            answers: Vec<(u16, &'static str)>,
+        ) -> (BackupDone, Vec<(String, String)>) {
+            let (url, seen) = refusing_server(answers).await;
+            let api = ApiClient::new(&url, "fake").unwrap();
+            let (events_tx, _events_rx) = mpsc::channel(64);
+            let (done_tx, mut done_rx) = mpsc::channel(8);
+            let (cmd_tx, mut cmd_rx) = mpsc::channel(8);
+            let (base, world_base) = push_bases(slot);
+            run_backup_with_retry(
+                api,
+                slot.save.clone(),
+                slot.last_set_hash.clone(),
+                base,
+                world_base,
+                None,
+                VersionOrigin::Automatic,
+                slot.save.owns_whole_folder() && slot.is_running,
+                events_tx,
+                done_tx,
+                cmd_tx,
+                0,
+                false,
+                None,
+                14,
+            )
+            .await;
+            assert!(cmd_rx.try_recv().is_err(), "no hold, no retry");
+            let seen = seen.lock().unwrap().clone();
+            (done_rx.try_recv().expect("the push landed"), seen)
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        owner_folder(root);
+        let mut save = owner_save(root);
+        save.policy.auto_restore = Some(true);
+        let mut slot = test_slot(save);
+        slot.known_version = Some(3);
+        slot.lease = kernel::LeaseObs::Other;
+        slot.is_running = true;
+        test_sync_now(&mut slot);
+        let world = slot.synced_world_fingerprint;
+        let t0 = OffsetDateTime::now_utc();
+        let mut cloud = CloudHeads::new(t0);
+        cloud.feed(HashMap::from([("w1".to_string(), 4)]), None, None, t0);
+
+        write_file(&root.join("characters_local/Me.fch"), b"me, levelled up");
+        mark_fs_hit(&mut slot, t0);
+        let ds = tick(&mut slot, &cloud, t0 + time::Duration::seconds(1));
+        assert!(ds.contains(&Decision::Act(Action::Backup)), "{ds:?}");
+        let (done, seen) = push(&slot, vec![(200, INIT_V5), (201, COMMIT_V5)]).await;
+        assert!(seen[0].1.contains(r#""base_version":3"#), "{seen:?}");
+        assert!(!seen[0].1.contains("world_base_version"), "{seen:?}");
+        assert_eq!((done.version_num, done.carried_version), (None, Some(5)));
+        apply_backup_done(&mut slot, done);
+        let t1 = t0 + time::Duration::hours(1);
+        cloud.feed(HashMap::from([("w1".to_string(), 5)]), None, None, t1);
+        let ds = tick(&mut slot, &cloud, t1);
+        assert!(!ds.contains(&Decision::Act(Action::Restore)), "{ds:?}");
+        assert!(!slot.has_pending);
+        assert_eq!((slot.known_version, slot.version_base), (Some(3), Some(5)));
+        assert_eq!(push_bases(&slot), (Some(5), Some(3)));
+
+        write_file(
+            &root.join("characters_local/Me.fch"),
+            b"me, levelled up twice",
+        );
+        mark_fs_hit(&mut slot, t1);
+        let ds = tick(&mut slot, &cloud, t1 + time::Duration::seconds(1));
+        assert!(ds.contains(&Decision::Act(Action::Backup)), "{ds:?}");
+        let (done, seen) = push(&slot, vec![(200, INIT_V6), (201, COMMIT_V6)]).await;
+        for (_, body) in &seen {
+            assert!(body.contains(r#""base_version":5"#), "{seen:?}");
+            assert!(body.contains(r#""world_base_version":3"#), "{seen:?}");
+        }
+        assert_eq!(seen.len(), 2, "{seen:?}");
+        assert_eq!((done.version_num, done.carried_version), (None, Some(6)));
+        apply_backup_done(&mut slot, done);
+        let t2 = t1 + time::Duration::hours(1);
+        cloud.feed(HashMap::from([("w1".to_string(), 6)]), None, None, t2);
+        let ds = tick(&mut slot, &cloud, t2);
+        assert!(!ds.contains(&Decision::Act(Action::Restore)), "{ds:?}");
+        assert_eq!((slot.known_version, slot.version_base), (Some(3), Some(6)));
+        assert_eq!(slot.synced_world_fingerprint, world);
+
+        // The game closed: the head comes down, with the member's world.
+        slot.is_running = false;
+        let t3 = t2 + time::Duration::hours(1);
+        let ds = tick(&mut slot, &cloud, t3);
+        assert!(ds.contains(&Decision::Act(Action::Restore)), "{ds:?}");
+        write_file(&root.join("worlds_local/Alpha.db"), b"alpha, the member's");
+        let (whole, pulled) =
+            observe_local_fingerprint(root, "valheim", &slot.save.include, slot.save.world())
+                .unwrap();
+        assert_ne!(Some(pulled), world);
+        slot.pending_op_result = Some(kernel::OpResult::Ok {
+            version: Some(6),
+            fingerprint: Some(whole),
+            wrote: true,
+            world_fingerprint: Some(pulled),
+        });
+        slot.needs_l1 = true;
+        tick(&mut slot, &cloud, t3 + time::Duration::seconds(1));
+        assert_eq!((slot.known_version, slot.version_base), (Some(6), None));
+        assert_eq!(slot.synced_world_fingerprint, Some(pulled));
+        assert_eq!(push_bases(&slot), (Some(6), None));
     }
 
     /// Finding 2 of the third end-to-end run: sharing a tracked, synced save

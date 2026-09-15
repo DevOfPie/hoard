@@ -339,6 +339,7 @@ pub async fn init(
         &user_id,
         head,
         body.base_version,
+        body.world_base_version,
         &manifest_rows(&body.files),
     )
     .await?;
@@ -1053,6 +1054,7 @@ pub async fn commit(
         &user_id,
         head,
         body.base_version,
+        body.world_base_version,
         &manifest_rows(&body.files),
     )
     .await

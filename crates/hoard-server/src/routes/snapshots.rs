@@ -279,6 +279,9 @@ pub async fn create(
     // for this save). When present and it no longer matches the server's head,
     // another device advanced the save → non-fast-forward, rejected below.
     let mut base_version: Option<i64> = None;
+    // The version the folder's shared world came from, when the client names
+    // one apart from the base (`share::push_gate`).
+    let mut world_base_version: Option<i64> = None;
     let mut files: Vec<(String, i64, String)> = Vec::new(); // (rel_path, size, sha256)
     let mut total_size: i64 = 0;
 
@@ -304,6 +307,14 @@ pub async fn create(
         }
         if name == "base_version" {
             base_version = field
+                .text()
+                .await
+                .ok()
+                .and_then(|s| s.trim().parse::<i64>().ok());
+            continue;
+        }
+        if name == "world_base_version" {
+            world_base_version = field
                 .text()
                 .await
                 .ok()
@@ -718,6 +729,7 @@ pub async fn create(
         &user_id,
         head,
         base_version,
+        world_base_version,
         &manifest,
     )
     .await

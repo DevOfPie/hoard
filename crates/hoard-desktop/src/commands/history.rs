@@ -459,6 +459,7 @@ pub async fn restore_snapshot(
                 // Pre-restore safety backup is an explicit user action; don't
                 // gate it on fast-forward.
                 None,
+                None,
                 // No re-upload check either (ADR 0021 D.8.3): this safety copy has
                 // to exist as a version of its own before the folder is overwritten,
                 // even when its content matches the head.

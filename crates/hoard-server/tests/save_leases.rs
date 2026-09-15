@@ -192,6 +192,7 @@ async fn init_as(
         path(),
         Json(CasInit {
             base_version: base,
+            world_base_version: None,
             files: manifest(files),
         }),
     )
@@ -214,6 +215,7 @@ async fn commit_as(
         Json(CasCommit {
             upload_id,
             base_version: base,
+            world_base_version: None,
             device_name: Some("desk".into()),
             notes: None,
             files: manifest(files),

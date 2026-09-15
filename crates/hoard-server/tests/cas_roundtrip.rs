@@ -183,6 +183,7 @@ async fn backup_at(
         Path(SAVE.to_string()),
         Json(CasInit {
             base_version: base,
+            world_base_version: None,
             files: m.clone(),
         }),
     )
@@ -217,6 +218,7 @@ async fn backup_at(
         Json(CasCommit {
             upload_id: init.upload_id,
             base_version: base,
+            world_base_version: None,
             device_name: Some("ubserver".into()),
             notes: None,
             files: m,
@@ -357,6 +359,7 @@ async fn bytes_that_dont_match_their_sha_are_refused() {
         Path(SAVE.to_string()),
         Json(CasInit {
             base_version: Some(0),
+            world_base_version: None,
             files: m.clone(),
         }),
     )
@@ -387,6 +390,7 @@ async fn bytes_that_dont_match_their_sha_are_refused() {
         Json(CasCommit {
             upload_id: init.upload_id,
             base_version: Some(0),
+            world_base_version: None,
             device_name: None,
             notes: None,
             files: m,
@@ -425,6 +429,7 @@ async fn a_diverged_base_passes_when_the_manifest_carries_the_whole_head() {
         Path(SAVE.to_string()),
         Json(CasInit {
             base_version: Some(0),
+            world_base_version: None,
             files: manifest(&[("save", &old), ("otro", &extra)]),
         }),
     )
@@ -443,6 +448,7 @@ async fn a_diverged_base_passes_when_the_manifest_carries_the_whole_head() {
         Path(SAVE.to_string()),
         Json(CasInit {
             base_version: Some(0),
+            world_base_version: None,
             files: manifest(&[("otro", &extra)]),
         }),
     )
@@ -468,6 +474,7 @@ async fn a_diverged_head_is_refused_before_and_after_the_upload() {
         Path(SAVE.to_string()),
         Json(CasInit {
             base_version: Some(0),
+            world_base_version: None,
             files: m.clone(),
         }),
     )
@@ -492,6 +499,7 @@ async fn a_diverged_head_is_refused_before_and_after_the_upload() {
         Path(SAVE.to_string()),
         Json(CasInit {
             base_version: Some(1),
+            world_base_version: None,
             files: m.clone(),
         }),
     )
@@ -510,6 +518,7 @@ async fn a_diverged_head_is_refused_before_and_after_the_upload() {
         Json(CasCommit {
             upload_id: init.upload_id,
             base_version: Some(1),
+            world_base_version: None,
             device_name: None,
             notes: None,
             files: m,
@@ -541,6 +550,7 @@ async fn the_snapshot_cap_is_answered_before_any_byte_moves() {
         Path(SAVE.to_string()),
         Json(CasInit {
             base_version: Some(0),
+            world_base_version: None,
             files,
         }),
     )
@@ -574,6 +584,7 @@ async fn another_users_upload_area_is_not_reachable() {
         Path(SAVE.to_string()),
         Json(CasInit {
             base_version: Some(0),
+            world_base_version: None,
             files: manifest(&[("save", &data)]),
         }),
     )
@@ -676,6 +687,7 @@ async fn a_compressed_blob_is_decoded_before_it_is_stored() {
         Path(SAVE.to_string()),
         Json(CasInit {
             base_version: None,
+            world_base_version: None,
             files: vec![CasFile {
                 relative_path: "save.dat".into(),
                 sha256: Sha256Hex::parse(&sha).unwrap(),
@@ -712,6 +724,7 @@ async fn a_compressed_blob_is_decoded_before_it_is_stored() {
         Json(CasCommit {
             upload_id: init.upload_id.clone(),
             base_version: None,
+            world_base_version: None,
             device_name: None,
             notes: None,
             files: vec![CasFile {
@@ -749,6 +762,7 @@ async fn compressed_bytes_without_the_header_are_rejected() {
         Path(SAVE.to_string()),
         Json(CasInit {
             base_version: None,
+            world_base_version: None,
             files: vec![CasFile {
                 relative_path: "save.dat".into(),
                 sha256: Sha256Hex::parse(&sha).unwrap(),

@@ -999,6 +999,7 @@ pub(crate) fn on_side_copied(
         // are marked again once it lands (HRD-D-0019).
         slot.recheck_pending_after_pull = slot.save.owns_whole_folder();
         slot.known_version = None;
+        slot.version_base = None;
         slot.pull_pending = true;
         slot.last_restore_at = Some(OffsetDateTime::now_utc());
         slot.side_copy_landed_at = Some(now);

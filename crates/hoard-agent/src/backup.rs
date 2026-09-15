@@ -791,6 +791,9 @@ pub async fn upload_directory<F>(
     label: &str,
     source: &Path,
     base_version: Option<i64>,
+    // The version the folder's shared world came from, sent only when it is
+    // not the base (HRD-D-0019). Self-hosted only; Cloud has no shares.
+    world_base_version: Option<i64>,
     head: Option<&ServerHead>,
     origin: VersionOrigin,
     progress: F,
@@ -902,6 +905,7 @@ where
             &files,
             total_bytes,
             base_version,
+            world_base_version,
             origin,
             progress,
         )
@@ -922,6 +926,9 @@ where
     // (another device advanced this save since we last synced).
     if let Some(b) = base_version {
         form = form.text("base_version", b.to_string());
+    }
+    if let Some(w) = world_base_version {
+        form = form.text("world_base_version", w.to_string());
     }
     // Who uploads. The column has existed since day one and the server stores and
     // returns it; what was missing was somebody filling it in, so the history could
@@ -1046,12 +1053,14 @@ async fn hash_manifest(files: &[UploadFile]) -> Result<HashMap<&str, String>> {
 /// it deduplicated on store rather than in transit, so a 3 GB save with 10 MB of
 /// changes cost 3 GB of upload and ran into `max_snapshot_size_mb` and any
 /// proxy's body limit along the way.
+#[allow(clippy::too_many_arguments)]
 async fn upload_directory_cas<F>(
     client: &ApiClient,
     save_id: &str,
     files: &[UploadFile],
     total_bytes: u64,
     base_version: Option<i64>,
+    world_base_version: Option<i64>,
     origin: VersionOrigin,
     progress: F,
 ) -> Result<UploadOutcome>
@@ -1083,6 +1092,7 @@ where
             save_id,
             &CasInit {
                 base_version,
+                world_base_version,
                 files: manifest.clone(),
             },
         )
@@ -1238,6 +1248,7 @@ where
             &CasCommit {
                 upload_id: init.upload_id,
                 base_version,
+                world_base_version,
                 device_name: crate::logship::device_name(),
                 notes: origin.as_note().map(str::to_string),
                 files: manifest,
@@ -2039,6 +2050,7 @@ pub async fn upload_directory_checked<F, G>(
     source: &Path,
     prev_signature: Option<&str>,
     base_version: Option<i64>,
+    world_base_version: Option<i64>,
     head: Option<&ServerHead>,
     origin: VersionOrigin,
     progress: F,
@@ -2117,6 +2129,7 @@ where
         label,
         &canonical,
         base_version,
+        world_base_version,
         head,
         origin,
         progress,
@@ -2671,6 +2684,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             VersionOrigin::Automatic,
             |_, _| {},
             || {},
@@ -2702,6 +2716,7 @@ mod tests {
             &[],
             "main",
             &save_dir,
+            None,
             None,
             None,
             None,
