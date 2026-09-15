@@ -466,6 +466,7 @@ impl Request {
             Request::ApplyUpdate { .. } => "apply_update",
             Request::SnoozeUpdate { .. } => "snooze_update",
             Request::ClaimWorld { .. } => "claim_world",
+            Request::DismissWorld { .. } => "dismiss_world",
             Request::ReleaseWorld { .. } => "release_world",
             Request::ForceWorld { .. } => "force_world",
             Request::ListGroups => "list_groups",
@@ -1602,7 +1603,7 @@ mod tests {
     /// no sample fails the coverage check.
     #[test]
     fn every_request_kind_is_its_serde_tag() {
-        const VARIANTS: usize = 33;
+        const VARIANTS: usize = 34;
         fn index(r: &Request) -> usize {
             match r {
                 Request::Ping => 0,
@@ -1638,6 +1639,7 @@ mod tests {
                 Request::UnshareSave { .. } => 30,
                 Request::GetLease { .. } => 31,
                 Request::Unknown => 32,
+                Request::DismissWorld { .. } => 33,
             }
         }
 
@@ -1704,9 +1706,13 @@ mod tests {
             Request::ShareSave {
                 save_id: id(),
                 group_id: "g1".into(),
+                world: None,
             },
             Request::UnshareSave { save_id: id() },
             Request::GetLease { save_id: id() },
+            Request::DismissWorld {
+                save_id: "s1".into(),
+            },
             Request::Unknown,
         ];
 
