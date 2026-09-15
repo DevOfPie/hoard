@@ -319,8 +319,10 @@ async fn the_world_and_group_verbs_round_trip_and_want_an_engine() {
     assert_eq!(pid, std::process::id());
 }
 
-/// `GetLease` is answered, and promptly: with no engine it is an error the user
-/// can read, never a reply the client waits out its timeout for.
+/// With no engine, `GetLease` is refused promptly with an error the user can
+/// read, and the connection stays up. The engine is never reached, so no lease
+/// payload is built here: that it encodes is pinned by `the_lease_payload_is_frozen`
+/// and `every_payload_round_trips_through_a_frame` in `hoard_core::ipc`.
 #[tokio::test]
 async fn asking_who_hosts_without_an_engine_answers_promptly() {
     let fx = Fixture::start();

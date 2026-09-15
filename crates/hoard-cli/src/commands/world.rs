@@ -131,7 +131,7 @@ pub async fn run(cmd: WorldCommand) -> Result<()> {
             let outcome = match role {
                 WorldRole::View => Outcome::Viewing,
                 WorldRole::Host => {
-                    let verdict = wait_for_verdict(&mut client, &save_id).await;
+                    let verdict = wait_for_verdict(&mut client, &save_id, Wait::default()).await;
                     outcome_of(&save_id, verdict, false)?
                 }
             };
@@ -148,6 +148,26 @@ pub async fn run(cmd: WorldCommand) -> Result<()> {
             emit(save_id, Outcome::Releasing, false)
         }
         WorldCommand::Force { save_id } => {
+            // Who holds it as the force goes out. The server keeps naming them
+            // until the engine's call lands, which can be well behind.
+            let forced = match lease(&mut client, &save_id).await {
+                Ok(l) => {
+                    let engine = match link::ask(&mut client, Request::Status).await {
+                        Ok(Payload::Status(status)) => Hosts::from_status(&status).lease(&save_id),
+                        _ => None,
+                    };
+                    match seen(
+                        l.as_ref(),
+                        engine,
+                        &this_device(),
+                        this_account().as_deref(),
+                    ) {
+                        Seen::Other { holder, .. } => Some(holder),
+                        _ => None,
+                    }
+                }
+                Err(_) => None,
+            };
             link::ask(
                 &mut client,
                 Request::ForceWorld {
@@ -155,7 +175,7 @@ pub async fn run(cmd: WorldCommand) -> Result<()> {
                 },
             )
             .await?;
-            let verdict = wait_for_verdict(&mut client, &save_id).await;
+            let verdict = wait_for_verdict(&mut client, &save_id, Wait::forcing(forced)).await;
             let outcome = outcome_of(&save_id, verdict, true)?;
             emit(save_id, outcome, true)
         }
@@ -264,13 +284,32 @@ pub enum Verdict {
 /// look cannot tell that from a refusal.
 #[derive(Default)]
 struct Wait {
+    /// For `force`: the holder the force was sent against. The engine sends it
+    /// behind whatever it already had on the wire, so the server can name them
+    /// for seconds; they settle nothing before the deadline.
+    forced: Option<String>,
     other: Option<(String, bool)>,
+    /// The last look named `forced`.
+    still_forced: Option<(String, bool)>,
 }
 
 impl Wait {
+    fn forcing(holder: Option<String>) -> Self {
+        Self {
+            forced: holder,
+            ..Self::default()
+        }
+    }
+
     fn see(&mut self, seen: Seen) -> Option<Verdict> {
+        self.still_forced = None;
         match seen {
             Seen::Mine => Some(Verdict::Hosting),
+            Seen::Other { holder, pushed } if self.forced.as_ref() == Some(&holder) => {
+                self.other = None;
+                self.still_forced = Some((holder, pushed));
+                None
+            }
             Seen::Other { holder, pushed } => {
                 let key = (holder, pushed);
                 if self.other.as_ref() == Some(&key) {
@@ -286,25 +325,37 @@ impl Wait {
             }
         }
     }
+
+    /// Where the wait ends when the deadline comes first: held, when the last
+    /// look still named the holder a force was sent against.
+    fn deadline(self) -> Verdict {
+        match self.still_forced {
+            Some((holder, pushed)) => Verdict::Held { holder, pushed },
+            None => Verdict::Undecided,
+        }
+    }
 }
 
-/// The verdict a sequence of looks reaches; `Undecided` when it runs out
-/// first. The deadline is the caller's: it decides how many looks there are.
-/// [`wait_for_verdict`] feeds [`Wait`] the same way, one look at a time.
+/// The verdict a sequence of looks reaches for a claim; `Undecided` when it
+/// runs out first. The deadline is the caller's: it decides how many looks
+/// there are. [`wait_for_verdict`] feeds [`Wait`] the same way, one look at a
+/// time.
 #[cfg(test)]
 fn verdict(looks: impl IntoIterator<Item = Seen>) -> Verdict {
-    let mut wait = Wait::default();
-    looks
-        .into_iter()
-        .find_map(|seen| wait.see(seen))
-        .unwrap_or(Verdict::Undecided)
+    verdict_of(Wait::default(), looks)
+}
+
+/// [`verdict`] for any wait, a force's included.
+#[cfg(test)]
+fn verdict_of(mut wait: Wait, looks: impl IntoIterator<Item = Seen>) -> Verdict {
+    let settled = looks.into_iter().find_map(|seen| wait.see(seen));
+    settled.unwrap_or_else(|| wait.deadline())
 }
 
 /// Look at the lease every [`POLL_EVERY`] until a verdict or [`VERDICT_WAIT`].
-async fn wait_for_verdict(client: &mut Client, save_id: &str) -> Verdict {
+async fn wait_for_verdict(client: &mut Client, save_id: &str, mut wait: Wait) -> Verdict {
     let my_fp = this_device();
     let me = this_account();
-    let mut wait = Wait::default();
     let behind = std::cell::Cell::new(false);
     let polls = async {
         loop {
@@ -337,21 +388,42 @@ async fn wait_for_verdict(client: &mut Client, save_id: &str) -> Verdict {
     };
     match tokio::time::timeout(VERDICT_WAIT, polls).await {
         Ok(verdict) => verdict,
-        Err(_) if behind.get() => Verdict::Behind,
-        Err(_) => Verdict::Undecided,
+        Err(_) => timed_out(wait, behind.get()),
     }
 }
 
-/// One lease read as a look: a quiet lease is as good as free, and whose it is
-/// is the engine's word when it has one (see [`held_here`]).
+/// Where a wait ends at the deadline: behind the head when the engine says so,
+/// whatever the looks were; otherwise the wait's own deadline.
+fn timed_out(wait: Wait, behind: bool) -> Verdict {
+    if behind {
+        Verdict::Behind
+    } else {
+        wait.deadline()
+    }
+}
+
+/// One lease read as a look: a quiet lease is as good as free. Whose it is is
+/// the engine's word when it has one. Otherwise ours is a lease held from this
+/// machine by this account, as the engine counts it: every account and OS user
+/// here shares the fingerprint. With the account unknown, a lease from this
+/// machine says nothing either way (see [`held_here`]).
 fn seen(lease: Option<&Lease>, engine: Option<WorldLease>, my_fp: &str, me: Option<&str>) -> Seen {
+    let other = |l: &Lease| Seen::Other {
+        holder: l.holder_username.to_string(),
+        pushed: l.pushed_since,
+    };
     match lease {
         None => Seen::Free,
         Some(l) if !l.live => Seen::Free,
-        Some(l) if held_here(l, engine, my_fp, me) => Seen::Mine,
-        Some(l) => Seen::Other {
-            holder: l.holder_username.to_string(),
-            pushed: l.pushed_since,
+        Some(l) => match engine {
+            Some(WorldLease::Mine) => Seen::Mine,
+            Some(WorldLease::Other) => other(l),
+            _ if l.holder_device_fp.as_deref() == Some(my_fp) => match me {
+                Some(id) if l.holder_user_id == id => Seen::Mine,
+                Some(_) => other(l),
+                None => Seen::Unknown,
+            },
+            _ => other(l),
         },
     }
 }
@@ -746,20 +818,33 @@ mod tests {
 
     #[test]
     fn a_lease_reads_as_a_look() {
-        assert_eq!(seen(None, None, "fp-me", Some("u2")), Seen::Free);
+        let me = Some("u2");
+        assert_eq!(seen(None, None, "fp-me", me), Seen::Free);
         assert_eq!(
-            seen(
-                Some(&lease(Some("fp-me"), false)),
-                None,
-                "fp-me",
-                Some("u2")
-            ),
+            seen(Some(&lease(Some("fp-me"), false)), None, "fp-me", me),
             Seen::Free
         );
         assert_eq!(
-            seen(Some(&lease(Some("fp-me"), true)), None, "fp-me", Some("u2")),
+            seen(Some(&lease(Some("fp-me"), true)), None, "fp-me", me),
             Seen::Mine
         );
+        assert_eq!(
+            seen(Some(&lease(Some("fp-them"), true)), None, "fp-me", me),
+            other("alice", false)
+        );
+    }
+
+    /// Two accounts on one machine share the fingerprint: another account's
+    /// lease is theirs, as the engine counts it.
+    #[test]
+    fn a_lease_from_this_machine_is_ours_only_for_this_account() {
+        let here = lease(Some("fp-me"), true);
+        assert_eq!(
+            seen(Some(&here), None, "fp-me", Some("u9")),
+            other("alice", false)
+        );
+        assert_eq!(seen(Some(&here), None, "fp-me", None), Seen::Unknown);
+        // This account from another machine is not ours either.
         assert_eq!(
             seen(
                 Some(&lease(Some("fp-them"), true)),
@@ -768,6 +853,94 @@ mod tests {
                 Some("u2")
             ),
             other("alice", false)
+        );
+    }
+
+    /// At the deadline a world behind the head answers `Behind`, even for a
+    /// force whose last look still named the holder it was sent against.
+    #[test]
+    fn behind_the_head_outranks_a_held_force_at_the_deadline() {
+        let forced = || {
+            let mut wait = Wait::forcing(Some("bob".into()));
+            assert_eq!(wait.see(other("bob", false)), None);
+            wait
+        };
+        assert_eq!(timed_out(forced(), true), Verdict::Behind);
+        assert_eq!(
+            timed_out(forced(), false),
+            Verdict::Held {
+                holder: "bob".into(),
+                pushed: false
+            }
+        );
+    }
+
+    /// A force goes out behind whatever the engine already had on the wire, so
+    /// the holder it was sent against is not a refusal until the deadline.
+    #[test]
+    fn a_force_waits_out_the_holder_it_was_sent_against() {
+        let forcing = || Wait::forcing(Some("bob".into()));
+        assert_eq!(
+            verdict_of(
+                forcing(),
+                [
+                    other("bob", false),
+                    other("bob", false),
+                    other("bob", false),
+                    Seen::Mine
+                ]
+            ),
+            Verdict::Hosting
+        );
+        // Still there at the deadline: held, or pushed under.
+        assert_eq!(
+            verdict_of(forcing(), vec![other("bob", false); 20]),
+            Verdict::Held {
+                holder: "bob".into(),
+                pushed: false
+            }
+        );
+        assert_eq!(
+            verdict_of(forcing(), [other("bob", true), other("bob", true)]),
+            Verdict::Held {
+                holder: "bob".into(),
+                pushed: true
+            }
+        );
+        // Someone else read twice took it in between.
+        assert_eq!(
+            verdict_of(
+                forcing(),
+                [
+                    other("bob", false),
+                    other("carol", false),
+                    other("carol", false)
+                ]
+            ),
+            Verdict::Held {
+                holder: "carol".into(),
+                pushed: false
+            }
+        );
+        // The last look said nothing about the holder: no verdict.
+        assert_eq!(
+            verdict_of(forcing(), [other("bob", false), Seen::Unknown]),
+            Verdict::Undecided
+        );
+        assert_eq!(
+            verdict_of(forcing(), [other("bob", false), Seen::Free]),
+            Verdict::Undecided
+        );
+        // With no holder known at the force, the wait is a claim's.
+        assert_eq!(
+            verdict_of(
+                Wait::forcing(None),
+                [other("bob", false), other("bob", false)]
+            ),
+            Verdict::Held {
+                holder: "bob".into(),
+                pushed: false
+            }
         );
     }
 

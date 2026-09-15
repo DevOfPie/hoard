@@ -16,14 +16,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   each shared save carries a hosting lease: the member holding it is the only
   one who can push, the others read, and the lease expires five minutes after
   its last heartbeat, so a machine that dies mid-session frees the world on its
-  own instead of holding it until somebody notices. This is the server side; the
-  desktop app and the CLI follow.
+  own instead of holding it until somebody notices.
 - **A shared save names its files.** Sharing a Valheim world sends only that
   world (`worlds_local/<name>` and its backups), never the characters, and every
   member's backup, restore and fingerprint honour the same list, while the
   owner's own versions keep the whole folder, so sharing a world never stops
   their characters and other worlds being backed up. A world shared with you
-  appears in `hoard save list` with its group, ready to adopt into a folder.
+  appears in `hoard save list` with its group, ready to adopt with `hoard adopt`.
 - **The CLI shares saves and hosts worlds.** `hoard group` creates a group,
   lists yours, mints an invite token and joins or leaves with one. `hoard share
   <save_id> --group <group>` moves a save into a group and `hoard unshare` takes
@@ -35,6 +34,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   sync service last heard it. The group, share and world commands go through
   the service, which holds the session, so they need it running (`hoard sync
   start`); without it the tables print as before, with no HOST column.
+- **The desktop app shares saves and hosts worlds.** A *Groups* page creates
+  groups, mints invite links and joins with one, and *Share* on a save's menu
+  in the Library moves it into a group, picking the world for Valheim and
+  listing what travels. When a game with shared worlds starts, Hoard asks in
+  the app and in the in-game HUD whether to host, view or sit it out, and with
+  one free world and no answer it hosts on its own after 60 seconds. Library
+  rows say who hosts each world, their menu releases it or takes over a lease
+  nobody has pushed under, and a session that could not push ends in a side
+  copy with a notice that opens it.
 
 ## [1.1.7] - 2026-09-13
 

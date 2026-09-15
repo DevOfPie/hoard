@@ -22,7 +22,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 use anyhow::Result;
-use hoard_core::kernel::fileclass::RestoreGate;
+use hoard_core::kernel::fileclass::{included, RestoreGate};
 use serde::Serialize;
 
 /// A file in the remote version, in the least it takes to compare. It is built
@@ -74,6 +74,15 @@ pub struct RestorePreview {
     pub local_only_count: usize,
     /// Bytes that have to be written (modified plus added).
     pub bytes_to_write: u64,
+    /// On an owner's restore of a shared save, the files outside the share's
+    /// list this restore overwrites. Their current bytes may be in no version
+    /// yet, so the restore copies them into the side-copy folder first. Listed up to
+    /// [`MAX_LISTED`]; empty on any other restore.
+    #[serde(default)]
+    pub outside_share: Vec<String>,
+    /// How many of those in total, listed or not.
+    #[serde(default)]
+    pub outside_share_count: usize,
     /// `false` when the version publishes no per-file hashes (the legacy
     /// whole-archive ones). Then `modified` and `unchanged` cannot be told apart
     /// and the UI has to say it cannot preview, rather than showing an empty diff
@@ -267,7 +276,65 @@ pub async fn remote_files(
         .collect())
 }
 
+/// The files on disk outside `share_include` that restoring `remote` through
+/// `gate` writes over with other bytes. `share_include` is the list
+/// [`crate::savefilter::owner_share_include`] gives: empty, and so nothing
+/// here, for anyone but a shared save's owner.
+///
+/// A file of the same size is hashed; one that cannot be read counts as
+/// different, the side that keeps a copy. A path that would leave `dest` is
+/// skipped: it is not the restore's to write, and not this copy's to read.
+pub async fn overwritten_outside_share(
+    remote: &[RemoteFile],
+    dest: &Path,
+    gate: &RestoreGate,
+    share_include: &[String],
+) -> Vec<String> {
+    if share_include.is_empty() {
+        return Vec::new();
+    }
+    let names: Vec<&str> = remote.iter().map(|f| f.relative_path.as_str()).collect();
+    if crate::restore::is_single_file_snapshot(dest, &names) {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    for r in remote {
+        if included(share_include, &r.relative_path) || !gate.allows(&r.relative_path) {
+            continue;
+        }
+        let rel = Path::new(&r.relative_path);
+        if !rel
+            .components()
+            .all(|c| matches!(c, std::path::Component::Normal(_)))
+        {
+            continue;
+        }
+        let path = dest.join(rel);
+        // Only a regular file is overwritten; a symlink is not walked either.
+        let Ok(meta) = tokio::fs::symlink_metadata(&path).await else {
+            continue;
+        };
+        if !meta.is_file() {
+            continue;
+        }
+        if meta.len() == r.size_bytes {
+            if let Some(sha) = r.sha256.as_deref() {
+                if let Ok(actual) = crate::backup::hash_file(&path).await {
+                    if actual.eq_ignore_ascii_case(sha) {
+                        continue;
+                    }
+                }
+            }
+        }
+        out.push(r.relative_path.clone());
+    }
+    out.sort();
+    out
+}
+
 /// The full preview: it fetches the manifest and crosses it with the disk.
+/// `share_include` names the files an owner's restore keeps a copy of when it
+/// overwrites them outside the share (see [`overwritten_outside_share`]).
 ///
 /// An empty manifest (a legacy version, or a version with no files) comes out as
 /// not comparable, never as "nothing changes".
@@ -277,6 +344,7 @@ pub async fn restore_preview(
     version: i64,
     dest: &Path,
     gate: &RestoreGate,
+    share_include: &[String],
 ) -> Result<RestorePreview> {
     let remote = remote_files(client, save_id, version).await?;
     if remote.is_empty() {
@@ -285,7 +353,11 @@ pub async fn restore_preview(
             ..Default::default()
         });
     }
-    against_disk(&remote, dest, gate).await
+    let mut preview = against_disk(&remote, dest, gate).await?;
+    let outside = overwritten_outside_share(&remote, dest, gate, share_include).await;
+    preview.outside_share_count = outside.len();
+    preview.outside_share = outside.into_iter().take(MAX_LISTED).collect();
+    Ok(preview)
 }
 
 #[cfg(test)]

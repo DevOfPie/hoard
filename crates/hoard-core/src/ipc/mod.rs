@@ -454,6 +454,54 @@ pub enum Request {
     Unknown,
 }
 
+impl Request {
+    /// The request's wire name (`get_lease`), the serde tag, for a log line. A
+    /// `match` rather than an encode: it runs before every dispatch, and some
+    /// requests carry tokens that have no business in a scratch buffer. Pinned to
+    /// the tag by `every_request_kind_is_its_serde_tag`.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Request::Ping => "ping",
+            Request::Status => "status",
+            Request::Subscribe { .. } => "subscribe",
+            Request::BackupNow { .. } => "backup_now",
+            Request::SweepAll { .. } => "sweep_all",
+            Request::ForceRestore { .. } => "force_restore",
+            Request::SetAutoRestore { .. } => "set_auto_restore",
+            Request::SetGlobalSync { .. } => "set_global_sync",
+            Request::Reload => "reload",
+            Request::SetProbeCandidates { .. } => "set_probe_candidates",
+            Request::CloudToken { .. } => "cloud_token",
+            Request::AdoptSession { .. } => "adopt_session",
+            Request::ForgetSession => "forget_session",
+            Request::AdoptServerSession { .. } => "adopt_server_session",
+            Request::ForgetServerSession => "forget_server_session",
+            Request::ServerToken => "server_token",
+            Request::RestartEngine => "restart_engine",
+            Request::Shutdown => "shutdown",
+            Request::UpdateStatus => "update_status",
+            Request::ApplyUpdate { .. } => "apply_update",
+            Request::SnoozeUpdate { .. } => "snooze_update",
+            Request::ClaimWorld { .. } => "claim_world",
+            Request::DismissWorld { .. } => "dismiss_world",
+            Request::ReleaseWorld { .. } => "release_world",
+            Request::ForceWorld { .. } => "force_world",
+            Request::ListGroups => "list_groups",
+            Request::CreateGroup { .. } => "create_group",
+            Request::InviteToGroup { .. } => "invite_to_group",
+            Request::JoinGroup { .. } => "join_group",
+            Request::LeaveGroup { .. } => "leave_group",
+            Request::RemoveMember { .. } => "remove_member",
+            Request::DeleteGroup { .. } => "delete_group",
+            Request::ListWorlds { .. } => "list_worlds",
+            Request::ShareSave { .. } => "share_save",
+            Request::UnshareSave { .. } => "unshare_save",
+            Request::GetLease { .. } => "get_lease",
+            Request::Unknown => "unknown",
+        }
+    }
+}
+
 /// The answer to a request.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "result", rename_all = "snake_case")]
@@ -1709,6 +1757,149 @@ mod tests {
         assert!(
             missing.is_empty(),
             "payload cases with no sample: {missing:?}"
+        );
+    }
+
+    /// `Request::kind` is the `op` tag serde writes, for every variant. Adding a
+    /// variant breaks the `match` in `index` until it has a case, and a case with
+    /// no sample fails the coverage check.
+    #[test]
+    fn every_request_kind_is_its_serde_tag() {
+        const VARIANTS: usize = 37;
+        fn index(r: &Request) -> usize {
+            match r {
+                Request::Ping => 0,
+                Request::Status => 1,
+                Request::Subscribe { .. } => 2,
+                Request::BackupNow { .. } => 3,
+                Request::SweepAll { .. } => 4,
+                Request::ForceRestore { .. } => 5,
+                Request::SetAutoRestore { .. } => 6,
+                Request::SetGlobalSync { .. } => 7,
+                Request::Reload => 8,
+                Request::SetProbeCandidates { .. } => 9,
+                Request::CloudToken { .. } => 10,
+                Request::AdoptSession { .. } => 11,
+                Request::ForgetSession => 12,
+                Request::AdoptServerSession { .. } => 13,
+                Request::ForgetServerSession => 14,
+                Request::ServerToken => 15,
+                Request::RestartEngine => 16,
+                Request::Shutdown => 17,
+                Request::UpdateStatus => 18,
+                Request::ApplyUpdate { .. } => 19,
+                Request::SnoozeUpdate { .. } => 20,
+                Request::ClaimWorld { .. } => 21,
+                Request::ReleaseWorld { .. } => 22,
+                Request::ForceWorld { .. } => 23,
+                Request::ListGroups => 24,
+                Request::CreateGroup { .. } => 25,
+                Request::InviteToGroup { .. } => 26,
+                Request::JoinGroup { .. } => 27,
+                Request::LeaveGroup { .. } => 28,
+                Request::ShareSave { .. } => 29,
+                Request::UnshareSave { .. } => 30,
+                Request::GetLease { .. } => 31,
+                Request::Unknown => 32,
+                Request::DismissWorld { .. } => 33,
+                Request::RemoveMember { .. } => 34,
+                Request::DeleteGroup { .. } => 35,
+                Request::ListWorlds { .. } => 36,
+            }
+        }
+
+        let id = || "w1".to_string();
+        let samples = vec![
+            Request::Ping,
+            Request::Status,
+            Request::Subscribe { since: Some(3) },
+            Request::BackupNow { save_id: id() },
+            Request::SweepAll { window_secs: 60 },
+            Request::ForceRestore {
+                save_id: id(),
+                version_num: Some(4),
+            },
+            Request::SetAutoRestore { enabled: true },
+            Request::SetGlobalSync { enabled: false },
+            Request::Reload,
+            Request::SetProbeCandidates {
+                dirs: vec!["/saves".into()],
+            },
+            Request::CloudToken { rejected: None },
+            Request::AdoptSession {
+                session: AdoptedSession {
+                    server_url: "https://api.hoard.services".into(),
+                    access_token: "jwt".into(),
+                    refresh_token: "refresh".into(),
+                },
+            },
+            Request::ForgetSession,
+            Request::AdoptServerSession {
+                session: ServerSession {
+                    server_url: "https://hoard.example".into(),
+                    token: "hoard_v1_dead".into(),
+                    user: None,
+                },
+            },
+            Request::ForgetServerSession,
+            Request::ServerToken,
+            Request::RestartEngine,
+            Request::Shutdown,
+            Request::UpdateStatus,
+            Request::ApplyUpdate { version: None },
+            Request::SnoozeUpdate { hours: 2 },
+            Request::ClaimWorld {
+                save_id: id(),
+                role: WorldRole::View,
+            },
+            Request::ReleaseWorld { save_id: id() },
+            Request::ForceWorld { save_id: id() },
+            Request::ListGroups,
+            Request::CreateGroup {
+                name: "friends".into(),
+            },
+            Request::InviteToGroup {
+                group_id: "g1".into(),
+                expires_in_secs: Some(60),
+            },
+            Request::JoinGroup {
+                token: "invite-token".into(),
+            },
+            Request::LeaveGroup {
+                group_id: "g1".into(),
+            },
+            Request::ShareSave {
+                save_id: id(),
+                group_id: "g1".into(),
+                world: None,
+            },
+            Request::UnshareSave { save_id: id() },
+            Request::GetLease { save_id: id() },
+            Request::DismissWorld {
+                save_id: "s1".into(),
+            },
+            Request::RemoveMember {
+                group_id: "g1".into(),
+                user_id: "u2".into(),
+            },
+            Request::DeleteGroup {
+                group_id: "g1".into(),
+            },
+            Request::ListWorlds { save_id: id() },
+            Request::Unknown,
+        ];
+
+        let mut seen = [false; VARIANTS];
+        for request in samples {
+            seen[index(&request)] = true;
+            let sent = serde_json::to_value(&request)
+                .unwrap_or_else(|e| panic!("{request:?} cannot be encoded: {e}"));
+            assert_eq!(sent["op"], request.kind(), "{sent}");
+        }
+        let missing: Vec<usize> = (0..VARIANTS).filter(|i| !seen[*i]).collect();
+        assert!(
+            missing.is_empty(),
+            "request cases with no sample: {missing:?}"
         );
     }
 }

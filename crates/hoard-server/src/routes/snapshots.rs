@@ -1126,9 +1126,29 @@ pub async fn list(
         });
     }
 
-    if !include.is_empty() {
+    if !include.is_empty() && !rows.is_empty() {
+        // The whole page's manifests in one read, grouped by version here.
+        let sql = format!(
+            "SELECT snapshot_id, relative_path, size_bytes FROM snapshot_files
+             WHERE snapshot_id IN ({})",
+            vec!["?"; rows.len()].join(",")
+        );
+        let mut query = sqlx::query_as::<_, (String, String, i64)>(&sql);
+        for s in &rows {
+            query = query.bind(&s.id);
+        }
+        let mut files: std::collections::HashMap<String, Vec<(String, i64)>> =
+            std::collections::HashMap::new();
+        for (snapshot_id, path, bytes) in query
+            .fetch_all(&state.pool)
+            .await
+            .map_err(|e| internal_logged("listing snapshot rows", e))?
+        {
+            files.entry(snapshot_id).or_default().push((path, bytes));
+        }
         for s in &mut rows {
-            restrict_to_include(&state.pool, s, &include).await?;
+            let listed = files.get(&s.id).map(Vec::as_slice).unwrap_or_default();
+            restrict_to_include(s, &include, listed);
         }
     }
 
@@ -1137,23 +1157,13 @@ pub async fn list(
 
 /// A version as a member of a share that names its files sees it: the count
 /// and size of those files only, and no insight, which is derived from the
-/// whole manifest and can name what the list leaves out.
-async fn restrict_to_include(
-    pool: &sqlx::SqlitePool,
-    snap: &mut Snapshot,
-    include: &[String],
-) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
-    let files: Vec<(String, i64)> =
-        sqlx::query_as("SELECT relative_path, size_bytes FROM snapshot_files WHERE snapshot_id=?")
-            .bind(&snap.id)
-            .fetch_all(pool)
-            .await
-            .map_err(|e| internal_logged("listing snapshot rows", e))?;
-    let (count, size) = included_totals(include, &files);
+/// whole manifest and can name what the list leaves out. `files` is that
+/// version's manifest, `(path, bytes)`.
+fn restrict_to_include(snap: &mut Snapshot, include: &[String], files: &[(String, i64)]) {
+    let (count, size) = included_totals(include, files);
     snap.file_count = count;
     snap.total_size_bytes = size;
     snap.insight = None;
-    Ok(())
 }
 
 /// How many of `files` (path, bytes) the include list names, and their bytes.

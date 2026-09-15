@@ -465,11 +465,14 @@ impl SaveRow {
             Some(shared) if !is_owner && !shared.include.is_empty() => &shared.include,
             _ => return Ok(Some(save)),
         };
+        // Summed per path in SQL, so the rows scale with distinct paths rather
+        // than versions times files; the included total is the same sum.
         let files: Vec<(String, i64)> = sqlx::query_as(
-            "SELECT sf.relative_path, sf.size_bytes
+            "SELECT sf.relative_path, SUM(sf.size_bytes)
              FROM snapshot_files sf
              JOIN snapshots sn ON sn.id = sf.snapshot_id
-             WHERE sn.save_id = ? AND sn.deleted_at IS NULL",
+             WHERE sn.save_id = ? AND sn.deleted_at IS NULL
+             GROUP BY sf.relative_path",
         )
         .bind(&save_id)
         .fetch_all(pool)

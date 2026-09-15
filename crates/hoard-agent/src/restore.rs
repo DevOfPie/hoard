@@ -226,6 +226,65 @@ fn extraction_root(dest: &Path, snapshot_names: &[&str]) -> PathBuf {
     dest.to_path_buf()
 }
 
+/// Where [`keep_outside_share`] put the files it copied.
+#[derive(Debug, Clone)]
+pub struct SetAside {
+    pub dir: PathBuf,
+    pub files: usize,
+}
+
+/// Before an owner's restore of a shared save writes: copies the files on disk
+/// outside the share's list that it would overwrite into a side-copy folder
+/// under `root`, the tree a session's side copies use, so one retention sweep
+/// covers both.
+///
+/// A file outside the share written since the owner's last upload (a
+/// character played while a member hosted, say) and overwritten by an older
+/// version would otherwise be in no version and in no copy. `share_include`
+/// comes from [`crate::savefilter::owner_share_include`]; empty, and `None`
+/// back, for any other restore. Files are copied, never moved: the restore decides what
+/// changes in the folder. `None` when nothing needed keeping.
+pub async fn keep_outside_share(
+    client: &ApiClient,
+    save_id: &str,
+    version: i64,
+    dest: &Path,
+    gate: &RestoreGate,
+    share_include: &[String],
+    root: &Path,
+) -> Result<Option<SetAside>> {
+    if share_include.is_empty() {
+        return Ok(None);
+    }
+    let remote = crate::preview::remote_files(client, save_id, version).await?;
+    let files = crate::preview::overwritten_outside_share(&remote, dest, gate, share_include).await;
+    if files.is_empty() {
+        return Ok(None);
+    }
+    let dir = crate::claim::side_copy_dir(root, save_id, time::OffsetDateTime::now_utc());
+    copy_aside(dest, &files, &dir).await?;
+    Ok(Some(SetAside {
+        dir,
+        files: files.len(),
+    }))
+}
+
+/// Copies each of `files` (relative to `dest`) to the same path under `dir`.
+async fn copy_aside(dest: &Path, files: &[String], dir: &Path) -> Result<()> {
+    for rel in files {
+        let to = dir.join(rel);
+        if let Some(parent) = to.parent() {
+            tokio::fs::create_dir_all(parent)
+                .await
+                .with_context(|| format!("creating {}", parent.display()))?;
+        }
+        tokio::fs::copy(dest.join(rel), &to)
+            .await
+            .with_context(|| format!("copying {rel} aside to {}", to.display()))?;
+    }
+    Ok(())
+}
+
 /// Resolve the snapshot version to use: the explicit one if supplied, else the
 /// save's `latest_version_num`. Errors if the save has no snapshots yet.
 pub async fn resolve_version(
@@ -1332,6 +1391,68 @@ mod tests {
         std::fs::create_dir(&dir).unwrap();
         std::fs::write(dir.join("slot1.sav"), b"x").unwrap();
         assert_eq!(extraction_root(&dir, &["slot1.sav"]), dir);
+    }
+
+    /// The owner shared world One and kept playing a character, not yet in a
+    /// version. Restoring an older version writes the
+    /// character over: its current bytes land in the side-copy folder first,
+    /// and the world's files, which later versions hold, and a file the
+    /// version brings back unchanged, are not copied.
+    #[tokio::test]
+    async fn an_owners_restore_keeps_what_it_overwrites_outside_the_share() {
+        let tmp = tempfile::tempdir().unwrap();
+        let save = tmp.path().join("save");
+        std::fs::create_dir_all(save.join("worlds_local")).unwrap();
+        std::fs::create_dir_all(save.join("characters_local")).unwrap();
+        std::fs::write(save.join("worlds_local/One.db"), b"world now").unwrap();
+        std::fs::write(save.join("characters_local/Bob.fch"), b"bob, level 40").unwrap();
+        std::fs::write(save.join("characters_local/Ann.fch"), b"ann").unwrap();
+        let ann_sha = crate::backup::hash_file(&save.join("characters_local/Ann.fch"))
+            .await
+            .unwrap();
+
+        // The older version: another world file, another Bob, the same Ann.
+        let remote = vec![
+            crate::preview::RemoteFile {
+                relative_path: "worlds_local/One.db".into(),
+                size_bytes: 11,
+                sha256: Some("00".repeat(32)),
+            },
+            crate::preview::RemoteFile {
+                relative_path: "characters_local/Bob.fch".into(),
+                size_bytes: 12,
+                sha256: Some("11".repeat(32)),
+            },
+            crate::preview::RemoteFile {
+                relative_path: "characters_local/Ann.fch".into(),
+                size_bytes: 3,
+                sha256: Some(ann_sha),
+            },
+        ];
+        let share = vec!["worlds_local/One.db".to_string()];
+        // The owner's gate: the whole folder.
+        let gate = RestoreGate::default();
+
+        let files = crate::preview::overwritten_outside_share(&remote, &save, &gate, &share).await;
+        assert_eq!(files, vec!["characters_local/Bob.fch".to_string()]);
+
+        let dir = tmp.path().join("conflicts").join("save-1").join("ts");
+        copy_aside(&save, &files, &dir).await.unwrap();
+        assert_eq!(
+            std::fs::read(dir.join("characters_local/Bob.fch")).unwrap(),
+            b"bob, level 40"
+        );
+        assert!(!dir.join("worlds_local/One.db").exists());
+        assert!(!dir.join("characters_local/Ann.fch").exists());
+        // Copied, not moved.
+        assert!(save.join("characters_local/Bob.fch").exists());
+
+        // Nobody but the owner has a list here, so nothing is kept.
+        assert!(
+            crate::preview::overwritten_outside_share(&remote, &save, &gate, &[])
+                .await
+                .is_empty()
+        );
     }
 
     #[test]

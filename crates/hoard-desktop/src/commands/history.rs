@@ -110,26 +110,39 @@ pub async fn list_save_snapshots(
 ///
 /// The restore gate for `save_id`: the manifest's shield, the share's include
 /// list when this account is a member of it, plus the user's "yes" to writing
-/// their config.
+/// their config. With it, the share's list when this account owns the save
+/// (the server's `caller_owns` mark), whose outside the restore copies aside
+/// before writing over it.
 ///
 /// The preview and the restore compute it the same way, so the dialog does not
 /// promise one thing and the button do another.
-fn restore_gate(save_id: &str, allow_config: bool) -> hoard_core::kernel::fileclass::RestoreGate {
+fn restore_gate(
+    save_id: &str,
+    allow_config: bool,
+) -> (hoard_core::kernel::fileclass::RestoreGate, Vec<String>) {
     CliState::load_default()
         .ok()
         .and_then(|(st, _)| {
             st.saves.get(save_id).map(|s| {
-                hoard_agent::savefilter::gate_for_save(
-                    &s.game_slug,
-                    hoard_agent::savefilter::restore_include(s.shared.as_ref()),
-                    allow_config,
+                (
+                    hoard_agent::savefilter::gate_for_save(
+                        &s.game_slug,
+                        hoard_agent::savefilter::restore_include(s.shared.as_ref()),
+                        allow_config,
+                    ),
+                    hoard_agent::savefilter::owner_share_include(s.shared.as_ref()).to_vec(),
                 )
             })
         })
         // No row, no game: the kernel decides by name alone.
-        .unwrap_or_else(|| hoard_core::kernel::fileclass::RestoreGate {
-            allow_device_local: allow_config,
-            ..Default::default()
+        .unwrap_or_else(|| {
+            (
+                hoard_core::kernel::fileclass::RestoreGate {
+                    allow_device_local: allow_config,
+                    ..Default::default()
+                },
+                Vec::new(),
+            )
         })
 }
 
@@ -157,15 +170,10 @@ pub async fn preview_restore(
                 .ok_or_else(|| "NEEDS_DESTINATION".to_string())?
         }
     };
-    hoard_agent::preview::restore_preview(
-        &client,
-        &save_id,
-        version,
-        &dest,
-        &restore_gate(&save_id, allow_config),
-    )
-    .await
-    .map_err(pretty_error)
+    let (gate, outside) = restore_gate(&save_id, allow_config);
+    hoard_agent::preview::restore_preview(&client, &save_id, version, &dest, &gate, &outside)
+        .await
+        .map_err(pretty_error)
 }
 
 /// Detail view: snapshot metadata + per-file list, used by the expandable
@@ -487,6 +495,37 @@ pub async fn restore_snapshot(
         }
     }
 
+    // The same game as the safety copy above; the preview's gate reads it from
+    // the row, which this may have just given the save. A member's restore walks
+    // the share's list, the owner's the whole folder.
+    let gate = hoard_agent::savefilter::gate_for_save(
+        &game_slug,
+        hoard_agent::savefilter::restore_include(shared.as_ref()),
+        allow_config,
+    );
+
+    // 1b) The owner's restore writes the whole folder, and a file outside the
+    //     share it overwrites may hold bytes no version has yet. Those files
+    //     are copied into the side-copy tree first, and a copy that fails stops
+    //     the restore before it writes.
+    let outside = hoard_agent::savefilter::owner_share_include(shared.as_ref());
+    if !outside.is_empty() {
+        let root = CliConfig::state_dir()
+            .map_err(|e| e.to_string())?
+            .join("conflicts");
+        restore::keep_outside_share(
+            &client,
+            &save_id,
+            version,
+            &local_path,
+            &gate,
+            outside,
+            &root,
+        )
+        .await
+        .map_err(pretty_error)?;
+    }
+
     // 2) Download + verify + extract. We pass `force = true` because the
     //    user has explicitly confirmed they want to overwrite; refusing on
     //    "destination not empty" here would defeat the whole point.
@@ -505,14 +544,7 @@ pub async fn restore_snapshot(
             // dedup against is the destination itself: anything already there
             // with the right bytes is copied (or left) instead of re-downloaded.
             reuse_from: Some(local_path.clone()),
-            // The same game as the safety copy above; the preview's gate reads it
-            // from the row, which this may have just given the save. A member's
-            // restore walks the share's list, the owner's the whole folder.
-            gate: hoard_agent::savefilter::gate_for_save(
-                &game_slug,
-                hoard_agent::savefilter::restore_include(shared.as_ref()),
-                allow_config,
-            ),
+            gate,
         },
         move |downloaded, total| {
             let _ = app_for_dl.emit(
