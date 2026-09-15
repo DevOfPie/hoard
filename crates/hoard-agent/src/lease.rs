@@ -251,8 +251,9 @@ async fn run<A: LeaseApi, S: LeaseSink>(api: A, sink: S, mut rx: mpsc::Receiver<
     // Acquires the server never answered (transport), retried on the tick:
     // the engine asks once and waits for a verdict, so the retry is ours.
     let mut wanted: HashMap<String, i64> = HashMap::new();
-    // The base each save was refused as stale with. The engine asks again on
-    // every hold with the same head until a pull moves it; the server is not.
+    // The base each save was refused as stale with. An acquire at the same
+    // head is answered stale from here until a pull moves it; the server is
+    // not asked again.
     let mut stale: HashMap<String, i64> = HashMap::new();
 
     let mut tick = interval(Duration::from_secs(RENEW_SECS));
@@ -365,8 +366,11 @@ async fn acquire<A: LeaseApi, S: LeaseSink>(
 ) {
     if stale.get(&save_id) == Some(&base_version) {
         // Refused as stale with this very head: asking again returns the same
-        // answer. Nothing is reported, so the engine waits until its head moves.
-        tracing::debug!(save_id = %save_id, base_version, "lease: still behind the head; not asking again");
+        // answer, so the server is not asked. The engine still gets its
+        // verdict, or its request would wait on an answer that never comes.
+        tracing::debug!(save_id = %save_id, base_version, "lease: still behind the head; answering stale again");
+        wanted.remove(&save_id);
+        sink.stale(save_id, base_version).await;
         return;
     }
     match api.acquire(save_id.clone(), base_version).await {
@@ -776,8 +780,8 @@ mod tests {
         assert!(task.await.is_ok(), "the task ends after closing");
     }
 
-    /// Refused as stale, the task asks the server once per head: the engine
-    /// keeps asking on every hold until its head moves, the server is not.
+    /// Refused as stale, the task asks the server once per head: an acquire at
+    /// the same head is answered from the cache, the server is not asked.
     #[tokio::test(start_paused = true)]
     async fn a_stale_acquire_is_asked_once_per_head() {
         let fake = Fake::default();
@@ -797,7 +801,11 @@ mod tests {
             1,
             "not asked again for the same head"
         );
-        assert_eq!(sink.0.lock().unwrap().len(), 1, "nothing reported either");
+        assert_eq!(
+            *sink.2.lock().unwrap(),
+            vec![("w1".to_string(), 1), ("w1".to_string(), 1)],
+            "answered stale again from the cache"
+        );
         h.acquire("w1", 2);
         settle().await;
         assert_eq!(
@@ -820,6 +828,35 @@ mod tests {
         assert_eq!(
             sink.0.lock().unwrap().last(),
             Some(&("w1".to_string(), LeaseObs::Free, None))
+        );
+    }
+
+    /// An acquire at a base the task holds as stale is a verdict all the same:
+    /// stale, with that base, and nothing asked of the server. Unanswered, the
+    /// engine's request would stand until the service restarts.
+    #[tokio::test(start_paused = true)]
+    async fn a_cached_stale_acquire_is_answered_stale() {
+        let fake = Fake::default();
+        fake.0.acquire.lock().unwrap().push(Err(stale(4, 2)));
+        let (h, sink, _task) = start(fake.clone());
+        h.acquire("w1", 2);
+        settle().await;
+        for _ in 0..2 {
+            h.acquire("w1", 2);
+            settle().await;
+        }
+        assert!(
+            fake.0.acquire.lock().unwrap().is_empty(),
+            "the server was asked once"
+        );
+        assert_eq!(*sink.2.lock().unwrap(), vec![("w1".to_string(), 2); 3]);
+        assert_eq!(*sink.1.lock().unwrap(), vec![true; 3], "each a verdict");
+        tokio::time::advance(Duration::from_secs(RENEW_SECS + 1)).await;
+        settle().await;
+        assert_eq!(
+            sink.2.lock().unwrap().len(),
+            3,
+            "nothing retried on the tick"
         );
     }
 
