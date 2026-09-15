@@ -4,14 +4,14 @@
 //! `adopt_save`: the same `library::adopt`, fed the server row's slug and
 //! label, then the same `Reload` so the service starts watching the folder.
 
-use std::path::{Path, PathBuf};
+use std::io;
+use std::path::{Component, Path, PathBuf};
 
 use anyhow::Result;
 use serde::Serialize;
 
 use hoard_agent::api::{ApiClient, ApiError};
-use hoard_agent::library::{self, AdoptArgs};
-use hoard_agent::session;
+use hoard_agent::library::{self, AdoptArgs, AdoptRefusal};
 use hoard_agent::state::CliState;
 use hoard_core::ids::SaveId;
 
@@ -37,14 +37,20 @@ pub struct AdoptOut {
 }
 
 pub async fn run(args: Args) -> Result<()> {
-    // What needs no server is refused first, against this account's state as
-    // `hoard saves` reads it.
-    session::set_context_offline();
-    let (state, _) = CliState::load_default()?;
-    let folder = check(&state, &args.save_id, &args.path)?;
+    // What needs neither a session nor the server is refused first.
+    let folder = check(&args.save_id, &args.path)?;
 
-    // The Cloud token comes on loan from the service, as in `hoard track`.
+    // The Cloud token comes on loan from the service, as in `hoard track`. The
+    // session also picks the account whose state the adopt writes, so a save
+    // already tracked is looked for there, before the server is asked.
     let active = link::resolve_session().await?;
+    let (state, _) = CliState::load_default()?;
+    if let Some(row) = state.saves.get(&args.save_id) {
+        return Err(refused(AdoptRefusal::AlreadyTracked {
+            save_id: args.save_id.clone(),
+            local_path: row.local_path.clone(),
+        }));
+    }
     let (game_slug, label) = server_row(&active.client, &args.save_id).await?;
     let outcome = library::adopt(
         &active.client,
@@ -55,7 +61,8 @@ pub async fn run(args: Args) -> Result<()> {
             local_path: folder.to_string_lossy().into_owned(),
         },
     )
-    .await?;
+    .await
+    .map_err(coded)?;
     // The service owns the watched set: it is told to re-read it, as the
     // desktop does after the same call.
     let watching = link::reload().await;
@@ -92,26 +99,17 @@ pub async fn run(args: Args) -> Result<()> {
     })
 }
 
-/// The folder `path` names, made absolute, or the refusal when `save_id`
-/// cannot be adopted there. Local only: the server is asked afterwards.
-fn check(state: &CliState, save_id: &str, path: &Path) -> Result<PathBuf> {
+/// The folder `path` names, resolved as the adopt stores it, or the refusal
+/// when `save_id` cannot be adopted there. Local only: the session and the
+/// server come afterwards.
+fn check(save_id: &str, path: &Path) -> Result<PathBuf> {
     SaveId::parse(save_id).map_err(|e| {
         output::err(
             "bad_request",
             format!("{e}; the save id is the UUID `hoard save list` shows"),
         )
     })?;
-    if let Some(row) = state.saves.get(save_id) {
-        return Err(output::err(
-            "already_tracked",
-            format!(
-                "{save_id} is already tracked on this machine, in {}; \
-                 `hoard save path {save_id} <folder>` moves it",
-                row.local_path.display()
-            ),
-        ));
-    }
-    let folder = std::path::absolute(path).map_err(|e| {
+    let folder = resolve(path).map_err(|e| {
         output::err(
             "bad_request",
             format!("`{}` is not a usable folder: {e}", path.display()),
@@ -126,6 +124,89 @@ fn check(state: &CliState, save_id: &str, path: &Path) -> Result<PathBuf> {
     library::validate_path_shape(&folder)
         .map_err(|e| output::err("bad_request", format!("{e:#}")))?;
     Ok(folder)
+}
+
+/// `path` as the folder it really is: absolute, without `.` and `..`, and
+/// through any link on the part of it that exists. Every check and the stored
+/// row see this form only. Compared as text, `/home/u/games/..` is neither a
+/// home folder nor a parent of `/home/u/games/valheim`, and a link into a
+/// tracked save is not inside it.
+fn resolve(path: &Path) -> io::Result<PathBuf> {
+    // `absolute` keeps `..` on Unix. It is taken out as text: it means the
+    // folder above the one the user typed.
+    let mut folder = PathBuf::new();
+    for part in std::path::absolute(path)?.components() {
+        match part {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                folder.pop();
+            }
+            part => folder.push(part),
+        }
+    }
+    // The longest part that exists, and whether a link is on the way to it.
+    let parts: Vec<Component> = folder.components().collect();
+    let mut prefix = PathBuf::new();
+    let mut existing = 0;
+    let mut linked = false;
+    for part in &parts {
+        prefix.push(part);
+        let Ok(meta) = std::fs::symlink_metadata(&prefix) else {
+            break;
+        };
+        if !prefix.exists() {
+            // A link to nothing: what is beyond it does not exist either.
+            break;
+        }
+        linked |= meta.file_type().is_symlink();
+        existing += 1;
+    }
+    if !linked {
+        return Ok(folder);
+    }
+    let mut resolved = std::fs::canonicalize(parts[..existing].iter().collect::<PathBuf>())?;
+    resolved.extend(&parts[existing..]);
+    Ok(without_verbatim(resolved))
+}
+
+/// `canonicalize` spells a Windows path `\\?\C:\…`, where no check here finds
+/// a drive. The plain spelling names the same folder.
+fn without_verbatim(path: PathBuf) -> PathBuf {
+    #[cfg(windows)]
+    {
+        if let Some(rest) = path.to_str().and_then(|s| s.strip_prefix(r"\\?\")) {
+            if !rest.starts_with(r"UNC\") {
+                return PathBuf::from(rest);
+            }
+        }
+    }
+    path
+}
+
+/// The engine's refusals as the codes SKILL.md gives them. Anything else, a
+/// server or a disk failure, keeps its own.
+fn coded(e: anyhow::Error) -> anyhow::Error {
+    match e.downcast::<AdoptRefusal>() {
+        Ok(refusal) => refused(refusal),
+        Err(e) => e,
+    }
+}
+
+fn refused(refusal: AdoptRefusal) -> anyhow::Error {
+    match refusal {
+        AdoptRefusal::AlreadyTracked {
+            save_id,
+            local_path,
+        } => output::err(
+            "already_tracked",
+            format!(
+                "{save_id} is already tracked on this machine, in {}; \
+                 `hoard save path {save_id} <folder>` moves it",
+                local_path.display()
+            ),
+        ),
+        AdoptRefusal::Invalid(message) => output::err("bad_request", message),
+    }
 }
 
 /// The server's slug and label for `save_id`, which the adopt records as they
@@ -157,6 +238,7 @@ mod tests {
     use hoard_agent::state::SaveState;
 
     const ID: &str = "0f8a5c2e-3b1d-4e6f-9a7b-1c2d3e4f5a6b";
+    const OTHER: &str = "7d1e2f3a-4b5c-4d6e-8f9a-0b1c2d3e4f5a";
 
     fn code(e: &anyhow::Error) -> String {
         output::classify(e).code.into_owned()
@@ -185,22 +267,43 @@ mod tests {
         state
     }
 
+    /// What `library::adopt` answers for `folder` against `state` before the
+    /// server is asked, coded as the command codes it.
+    fn adopt_refusal(state: &CliState, save_id: &str, folder: &Path) -> Option<anyhow::Error> {
+        let args = AdoptArgs {
+            save_id: save_id.into(),
+            game_slug: "factorio".into(),
+            label: "main".into(),
+            local_path: folder.to_string_lossy().into_owned(),
+        };
+        library::plan_adopt(state, &args)
+            .err()
+            .map(|refusal| coded(refusal.into()))
+    }
+
+    /// A temporary folder as `resolve` spells it (on macOS `/var` is a link).
+    fn base(dir: &tempfile::TempDir) -> PathBuf {
+        resolve(dir.path()).unwrap()
+    }
+
     #[test]
     fn a_folder_is_taken_as_an_absolute_path() {
         let dir = tempfile::tempdir().unwrap();
-        let folder = dir.path().join("valheim");
-        let got = check(&CliState::default(), ID, &folder).unwrap();
+        let folder = base(&dir).join("valheim");
+        let got = check(ID, &folder).unwrap();
         assert_eq!(got, folder);
-        let relative = check(&CliState::default(), ID, Path::new("worlds")).unwrap();
+        let relative = check(ID, Path::new("worlds")).unwrap();
         assert!(relative.is_absolute(), "{}", relative.display());
         assert!(relative.ends_with("worlds"));
     }
 
+    /// Refused on the state `library::adopt` writes, which is the one the
+    /// session selected.
     #[test]
     fn a_save_tracked_here_is_refused() {
         let dir = tempfile::tempdir().unwrap();
         let state = tracking(ID, dir.path());
-        let err = check(&state, ID, &dir.path().join("elsewhere")).unwrap_err();
+        let err = adopt_refusal(&state, ID, &dir.path().join("elsewhere")).unwrap();
         assert_eq!(code(&err), "already_tracked");
         assert!(format!("{err:#}").contains("hoard save path"), "{err:#}");
     }
@@ -208,7 +311,7 @@ mod tests {
     #[test]
     fn an_id_that_is_not_a_uuid_is_refused() {
         let dir = tempfile::tempdir().unwrap();
-        let err = check(&CliState::default(), "valheim", dir.path()).unwrap_err();
+        let err = check("valheim", dir.path()).unwrap_err();
         assert_eq!(code(&err), "bad_request");
     }
 
@@ -217,10 +320,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let file = dir.path().join("world.fwl");
         std::fs::write(&file, b"").unwrap();
-        let err = check(&CliState::default(), ID, &file).unwrap_err();
+        let err = check(ID, &file).unwrap_err();
         assert_eq!(code(&err), "bad_request");
         assert!(format!("{err:#}").contains("not a folder"), "{err:#}");
-        let err = check(&CliState::default(), ID, Path::new("")).unwrap_err();
+        let err = check(ID, Path::new("")).unwrap_err();
         assert_eq!(code(&err), "bad_request");
     }
 
@@ -228,7 +331,70 @@ mod tests {
     /// through as `bad_request` too.
     #[test]
     fn a_dangerous_folder_is_refused() {
-        let err = check(&CliState::default(), ID, Path::new("/")).unwrap_err();
+        let err = check(ID, Path::new("/")).unwrap_err();
         assert_eq!(code(&err), "bad_request");
+    }
+
+    #[test]
+    fn dot_dot_is_taken_out_before_anything_is_stored() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = base(&dir);
+        assert_eq!(check(ID, &base.join("a/../b")).unwrap(), base.join("b"));
+        assert_eq!(check(ID, &base.join("./a/./b/..")).unwrap(), base.join("a"));
+        let relative = check(ID, Path::new("a/../b")).unwrap();
+        assert_eq!(relative, std::env::current_dir().unwrap().join("b"));
+    }
+
+    /// `..` from a folder next to a tracked save names the folder holding it,
+    /// and that is refused.
+    #[test]
+    fn dot_dot_from_beside_a_tracked_save_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let games = base(&dir).join("games");
+        std::fs::create_dir_all(games.join("valheim")).unwrap();
+        std::fs::create_dir_all(games.join("factorio")).unwrap();
+        let state = tracking(OTHER, &games.join("valheim"));
+
+        let folder = check(ID, &games.join("factorio/..")).unwrap();
+        assert_eq!(folder, games);
+        let err = adopt_refusal(&state, ID, &folder).unwrap();
+        assert_eq!(code(&err), "bad_request");
+        assert!(format!("{err:#}").contains("inside this folder"), "{err:#}");
+    }
+
+    /// The home folder spelled with `..` is still the home folder.
+    #[cfg(unix)]
+    #[test]
+    fn dot_dot_up_to_a_home_folder_is_refused() {
+        let err = check(ID, Path::new("/home/u/games/..")).unwrap_err();
+        assert_eq!(code(&err), "bad_request");
+        assert!(format!("{err:#}").contains("/home/u"), "{err:#}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_link_into_a_tracked_save_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let valheim = base(&dir).join("games/valheim");
+        std::fs::create_dir_all(&valheim).unwrap();
+        let state = tracking(OTHER, &valheim);
+        let link = base(&dir).join("shortcut");
+        std::os::unix::fs::symlink(&valheim, &link).unwrap();
+
+        let folder = check(ID, &link.join("worlds")).unwrap();
+        assert_eq!(folder, valheim.join("worlds"));
+        let err = adopt_refusal(&state, ID, &folder).unwrap();
+        assert_eq!(code(&err), "bad_request");
+    }
+
+    /// The engine's folder and slug refusals are the request's fault.
+    #[test]
+    fn a_folder_the_engine_refuses_is_a_bad_request() {
+        let err = coded(AdoptRefusal::Invalid("'valheim' already tracks it".into()).into());
+        assert_eq!(code(&err), "bad_request");
+        assert_eq!(format!("{err:#}"), "'valheim' already tracks it");
+        // Anything else keeps its own code.
+        let err = coded(anyhow::anyhow!("disk full"));
+        assert_eq!(code(&err), "error");
     }
 }

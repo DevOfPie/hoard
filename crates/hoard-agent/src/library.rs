@@ -779,6 +779,18 @@ pub fn validate_path_shape(local_path: &Path) -> Result<()> {
 /// still duplicate.
 fn validate_folder(local_path: &Path, except_save_ids: &[&str]) -> Result<()> {
     validate_path_shape(local_path)?;
+    ensure_folder(local_path)?;
+    if let Ok((state, _)) = CliState::load_default() {
+        if let Some(other) = conflicting_save(&state, local_path, except_save_ids) {
+            return Err(folder_taken(other, local_path));
+        }
+    }
+    Ok(())
+}
+
+/// The IO half of [`validate_folder`]: the folder is created when missing, and
+/// what is there has to be a folder or a file.
+fn ensure_folder(local_path: &Path) -> Result<()> {
     if !local_path.exists() {
         // It does not exist yet, so a folder is assumed. A single-file save is
         // always added over a file that is already there (detection proposes it on
@@ -787,11 +799,6 @@ fn validate_folder(local_path: &Path, except_save_ids: &[&str]) -> Result<()> {
             .with_context(|| format!("Couldn't create {}", local_path.display()))?;
     } else if !local_path.is_dir() && !local_path.is_file() {
         anyhow::bail!("{} isn't a folder or a file.", local_path.display());
-    }
-    if let Ok((state, _)) = CliState::load_default() {
-        if let Some(other) = conflicting_save(&state, local_path, except_save_ids) {
-            return Err(folder_taken(other, local_path));
-        }
     }
     Ok(())
 }
@@ -1315,14 +1322,102 @@ pub async fn add_to_tracking(client: &ApiClient, args: AddGameArgs) -> Result<Tr
     })
 }
 
+/// Why [`adopt`] refused before writing anything, as opposed to a server or disk
+/// failure. Its own type so a caller that answers with codes (the CLI) tells the
+/// two apart.
+#[derive(Debug)]
+pub enum AdoptRefusal {
+    /// The save already has a folder on this machine. Adopting it again would
+    /// replace that row and the old folder would silently stop syncing; a save
+    /// moves with [`set_local_path`].
+    AlreadyTracked {
+        save_id: String,
+        local_path: PathBuf,
+    },
+    /// The slug or the folder can't be used.
+    Invalid(String),
+}
+
+impl std::fmt::Display for AdoptRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::AlreadyTracked {
+                save_id,
+                local_path,
+            } => write!(
+                f,
+                "{save_id} is already tracked on this machine, in {}",
+                local_path.display()
+            ),
+            Self::Invalid(message) => f.write_str(message),
+        }
+    }
+}
+
+impl std::error::Error for AdoptRefusal {}
+
+/// What [`adopt`] decides from this machine's state alone: the refusal, or the row
+/// it relieves. Pure, so it is tested without a server; `adopt` runs it on the
+/// state it then writes.
+pub fn plan_adopt(
+    state: &CliState,
+    args: &AdoptArgs,
+) -> std::result::Result<Option<String>, AdoptRefusal> {
+    if let Some(row) = state.saves.get(&args.save_id) {
+        return Err(AdoptRefusal::AlreadyTracked {
+            save_id: args.save_id.clone(),
+            local_path: row.local_path.clone(),
+        });
+    }
+    let invalid = |e: anyhow::Error| AdoptRefusal::Invalid(format!("{e:#}"));
+    // Same door, same guard: adopting a cloud row is still how a bad slug
+    // enters this machine's state.
+    reject_degenerate_slug(&args.game_slug).map_err(invalid)?;
+    let local_path = Path::new(&args.local_path);
+    validate_path_shape(local_path).map_err(invalid)?;
+    // Adopting is repointing a save that already exists in the cloud: overlapping
+    // with itself is not a "one folder, one game" conflict.
+    //
+    // And "with itself" is TWO entries, not one. This machine may have added the game
+    // on its own, through detection or a manual add, minting a local `save_id`; the
+    // cloud brings its own. Same game, same folder, different ids: excluding only the
+    // cloud's, the local entry blocks itself and the game is stuck forever. The
+    // automatic scan fails on every pass with "'furi' already tracks ..., one folder,
+    // one game" (colliding with itself), the manual "+" fails the same way, and
+    // repointing the folder from the card does too: there is not one route left in
+    // the UI to get out of that state. And searching by slug is not enough: the same
+    // game arrives under different names depending on the source (`vrising` from the
+    // Steam appid, `v-rising` from the catalogue; `dispatch` and `dispatch-2025`).
+    // What identifies the row being relieved is the FOLDER, which is the rule's own
+    // unit.
+    let superseded = adopt_twin(
+        state,
+        &args.save_id,
+        &args.game_slug,
+        &args.label,
+        local_path,
+    );
+    let except: Vec<&str> = std::iter::once(args.save_id.as_str())
+        .chain(superseded.as_deref())
+        .collect();
+    if let Some(other) = conflicting_save(state, local_path, &except) {
+        return Err(invalid(folder_taken(other, local_path)));
+    }
+    Ok(superseded)
+}
+
 /// Adopts (links) a cloud save from another machine: it associates a local folder on
 /// THIS machine with the existing `save_id` rather than minting a new one. It leaves
 /// the version cursor open so the on-add auto-restore pulls the latest snapshot. The
 /// core of cross-device sync.
+///
+/// Refuses, with an [`AdoptRefusal`], a save this machine already tracks and a slug
+/// or folder [`plan_adopt`] rejects, before any server call.
 pub async fn adopt(client: &ApiClient, args: AdoptArgs) -> Result<TrackOutcome> {
-    // Same door, same guard: adopting a cloud row is still how a bad slug
-    // enters this machine's state.
-    reject_degenerate_slug(&args.game_slug)?;
+    let superseded = {
+        let (state, _) = CliState::load_default()?;
+        plan_adopt(&state, &args)?
+    };
     // The row already exists on the server; what is read back is whether it is
     // shared and, if so, of what it consists, so the first walk of the folder
     // already takes the world's files and nothing else. Cloud has no groups. A
@@ -1343,34 +1438,7 @@ pub async fn adopt(client: &ApiClient, args: AdoptArgs) -> Result<TrackOutcome> 
             .shared
     };
     let local_path = PathBuf::from(&args.local_path);
-    // Adopting is repointing a save that already exists in the cloud: overlapping
-    // with itself is not a "one folder, one game" conflict.
-    //
-    // And "with itself" is TWO entries, not one. This machine may have added the game
-    // on its own, through detection or a manual add, minting a local `save_id`; the
-    // cloud brings its own. Same game, same folder, different ids: excluding only the
-    // cloud's, the local entry blocks itself and the game is stuck forever. The
-    // automatic scan fails on every pass with "'furi' already tracks ..., one folder,
-    // one game" (colliding with itself), the manual "+" fails the same way, and
-    // repointing the folder from the card does too: there is not one route left in
-    // the UI to get out of that state. And searching by slug is not enough: the same
-    // game arrives under different names depending on the source (`vrising` from the
-    // Steam appid, `v-rising` from the catalogue; `dispatch` and `dispatch-2025`).
-    // What identifies the row being relieved is the FOLDER, which is the rule's own
-    // unit.
-    let superseded = CliState::load_default().ok().and_then(|(state, _)| {
-        adopt_twin(
-            &state,
-            &args.save_id,
-            &args.game_slug,
-            &args.label,
-            &local_path,
-        )
-    });
-    let except: Vec<&str> = std::iter::once(args.save_id.as_str())
-        .chain(superseded.iter().map(String::as_str))
-        .collect();
-    validate_folder(&local_path, &except)?;
+    ensure_folder(&local_path).map_err(|e| AdoptRefusal::Invalid(format!("{e:#}")))?;
 
     let (mut cli_state, path) = CliState::load_default()?;
     // The relief is a replacement, not an addition: leaving the local entry alive
@@ -2679,10 +2747,11 @@ async fn record_sharing(
 mod tests {
     use super::{
         apply_excluded_paths, auto_track_decision, conflicting_save, detected_paths_in, folder_key,
-        local_detection, manual_override_conflict, occupied_slot, prune_poisoned_rows,
+        local_detection, manual_override_conflict, occupied_slot, plan_adopt, prune_poisoned_rows,
         reconcile_plan, resolve_processes, restore_twin, row_for_same_folder, rows_one_per_folder,
         rows_unknown_to_server, spread_allow_device_local, superseded_rows, watched_from_snapshot,
-        watched_saves_from_state, AutoTrack, CachedDetection, ServerRow, ERR_SLOT_OCCUPIED,
+        watched_saves_from_state, AdoptArgs, AdoptRefusal, AutoTrack, CachedDetection, ServerRow,
+        ERR_SLOT_OCCUPIED,
     };
     use crate::detection::{
         Confidence, DetectedGame, DetectionReport, DetectionSource, DetectionStats,
@@ -3148,6 +3217,78 @@ mod tests {
             .map(|s| s.game_slug.as_str()),
             Some("skyrim"),
             "\"one folder, one game\" still protects against different games"
+        );
+    }
+
+    fn adopt_args(save_id: &str, slug: &str, folder: &Path) -> AdoptArgs {
+        AdoptArgs {
+            save_id: save_id.into(),
+            game_slug: slug.into(),
+            label: "main".into(),
+            local_path: folder.to_string_lossy().into_owned(),
+        }
+    }
+
+    /// Adopting a save this machine already tracks would replace its row: the
+    /// old folder would stop syncing with nothing said.
+    #[test]
+    fn adopting_a_save_tracked_here_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let tracked = dir.path().join("valheim");
+        let mut state = CliState::default();
+        state.saves.insert(
+            "save-1".into(),
+            save_state("valheim", &tracked.to_string_lossy()),
+        );
+
+        let err = plan_adopt(
+            &state,
+            &adopt_args("save-1", "valheim", &dir.path().join("elsewhere")),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(&err, AdoptRefusal::AlreadyTracked { local_path, .. } if *local_path == tracked),
+            "{err}"
+        );
+        assert_eq!(
+            plan_adopt(
+                &state,
+                &adopt_args("save-2", "factorio", &dir.path().join("elsewhere"))
+            )
+            .unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn adopting_over_another_save_or_with_a_bad_slug_is_invalid() {
+        let dir = tempfile::tempdir().unwrap();
+        let games = dir.path().join("games");
+        let mut state = CliState::default();
+        state.saves.insert(
+            "save-1".into(),
+            save_state("valheim", &games.join("valheim").to_string_lossy()),
+        );
+
+        for folder in [games.clone(), games.join("valheim/worlds")] {
+            let err = plan_adopt(&state, &adopt_args("save-2", "factorio", &folder)).unwrap_err();
+            assert!(matches!(err, AdoptRefusal::Invalid(_)), "{err}");
+        }
+        let err = plan_adopt(
+            &state,
+            &adopt_args("save-2", "user", &dir.path().join("elsewhere")),
+        )
+        .unwrap_err();
+        assert!(matches!(err, AdoptRefusal::Invalid(_)), "{err}");
+        // Its own twin on the same folder is relieved, not refused.
+        assert_eq!(
+            plan_adopt(
+                &state,
+                &adopt_args("save-2", "valheim", &games.join("valheim"))
+            )
+            .unwrap()
+            .as_deref(),
+            Some("save-1")
         );
     }
 
