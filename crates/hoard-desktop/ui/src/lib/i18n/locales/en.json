@@ -583,7 +583,7 @@
   "history.preview_modified": "{count, plural, one {# file overwritten} other {# files overwritten}}",
   "history.preview_added": "{count, plural, one {# file added} other {# files added}}",
   "history.preview_unchanged": "{count, plural, one {# file unchanged} other {# files unchanged}}",
-  "history.preview_outside_share": "{count, plural, one {# overwritten file is outside the shared world and in no version since the share; a side copy of it is kept first} other {# overwritten files are outside the shared world and in no version since the share; a side copy of them is kept first}}",
+  "history.preview_outside_share": "{count, plural, one {# overwritten file is outside the shared world; a side copy of its current bytes is kept first} other {# overwritten files are outside the shared world; a side copy of their current bytes is kept first}}",
   "history.preview_local_only": "{count, plural, one {# file only on this device, left untouched} other {# files only on this device, left untouched}}",
   "automatic.title": "Automatic Mode",
   "automatic.on": "ON",

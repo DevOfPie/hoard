@@ -563,7 +563,7 @@
   "history.preview_modified": "{count, plural, one {# ficheiro substituído} other {# ficheiros substituídos}}",
   "history.preview_added": "{count, plural, one {# ficheiro adicionado} other {# ficheiros adicionados}}",
   "history.preview_unchanged": "{count, plural, one {# ficheiro sem alterações} other {# ficheiros sem alterações}}",
-  "history.preview_outside_share": "{count, plural, one {# ficheiro sobrescrito está fora do mundo partilhado e em nenhuma versão desde a partilha; é copiado primeiro para a pasta de cópias à parte} other {# ficheiros sobrescritos estão fora do mundo partilhado e em nenhuma versão desde a partilha; são copiados primeiro para a pasta de cópias à parte}}",
+  "history.preview_outside_share": "{count, plural, one {# ficheiro sobrescrito está fora do mundo partilhado; é copiado primeiro para a pasta de cópias à parte} other {# ficheiros sobrescritos estão fora do mundo partilhado; são copiados primeiro para a pasta de cópias à parte}}",
   "history.preview_local_only": "{count, plural, one {# ficheiro só neste dispositivo, fica intacto} other {# ficheiros só neste dispositivo, ficam intactos}}",
   "automatic.title": "Modo automático",
   "automatic.on": "ON",

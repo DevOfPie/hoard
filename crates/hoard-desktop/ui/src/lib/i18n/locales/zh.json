@@ -563,7 +563,7 @@
   "history.preview_modified": "{count, plural, other {覆盖 # 个文件}}",
   "history.preview_added": "{count, plural, other {新增 # 个文件}}",
   "history.preview_unchanged": "{count, plural, other {# 个文件无变化}}",
-  "history.preview_outside_share": "{count, plural, other {# 个将被覆盖的文件在共享世界之外，共享后的任何版本都不包含它们；会先复制到备份副本文件夹}}",
+  "history.preview_outside_share": "{count, plural, other {# 个将被覆盖的文件在共享世界之外；会先复制到备份副本文件夹}}",
   "history.preview_local_only": "{count, plural, other {# 个文件仅存在于本机，保持不变}}",
   "automatic.title": "自动模式",
   "automatic.on": "开启",

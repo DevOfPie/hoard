@@ -563,7 +563,7 @@
   "history.preview_modified": "{count, plural, other {#個のファイルを上書き}}",
   "history.preview_added": "{count, plural, other {#個のファイルを追加}}",
   "history.preview_unchanged": "{count, plural, other {#個のファイルは変更なし}}",
-  "history.preview_outside_share": "{count, plural, other {上書きされる#個のファイルは共有ワールドの外にあり、共有後のどのバージョンにも含まれません。先に退避フォルダーへコピーします}}",
+  "history.preview_outside_share": "{count, plural, other {上書きされる#個のファイルは共有ワールドの外にあります。先に退避フォルダーへコピーします}}",
   "history.preview_local_only": "{count, plural, other {#個のファイルはこの端末にのみ存在（変更しません）}}",
   "automatic.title": "自動モード",
   "automatic.on": "ON",

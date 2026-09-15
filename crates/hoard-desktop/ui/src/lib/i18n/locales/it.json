@@ -563,7 +563,7 @@
   "history.preview_modified": "{count, plural, one {# file sovrascritto} other {# file sovrascritti}}",
   "history.preview_added": "{count, plural, one {# file aggiunto} other {# file aggiunti}}",
   "history.preview_unchanged": "{count, plural, one {# file invariato} other {# file invariati}}",
-  "history.preview_outside_share": "{count, plural, one {# file sovrascritto è fuori dal mondo condiviso e in nessuna versione dalla condivisione; prima viene copiato nella cartella delle copie a parte} other {# file sovrascritti sono fuori dal mondo condiviso e in nessuna versione dalla condivisione; prima vengono copiati nella cartella delle copie a parte}}",
+  "history.preview_outside_share": "{count, plural, one {# file sovrascritto è fuori dal mondo condiviso; prima viene copiato nella cartella delle copie a parte} other {# file sovrascritti sono fuori dal mondo condiviso; prima vengono copiati nella cartella delle copie a parte}}",
   "history.preview_local_only": "{count, plural, one {# file solo su questo dispositivo, resta intatto} other {# file solo su questo dispositivo, restano intatti}}",
   "automatic.title": "Modalità automatica",
   "automatic.on": "ON",

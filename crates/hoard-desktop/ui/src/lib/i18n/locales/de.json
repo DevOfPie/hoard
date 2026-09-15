@@ -563,7 +563,7 @@
   "history.preview_modified": "{count, plural, one {# Datei überschrieben} other {# Dateien überschrieben}}",
   "history.preview_added": "{count, plural, one {# Datei hinzugefügt} other {# Dateien hinzugefügt}}",
   "history.preview_unchanged": "{count, plural, one {# Datei unverändert} other {# Dateien unverändert}}",
-  "history.preview_outside_share": "{count, plural, one {# überschriebene Datei liegt außerhalb der geteilten Welt und in keiner Version seit der Freigabe; sie wird zuerst in den Ordner für Sicherungskopien kopiert} other {# überschriebene Dateien liegen außerhalb der geteilten Welt und in keiner Version seit der Freigabe; sie werden zuerst in den Ordner für Sicherungskopien kopiert}}",
+  "history.preview_outside_share": "{count, plural, one {# überschriebene Datei liegt außerhalb der geteilten Welt; sie wird zuerst in den Ordner für Sicherungskopien kopiert} other {# überschriebene Dateien liegen außerhalb der geteilten Welt; sie werden zuerst in den Ordner für Sicherungskopien kopiert}}",
   "history.preview_local_only": "{count, plural, one {# Datei nur auf diesem Gerät, bleibt unangetastet} other {# Dateien nur auf diesem Gerät, bleiben unangetastet}}",
   "automatic.title": "Automatischer Modus",
   "automatic.on": "AN",
