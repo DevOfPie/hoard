@@ -176,19 +176,27 @@ pub fn classify(e: &anyhow::Error) -> Classified {
             };
         }
         Some(hoard_core::ipc::IpcError::Invalid { .. }) => return plain("bad_request", 1),
-        // Only a missing or expired session is the sign-in group; an engine
-        // still starting, shutting down, failing, or whose keyring will not
-        // answer is not fixed by signing in.
+        // A missing or expired session, or a keyring that will not hand the
+        // session over, is the sign-in group: signing in again rewrites the
+        // keyring item under the service. An engine still starting, shutting
+        // down or failing is not fixed by signing in.
         Some(
             hoard_core::ipc::IpcError::EngineDown {
                 kind:
                     hoard_core::ipc::EngineDownReason::NoSession
-                    | hoard_core::ipc::EngineDownReason::SessionExpired,
+                    | hoard_core::ipc::EngineDownReason::SessionExpired
+                    | hoard_core::ipc::EngineDownReason::KeyringUnreadable,
                 ..
             }
             | hoard_core::ipc::IpcError::NoServerSession { .. }
             | hoard_core::ipc::IpcError::CloudSessionExpired { .. },
         ) => return plain("no_session", 2),
+        // A service older than `kind` sends none, and it reads `Unknown`. Its
+        // text is the only way left to keep the sign-in hint for "no session".
+        Some(hoard_core::ipc::IpcError::EngineDown {
+            kind: hoard_core::ipc::EngineDownReason::Unknown,
+            reason,
+        }) if reason.to_ascii_lowercase().contains("no session") => return plain("no_session", 2),
         Some(hoard_core::ipc::IpcError::EngineDown { .. }) => return plain("engine_down", 1),
         _ => {}
     }
@@ -392,11 +400,18 @@ mod tests {
             let c = classify(&anyhow::Error::new(e));
             assert_eq!((c.code.as_ref(), c.exit), ("no_session", 2));
         }
-        // Starting, stopping, failing or a mute keyring: not a sign-in.
+        // A keyring that will not hand the session over is a sign-in: signing
+        // in again rewrites the item under the service. It was listed below as
+        // `engine_down` until that advice was found to hide the one fix.
+        let c = classify(&anyhow::Error::new(IpcError::EngineDown {
+            reason: "the keyring did not answer".into(),
+            kind: hoard_core::ipc::EngineDownReason::KeyringUnreadable,
+        }));
+        assert_eq!((c.code.as_ref(), c.exit), ("no_session", 2));
+        // Starting, stopping or failing: not a sign-in.
         for kind in [
             hoard_core::ipc::EngineDownReason::Unknown,
             hoard_core::ipc::EngineDownReason::Other,
-            hoard_core::ipc::EngineDownReason::KeyringUnreadable,
         ] {
             let c = classify(&anyhow::Error::new(IpcError::EngineDown {
                 reason: "the engine is still starting".into(),
@@ -404,6 +419,25 @@ mod tests {
             }));
             assert_eq!((c.code.as_ref(), c.exit), ("engine_down", 1), "{kind:?}");
         }
+        // A service older than `kind`: no session is still named in its text,
+        // whatever the case; any other text stays `engine_down`.
+        for (reason, code, exit) in [
+            ("No session. Sign in with `hoard login`", "no_session", 2),
+            ("the engine is still starting", "engine_down", 1),
+        ] {
+            let c = classify(&anyhow::Error::new(IpcError::EngineDown {
+                reason: reason.into(),
+                kind: hoard_core::ipc::EngineDownReason::Unknown,
+            }));
+            assert_eq!((c.code.as_ref(), c.exit), (code, exit), "{reason}");
+        }
+        // The fallback is for `Unknown` only: a classified reason wins over
+        // the words in its text.
+        let c = classify(&anyhow::Error::new(IpcError::EngineDown {
+            reason: "no session yet, but the daemon is shutting down".into(),
+            kind: hoard_core::ipc::EngineDownReason::Other,
+        }));
+        assert_eq!((c.code.as_ref(), c.exit), ("engine_down", 1));
     }
 
     #[test]

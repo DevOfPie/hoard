@@ -81,14 +81,14 @@ exit status grouped by what to do about it:
 
 | Exit | Meaning |
 |---|---|
-| 2 | Not signed in (`no_session`, `unauthorized`, `forbidden`): tell the user to run `hoard login`; do not attempt it yourself. A command that goes through the sync service gets `no_session` only when the service has no session, or it expired |
+| 2 | Not signed in (`no_session`, `unauthorized`, `forbidden`): tell the user to run `hoard login`; do not attempt it yourself. A command that goes through the sync service gets `no_session` when the service has no session, it expired, or the keyring will not hand it over (signing in again rewrites it) |
 | 3 | It isn't there (`not_found`, `not_tracked`, `not_watched`): re-read `hoard saves --json`, do not retry with a guessed id |
 | 4 | `rate_limited`, or `throttled` from the sync service: `rate_limited` carries `retry_after_seconds`, `throttled` names the wait in its message; wait that long, exactly once, and don't loop |
 | 5 | Storage limit (`quota_exceeded`, `quota_full`, `too_large`, `archived`): will fail identically until the user frees space or upgrades |
 | 6 | Network (`network`, `storage_unreachable`): may work later |
 | 1 | `no_service`: the sync service isn't running, and groups, sharing and leases have nobody to ask without it: tell the user to run `hoard sync start` |
 | 1 | A shared save refused (`held`, `stale`, `lease_required`, `not_shared`, `pushed`, `conflict`): see below; retrying unchanged gets the same answer |
-| 1 | `engine_down`: the sync service is running but its engine is not ready (starting, shutting down, failing, or the keyring will not hand over the session); the message says which. Wait and retry once if it is starting; otherwise tell the user what the message says, and do not tell them to sign in |
+| 1 | `engine_down`: the sync service is running but its engine is not ready (starting, shutting down or failing); the message says which. Wait and retry once if it is starting; otherwise tell the user what the message says, and do not tell them to sign in |
 | 1 | `already_tracked`: `hoard adopt` on a save this machine already has a folder for; `hoard saves --json` shows where |
 | 1 | `bad_request`: the request itself is wrong (a world name that is not one, an expiry past a year, a folder that is not one); change it, don't retry |
 | 1 | `needs_input`, `needs_choice`: see below |
@@ -187,7 +187,11 @@ dangerous thing here.
    returns the diff file by file: `modified` (overwritten), `added`, and
    `local_only`, files on disk that the version doesn't have, which are the
    saves made *after* it. Show the user the names, not just the counts; the
-   `*_count` fields carry the real totals when a list is capped.
+   `*_count` fields carry the real totals when a list is capped. On the
+   owner's restore of a shared save, `outside_share` names the overwritten
+   files outside the shared world: no version since the share holds them, so
+   the restore (with `--force`) copies them aside first and says where in
+   `restored.set_aside`.
 2. Only run the real restore after the user confirms that specific save and
    version.
 3. Same for anything that deletes: `hoard snapshots delete`, `hoard save delete`.

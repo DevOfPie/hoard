@@ -943,7 +943,7 @@ pub(crate) struct SaveSlot {
     /// Most recent debounced fs event observed for this slot. Surfaced via
     /// `AgentSlotStatus` so the diagnostics panel can prove the watcher
     /// is actually seeing writes.
-    last_fs_event_at: Option<OffsetDateTime>,
+    pub(crate) last_fs_event_at: Option<OffsetDateTime>,
     /// When our own auto-restore last *wrote files* into this slot's folder
     /// (UTC). A restore bumps the folder mtime and echoes fs events, which would
     /// otherwise trip the `mid_session_reason` "folder touched recently" /
@@ -2686,18 +2686,7 @@ async fn run_agent(
                     Some(AgentCommand::ForceWorld { save_id, reply }) => {
                         match shared_world_slot(&mut slots, &save_id) {
                             Ok(slot) => {
-                                slot.role = WorldRole::Host;
-                                // Like `ClaimWorld`: taken outside a session, it
-                                // is the next one's, and not a push's lease to
-                                // give back once idle.
-                                slot.role_pinned = slot.session.is_none();
-                                crate::claim::on_claim(slot);
-                                if let Some(lease) = lease_task.as_ref() {
-                                    // The task runs them in order: the takeover,
-                                    // then the acquire with this machine's head.
-                                    lease.force(save_id.clone());
-                                    crate::claim::request_acquire(slot, lease);
-                                }
+                                crate::claim::on_force_world(slot, lease_task.as_ref());
                                 crate::claim::dismiss_siblings(&mut slots, &save_id);
                                 let _ = reply.send(Ok(()));
                             }

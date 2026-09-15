@@ -412,8 +412,22 @@ impl Engine {
         }
     }
 
+    /// Takes a client's restart request. Taking one forgets why the last start
+    /// failed: the request is the answer to it (a sign-in, most often), and a
+    /// command sent right behind it must hear "starting", not the old refusal.
     fn take_restart_request(&self) -> Option<String> {
-        self.lock().restart_requested.take()
+        let mut guard = self.lock();
+        let taken = guard.restart_requested.take();
+        if taken.is_some() {
+            forget_last_failure(&mut guard.status);
+        }
+        taken
+    }
+
+    /// A start is about to run: until it answers, the engine is starting, and
+    /// the reason the previous one failed is not this one's.
+    fn begin_start(&self) {
+        forget_last_failure(&mut self.lock().status);
     }
 
     /// A clean shutdown of the live engine so it can be started again. Keeper only.
@@ -525,6 +539,7 @@ pub async fn keeper(engine: Engine, events_tx: mpsc::Sender<AgentEvent>) -> Fini
             // Drop the corpse (and its tasks) before trying another start.
             engine.forget();
         }
+        engine.begin_start();
         match start(events_tx.clone()).await {
             Ok(started) => {
                 tracing::info!(
@@ -557,6 +572,14 @@ pub async fn keeper(engine: Engine, events_tx: mpsc::Sender<AgentEvent>) -> Fini
             }
         }
     }
+}
+
+/// Clears what a failed start left in `status`, so [`Engine::down_error`]
+/// reads "still starting" (`Unknown`, no text) until the next start answers.
+fn forget_last_failure(status: &mut EngineStatus) {
+    status.reason = EngineDownReason::Unknown;
+    status.last_error = None;
+    status.keyring = None;
 }
 
 /// Why it would not start, so the window can say so.
@@ -1135,6 +1158,53 @@ mod tests {
                 doing: "reading the self-hosted session",
             });
         assert_eq!(classify(&refused), EngineDownReason::KeyringUnreadable);
+    }
+
+    /// What a request gets while there is no engine, as the kind and the text.
+    fn down(engine: &Engine) -> (EngineDownReason, String) {
+        match engine.down_error() {
+            hoard_core::ipc::IpcError::EngineDown { reason, kind } => (kind, reason),
+            other => panic!("not an EngineDown: {other:?}"),
+        }
+    }
+
+    /// `hoard login` after a start refused for want of a session: the login's
+    /// restart request is taken, and a command sent before the new start
+    /// answers hears "starting" (`engine_down`), not the old `no_session` that
+    /// would send the user to sign in again.
+    #[test]
+    fn a_taken_restart_request_forgets_the_last_failure() {
+        let engine = down_with(EngineDownReason::NoSession, false);
+        engine.lock().status.last_error = Some("no session. Sign in".into());
+        engine.request_restart("a client handed us a new self-hosted session");
+        assert_eq!(
+            down(&engine).0,
+            EngineDownReason::NoSession,
+            "not taken yet"
+        );
+
+        assert!(engine.take_restart_request().is_some());
+        assert_eq!(
+            down(&engine),
+            (
+                EngineDownReason::Unknown,
+                "the engine is still starting".to_string()
+            )
+        );
+    }
+
+    /// A start retried after the backoff is starting too, whatever the last
+    /// one failed on.
+    #[test]
+    fn a_start_beginning_forgets_the_last_failure() {
+        let engine = down_with(EngineDownReason::KeyringUnreadable, true);
+        engine.lock().status.last_error = Some("the keyring did not answer".into());
+        engine.begin_start();
+        let status = engine.status();
+        assert_eq!(status.reason, EngineDownReason::Unknown);
+        assert_eq!(status.last_error, None);
+        assert!(status.keyring.is_none());
+        assert_eq!(down(&engine).1, "the engine is still starting");
     }
 
     /// And what we do not recognise is said not to be recognised, rather than

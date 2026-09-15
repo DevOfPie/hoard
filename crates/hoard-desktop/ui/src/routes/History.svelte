@@ -1346,6 +1346,13 @@
             {/if}
           </ul>
         {/if}
+        {#if preview && preview.outside_share_count > 0}
+          <div class="mt-1.5 text-amber-200">
+            {$_("history.preview_outside_share", {
+              values: { count: preview.outside_share_count },
+            })}
+          </div>
+        {/if}
         {#if preview && preview.local_only_count > 0}
           <div class="mt-1.5 text-zinc-400">
             {$_("history.preview_local_only", {

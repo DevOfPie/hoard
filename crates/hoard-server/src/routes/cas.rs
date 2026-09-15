@@ -167,29 +167,45 @@ async fn stored_representation(
 /// sha: any entry for the owner, an included one for a member (`include` is
 /// [`read_include`]). Otherwise the sha is reported missing like absent content,
 /// which neither confirms that it exists nor lets it through without its bytes.
-async fn may_reuse(
+///
+/// `reusable` is [`reusable_shas`], read once per request.
+fn may_reuse(reusable: &Option<HashSet<String>>, sha: &str) -> bool {
+    match reusable {
+        None => true,
+        Some(shas) => shas.contains(sha),
+    }
+}
+
+/// The shas of this save that [`may_reuse`] lets through: `None` in a user's
+/// own namespace, where everything may be. In a group's, one read of the save's
+/// `(sha, path)` pairs across every version, kept where an entry's path is
+/// included, so a push decides every sha from the map instead of walking the
+/// save's file rows once per sha under the write lock.
+async fn reusable_shas(
     conn: &mut sqlx::SqliteConnection,
     ns: &Namespace,
     save_id: &str,
     include: &[String],
-    sha: &str,
-) -> Result<bool, sqlx::Error> {
+) -> Result<Option<HashSet<String>>, sqlx::Error> {
     if let Namespace::User(_) = ns {
-        return Ok(true);
+        return Ok(None);
     }
-    let paths: Vec<String> = sqlx::query_scalar(
-        "SELECT sf.relative_path
+    let pairs: Vec<(String, String)> = sqlx::query_as(
+        "SELECT DISTINCT sf.sha256, sf.relative_path
            FROM snapshot_files sf
            JOIN snapshots s ON s.id = sf.snapshot_id
-          WHERE s.save_id = ? AND sf.sha256 = ?",
+          WHERE s.save_id = ?",
     )
     .bind(save_id)
-    .bind(sha)
     .fetch_all(conn)
     .await?;
-    Ok(paths
-        .iter()
-        .any(|p| hoard_core::kernel::fileclass::included(include, p)))
+    Ok(Some(
+        pairs
+            .into_iter()
+            .filter(|(_, p)| hoard_core::kernel::fileclass::included(include, p))
+            .map(|(sha, _)| sha)
+            .collect(),
+    ))
 }
 
 /// An upload's staging folder. It sits flush against `tmp/` so
@@ -365,6 +381,9 @@ pub async fn init(
     // charge is made by the commit against whatever actually landed.
     let mut missing = Vec::new();
     let mut missing_bytes: i64 = 0;
+    let may = reusable_shas(&mut tx, &ns, &save_id, &reuse_include)
+        .await
+        .map_err(|e| internal_logged("blob dedup lookup", e))?;
     for (sha, size) in unique_shas(&body.files) {
         if !valid_sha256(&sha) {
             return Err(err(StatusCode::BAD_REQUEST, "invalid sha256 in manifest"));
@@ -373,9 +392,7 @@ pub async fn init(
             .await
             .map_err(|e| internal_logged("blob dedup lookup", e))?
             .is_some()
-            && may_reuse(&mut tx, &ns, &save_id, &reuse_include, &sha)
-                .await
-                .map_err(|e| internal_logged("blob dedup lookup", e))?;
+            && may_reuse(&may, &sha);
         if !reusable {
             missing_bytes += size;
             missing.push(CasMissing {
@@ -782,6 +799,12 @@ pub async fn commit(
             cleanup_staging();
             internal_logged("include lookup", e)
         })?;
+    let may = reusable_shas(&mut conn, &ns, &save_id, &reuse_include)
+        .await
+        .map_err(|e| {
+            cleanup_staging();
+            internal_logged("blob dedup lookup", e)
+        })?;
     for (sha, _declared) in unique_shas(&body.files) {
         if !valid_sha256(&sha) {
             cleanup_staging();
@@ -813,13 +836,7 @@ pub async fn commit(
                 };
                 // Content the caller cannot read is refused exactly like
                 // content that is not there: see `may_reuse`.
-                if !may_reuse(&mut conn, &ns, &save_id, &reuse_include, &sha)
-                    .await
-                    .map_err(|e| {
-                        cleanup_staging();
-                        internal_logged("blob dedup lookup", e)
-                    })?
-                {
+                if !may_reuse(&may, &sha) {
                     cleanup_staging();
                     warn!(sha = %sha, save_id = %save_id, "cas commit: manifest references content the caller cannot read");
                     return Err(err(
@@ -1456,5 +1473,92 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    /// The map read once per request decides every sha as the per-sha query it
+    /// replaced did, for the owner (empty include) and a member, on a save whose
+    /// versions reference the same sha under included and excluded paths.
+    #[tokio::test]
+    async fn the_reuse_map_decides_like_the_per_sha_query() {
+        let pool = mem_pool().await;
+        let world = sha("aa"); // included in v1
+        let moved = sha("bb"); // excluded in v1, included in v2
+        let character = sha("cc"); // excluded in both
+        let absent = sha("dd");
+
+        sqlx::query("INSERT INTO users (id, username, password_hash) VALUES ('u1','user','x')")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO games (slug, display_name) VALUES ('g','G')")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO saves (id, user_id, game_slug, label, latest_version_num) VALUES ('sv','u1','g','default',2)")
+            .execute(&pool).await.unwrap();
+        for (id, v) in [("s1", 1), ("s2", 2)] {
+            sqlx::query("INSERT INTO snapshots (id, save_id, version_num, total_size_bytes, file_count) VALUES (?,'sv',?,3,3)")
+                .bind(id).bind(v).execute(&pool).await.unwrap();
+        }
+        for (id, snap, path, s) in [
+            ("f1", "s1", "worlds_local/Alpha.db", &world),
+            ("f2", "s1", "characters_local/x.fch", &moved),
+            ("f3", "s1", "characters_local/y.fch", &character),
+            ("f4", "s2", "worlds_local/Alpha.db", &world),
+            ("f5", "s2", "worlds_local/Alpha.fwl", &moved),
+            ("f6", "s2", "characters_local/y.fch", &character),
+        ] {
+            sqlx::query("INSERT INTO snapshot_files (id, snapshot_id, relative_path, size_bytes, sha256) VALUES (?,?,?,1,?)")
+                .bind(id).bind(snap).bind(path).bind(s).execute(&pool).await.unwrap();
+        }
+
+        // The query this replaced, verbatim, as the oracle.
+        async fn per_sha(conn: &mut sqlx::SqliteConnection, include: &[String], sha: &str) -> bool {
+            let paths: Vec<String> = sqlx::query_scalar(
+                "SELECT sf.relative_path
+                   FROM snapshot_files sf
+                   JOIN snapshots s ON s.id = sf.snapshot_id
+                  WHERE s.save_id = ? AND sf.sha256 = ?",
+            )
+            .bind("sv")
+            .bind(sha)
+            .fetch_all(conn)
+            .await
+            .unwrap();
+            paths
+                .iter()
+                .any(|p| hoard_core::kernel::fileclass::included(include, p))
+        }
+
+        let group = Namespace::Group("g1".into());
+        let owner: Vec<String> = Vec::new();
+        let member = vec![
+            "worlds_local/Alpha.db".to_string(),
+            "worlds_local/Alpha.fwl".to_string(),
+        ];
+        let mut conn = pool.acquire().await.unwrap();
+        for (include, want) in [
+            (&owner, [true, true, true, false]),
+            (&member, [true, true, false, false]),
+        ] {
+            let may = reusable_shas(&mut conn, &group, "sv", include)
+                .await
+                .unwrap();
+            for (s, want) in [&world, &moved, &character, &absent].into_iter().zip(want) {
+                assert_eq!(may_reuse(&may, s), want, "{include:?} {s}");
+                assert_eq!(
+                    per_sha(&mut conn, include, s).await,
+                    want,
+                    "{include:?} {s}"
+                );
+            }
+        }
+
+        // A user's own namespace reuses anything, with no read at all.
+        let mine = reusable_shas(&mut conn, &Namespace::User("u1".into()), "sv", &member)
+            .await
+            .unwrap();
+        assert!(mine.is_none());
+        assert!(may_reuse(&mine, &absent));
     }
 }
