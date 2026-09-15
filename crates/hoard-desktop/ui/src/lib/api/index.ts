@@ -1301,10 +1301,14 @@ export type RestorePreview = {
   modified: string[];
   added: string[];
   local_only: string[];
+  /** On the owner's restore of a shared save: overwritten files outside the
+   *  share's list, which the restore copies to the side-copy folder first. */
+  outside_share: string[];
   /** Real totals, whatever the lists above had room for. */
   modified_count: number;
   added_count: number;
   local_only_count: number;
+  outside_share_count: number;
   bytes_to_write: number;
   comparable: boolean;
 };

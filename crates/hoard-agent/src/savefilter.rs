@@ -41,6 +41,19 @@ pub fn restore_include<'a>(shared: Option<&'a SharedRef>, me: Option<&str>) -> &
     }
 }
 
+/// The share's list when `me` owns the shared save, nothing otherwise. The
+/// owner's restore writes the whole folder, and since the share only this list
+/// has gone up: a file outside it that the restore overwrites is in no later
+/// version, so it is copied aside first
+/// ([`crate::restore::keep_outside_share`]). The other half of
+/// [`restore_include`].
+pub fn owner_share_include<'a>(shared: Option<&'a SharedRef>, me: Option<&str>) -> &'a [String] {
+    match shared {
+        Some(s) if me == Some(s.owner_user_id.as_str()) => &s.include,
+        _ => &[],
+    }
+}
+
 /// The filename patterns the manifest declares as save data for `slug`, in
 /// lowercase and deduplicated.
 ///
@@ -107,6 +120,26 @@ impl WatchedSave {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Only the owner has files outside the share to keep: a member's restore
+    /// never writes there, and an account that cannot be known reads as one.
+    #[test]
+    fn only_the_owner_keeps_files_outside_the_share() {
+        let shared = SharedRef {
+            group_id: "g1".into(),
+            group_name: "friends".into(),
+            owner_user_id: "u1".into(),
+            owner_username: "alice".into(),
+            include: vec!["worlds/One.wld".into()],
+        };
+        assert_eq!(
+            owner_share_include(Some(&shared), Some("u1")),
+            ["worlds/One.wld".to_string()]
+        );
+        assert!(owner_share_include(Some(&shared), Some("u2")).is_empty());
+        assert!(owner_share_include(Some(&shared), None).is_empty());
+        assert!(owner_share_include(None, Some("u1")).is_empty());
+    }
 
     #[test]
     fn a_restore_narrows_to_the_share_only_for_a_member() {
