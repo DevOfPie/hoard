@@ -1218,6 +1218,10 @@ export type RestoreOutcome = {
   /** If `backup_first` was set on the call, this is the version number of
    *  the safety backup the user can restore to undo this restore. */
   safety_version: number | null;
+  /** Files of the shared world this version doesn't have, moved into the
+   *  conflicts folder (kept there for the retention period) so the world's
+   *  folder ends as the version's. 0 on any other restore. */
+  world_files_set_aside: number;
 };
 
 export type LogLine = {
@@ -1300,7 +1304,12 @@ export type RestorePreview = {
   /** Capped at 200 entries, count with `modified_count`, never `.length`. */
   modified: string[];
   added: string[];
+  /** Only on disk, and left there. */
   local_only: string[];
+  /** Only on disk, inside the shared world the version replaces whole: moved
+   *  to the conflicts folder before the version is written. Never also in
+   *  `local_only`. */
+  world_set_aside: string[];
   /** On the owner's restore of a shared save: overwritten files outside the
    *  share's list, which the restore copies to the side-copy folder first. */
   outside_share: string[];
@@ -1308,6 +1317,7 @@ export type RestorePreview = {
   modified_count: number;
   added_count: number;
   local_only_count: number;
+  world_set_aside_count: number;
   outside_share_count: number;
   bytes_to_write: number;
   comparable: boolean;

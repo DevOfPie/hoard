@@ -427,6 +427,12 @@
         destination_override: destinationOverride,
         allow_config: allowConfig,
       });
+      const setAside =
+        out.world_files_set_aside > 0
+          ? $_("history.set_aside_suffix", {
+              values: { count: out.world_files_set_aside },
+            })
+          : "";
       const safety = out.safety_version
         ? $_("history.safety_suffix", {
             values: { version: out.safety_version },
@@ -437,7 +443,7 @@
           values: {
             version: target.version_num,
             count: out.files_extracted,
-            safety,
+            safety: setAside + safety,
           },
         }),
       );
@@ -1319,7 +1325,9 @@
           <div class="text-zinc-500">{$_("history.preview_loading")}</div>
         {:else if !preview.comparable}
           <div class="text-zinc-400">{$_("history.preview_unavailable")}</div>
-        {:else if preview.modified_count === 0 && preview.added_count === 0}
+        {:else if preview.modified_count === 0 &&
+          preview.added_count === 0 &&
+          preview.world_set_aside_count === 0}
           <div class="text-zinc-400">{$_("history.preview_nothing")}</div>
         {:else}
           <ul class="space-y-1 text-zinc-300">
@@ -1350,6 +1358,13 @@
           <div class="mt-1.5 text-amber-200">
             {$_("history.preview_outside_share", {
               values: { count: preview.outside_share_count },
+            })}
+          </div>
+        {/if}
+        {#if preview && preview.world_set_aside_count > 0}
+          <div class="mt-1.5 text-amber-200">
+            {$_("history.preview_set_aside", {
+              values: { count: preview.world_set_aside_count },
             })}
           </div>
         {/if}

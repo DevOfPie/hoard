@@ -27,10 +27,14 @@ pub struct PreviewOut {
     /// decides whether someone loses a session.
     pub modified: Vec<String>,
     pub added: Vec<String>,
-    /// On disk and not in the version. **Nothing deletes them**, but they are
-    /// the saves made *after* the version being restored, so they are the ones
-    /// worth reading before saying yes.
+    /// On disk and not in the version, and left there. They are the saves
+    /// made *after* the version being restored, so they are the ones worth
+    /// reading before saying yes.
     pub local_only: Vec<String>,
+    /// On disk, not in the version, and inside the shared world it replaces
+    /// whole: moved into the conflicts folder before the version is written,
+    /// and kept there for the retention period.
+    pub world_set_aside: Vec<String>,
     /// On the owner's restore of a shared save: overwritten files outside the
     /// share's list, whose current bytes may be in no version yet. The restore
     /// copies them into the side-copy folder before writing.
@@ -39,6 +43,7 @@ pub struct PreviewOut {
     pub modified_count: usize,
     pub added_count: usize,
     pub local_only_count: usize,
+    pub world_set_aside_count: usize,
     pub outside_share_count: usize,
     pub unchanged: usize,
     pub bytes_to_write: u64,
@@ -173,7 +178,7 @@ pub async fn apply(
     // restoring overwrites and that deserves saying beforehand; with `--dry-run`
     // it is all the command does.
     let (preview, preview_error) = match hoard_agent::preview::restore_preview(
-        &client, &save_id, version, &dest, &gate, outside,
+        &client, &save_id, version, &dest, &gate, outside, &world,
     )
     .await
     {
@@ -182,10 +187,12 @@ pub async fn apply(
                 modified: p.modified,
                 added: p.added,
                 local_only: p.local_only,
+                world_set_aside: p.world_set_aside,
                 outside_share: p.outside_share,
                 modified_count: p.modified_count,
                 added_count: p.added_count,
                 local_only_count: p.local_only_count,
+                world_set_aside_count: p.world_set_aside_count,
                 outside_share_count: p.outside_share_count,
                 unchanged: p.unchanged,
                 bytes_to_write: p.bytes_to_write,
@@ -395,10 +402,12 @@ fn clone_preview(p: &PreviewOut) -> PreviewOut {
         modified: p.modified.clone(),
         added: p.added.clone(),
         local_only: p.local_only.clone(),
+        world_set_aside: p.world_set_aside.clone(),
         outside_share: p.outside_share.clone(),
         modified_count: p.modified_count,
         added_count: p.added_count,
         local_only_count: p.local_only_count,
+        world_set_aside_count: p.world_set_aside_count,
         outside_share_count: p.outside_share_count,
         unchanged: p.unchanged,
         bytes_to_write: p.bytes_to_write,
@@ -443,6 +452,13 @@ fn print_preview(out: &RestoreOut, full: bool) {
             p.outside_share_count
         );
     }
+    if p.world_set_aside_count > 0 {
+        println!(
+            "{} file(s) of the shared world that this version does not have will be moved to \
+             the conflicts folder first, and kept there for the retention period",
+            p.world_set_aside_count
+        );
+    }
 
     if !full {
         return;
@@ -468,6 +484,11 @@ fn print_preview(out: &RestoreOut, full: bool) {
         p.outside_share_count,
     );
     listed("created", &p.added, p.added_count);
+    listed(
+        "only on disk, in the shared world (will be moved aside)",
+        &p.world_set_aside,
+        p.world_set_aside_count,
+    );
     listed(
         "only on disk (kept, but newer than this version)",
         &p.local_only,

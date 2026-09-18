@@ -119,7 +119,11 @@ pub async fn list_save_snapshots(
 fn restore_gate(
     save_id: &str,
     allow_config: bool,
-) -> (hoard_core::kernel::fileclass::RestoreGate, Vec<String>) {
+) -> (
+    hoard_core::kernel::fileclass::RestoreGate,
+    Vec<String>,
+    Vec<String>,
+) {
     CliState::load_default()
         .ok()
         .and_then(|(st, _)| {
@@ -131,6 +135,9 @@ fn restore_gate(
                         allow_config,
                     ),
                     hoard_agent::savefilter::owner_share_include(s.shared.as_ref()).to_vec(),
+                    s.shared
+                        .as_ref()
+                        .map_or_else(Vec::new, |shared| shared.world().to_vec()),
                 )
             })
         })
@@ -141,6 +148,7 @@ fn restore_gate(
                     allow_device_local: allow_config,
                     ..Default::default()
                 },
+                Vec::new(),
                 Vec::new(),
             )
         })
@@ -170,10 +178,14 @@ pub async fn preview_restore(
                 .ok_or_else(|| "NEEDS_DESTINATION".to_string())?
         }
     };
-    let (gate, outside) = restore_gate(&save_id, allow_config);
-    hoard_agent::preview::restore_preview(&client, &save_id, version, &dest, &gate, &outside)
-        .await
-        .map_err(pretty_error)
+    // The restore writes into the folder it previews, the save's own (a
+    // picked folder becomes it), so the world's set-aside is announced.
+    let (gate, outside, world) = restore_gate(&save_id, allow_config);
+    hoard_agent::preview::restore_preview(
+        &client, &save_id, version, &dest, &gate, &outside, &world,
+    )
+    .await
+    .map_err(pretty_error)
 }
 
 /// Detail view: snapshot metadata + per-file list, used by the expandable
@@ -363,7 +375,8 @@ pub struct RestoreOutcome {
     pub destination: String,
     pub safety_version: Option<i64>,
     /// Files of the shared world the version does not have, moved into the
-    /// conflicts folder so the world's folder ends as the version's.
+    /// conflicts folder (kept there for the retention period) so the world's
+    /// folder ends as the version's.
     pub world_files_set_aside: usize,
 }
 
