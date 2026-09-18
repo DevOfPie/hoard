@@ -9056,6 +9056,95 @@ mod tests {
         assert!(!seen[1].1.contains("characters_local"), "{seen:?}");
     }
 
+    /// The third end-to-end run's save loop: a file the walk listed is gone
+    /// by the time it is hashed (the game deleted the previous generation).
+    /// The attempt walks the folder again at once, without spending one of the
+    /// caller's retries, and the version goes up without it. A file that keeps
+    /// vanishing is a normal failure after a bounded number of walks.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_file_gone_after_the_probe_walks_the_folder_again() {
+        use std::cell::Cell;
+        use std::rc::Rc;
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        write_file(&root.join("worlds_local/Alpha.db"), b"alpha");
+        let old = root.join("worlds_local/Alpha.db.old");
+        let upload = |url: String| {
+            let root = root.clone();
+            async move {
+                crate::backup::upload_directory(
+                    &ApiClient::new(&url, "fake").unwrap(),
+                    "w1",
+                    "valheim",
+                    &[],
+                    &[],
+                    "main",
+                    &root,
+                    Some(3),
+                    None,
+                    None,
+                    None,
+                    VersionOrigin::Automatic,
+                    |_, _| {},
+                )
+                .await
+            }
+        };
+        let set_hook = |f: Box<dyn Fn(&str)>| {
+            crate::backup::UPLOAD_HOOK.with(|h| *h.borrow_mut() = Some(f));
+        };
+
+        // Gone once, between the probe and the hash.
+        let walks = Rc::new(Cell::new(0u32));
+        {
+            let (walks, old) = (walks.clone(), old.clone());
+            set_hook(Box::new(move |phase| match phase {
+                "walk" => {
+                    walks.set(walks.get() + 1);
+                    if walks.get() == 1 {
+                        std::fs::write(&old, b"previous generation").unwrap();
+                    }
+                }
+                _ => {
+                    let _ = std::fs::remove_file(&old);
+                }
+            }));
+        }
+        let (url, seen) = refusing_server(vec![(200, INIT_V5), (201, COMMIT_V5)]).await;
+        let outcome = upload(url).await.expect("walked again and went up");
+        assert_eq!(outcome.snapshot.version_num, 5);
+        assert_eq!(walks.get(), 2);
+        {
+            let seen = seen.lock().unwrap();
+            assert_eq!(seen.len(), 2, "{seen:?}");
+            assert!(!seen[0].1.contains("Alpha.db.old"), "{seen:?}");
+        }
+
+        // Gone after every probe: bounded, then an ordinary failure.
+        walks.set(0);
+        {
+            let (walks, old) = (walks.clone(), old.clone());
+            set_hook(Box::new(move |phase| match phase {
+                "walk" => {
+                    walks.set(walks.get() + 1);
+                    std::fs::write(&old, b"previous generation").unwrap();
+                }
+                _ => {
+                    let _ = std::fs::remove_file(&old);
+                }
+            }));
+        }
+        let (url, seen) = refusing_server(vec![]).await;
+        let err = upload(url).await.expect_err("it never stays");
+        crate::backup::UPLOAD_HOOK.with(|h| *h.borrow_mut() = None);
+        assert!(
+            err.downcast_ref::<crate::backup::VanishedAfterWalk>().is_some(),
+            "{err:#}"
+        );
+        assert_eq!(walks.get(), 6, "one walk and five more");
+        assert!(seen.lock().unwrap().is_empty(), "nothing was sent");
+    }
+
     /// M-3: a local copy that cannot be read is different from the version's,
     /// not a reason to fail: an explicit restore backs it up (a rename needs no
     /// read) and writes the version's. Before, "restore without the safety

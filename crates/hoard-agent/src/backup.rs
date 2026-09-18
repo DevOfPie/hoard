@@ -189,6 +189,64 @@ where
     }
 }
 
+/// A file the walk listed was gone when the upload came to read it: it left
+/// the folder after the walk (a game rotating its save generations). Not a
+/// failure of the push: [`upload_directory`] walks again.
+#[derive(Debug, thiserror::Error)]
+#[error("{path} left the folder after the walk")]
+pub struct VanishedAfterWalk {
+    /// Relative to the save.
+    pub path: String,
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Called by an upload attempt with where it is (`walk`, before the walk;
+    /// `probed`, after the probe), on this thread: a test changes the folder
+    /// between the two.
+    pub(crate) static UPLOAD_HOOK: std::cell::RefCell<Option<Box<dyn Fn(&str)>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn upload_hook(phase: &str) {
+    UPLOAD_HOOK.with(|h| {
+        if let Some(f) = h.borrow().as_ref() {
+            f(phase)
+        }
+    });
+}
+
+/// Is `e` a [`VanishedAfterWalk`]?
+fn vanished_after_walk(e: &anyhow::Error) -> bool {
+    // `downcast_ref`, not `chain()`: it is attached as context, and anyhow
+    // finds a context type through every layer above it.
+    e.downcast_ref::<VanishedAfterWalk>().is_some()
+}
+
+/// `e` as a [`VanishedAfterWalk`] for `rel` when the file was not found, else
+/// as it was.
+fn vanished_or(e: anyhow::Error, rel: &str) -> anyhow::Error {
+    let not_found = e.chain().any(|c| {
+        c.downcast_ref::<std::io::Error>()
+            .is_some_and(|io| io.kind() == std::io::ErrorKind::NotFound)
+    });
+    if not_found {
+        return e.context(VanishedAfterWalk {
+            path: rel.to_string(),
+        });
+    }
+    e
+}
+
+/// Opens a file the walk listed, for sending: gone is [`VanishedAfterWalk`].
+async fn open_listed(f: &UploadFile) -> Result<tokio::fs::File> {
+    tokio::fs::File::open(&f.absolute_path)
+        .await
+        .with_context(|| format!("opening {}", f.absolute_path.display()))
+        .map_err(|e| vanished_or(e, &f.relative_path))
+}
+
 /// The source directory exists but holds no regular files to upload (only empty
 /// subdirs, or nothing). Typed so the agent can treat it as "nothing to back up"
 /// (a `BackupSkippedEmpty`) rather than a red failure: pushing an empty snapshot
@@ -699,11 +757,22 @@ async fn compute_content_signature(files: &[UploadFile]) -> String {
         }
         .await;
         if let Err(e) = read {
-            tracing::warn!(
-                path = %f.relative_path,
-                error = %format!("{e:#}"),
-                "hashing: skipping unreadable file"
-            );
+            // Gone since the walk (a game rotating its save generations) is
+            // not a file that can't be read: nothing to warn about, and the
+            // upload walks the folder again.
+            let gone = e.chain().any(|c| {
+                c.downcast_ref::<std::io::Error>()
+                    .is_some_and(|io| io.kind() == std::io::ErrorKind::NotFound)
+            });
+            if gone {
+                tracing::debug!(path = %f.relative_path, "hashing: a file left the folder after the walk");
+            } else {
+                tracing::warn!(
+                    path = %f.relative_path,
+                    error = %format!("{e:#}"),
+                    "hashing: skipping unreadable file"
+                );
+            }
             h.update(UNREADABLE_MARKER);
         }
         h.update([0u8]);
@@ -767,14 +836,9 @@ async fn split_unreadable(files: Vec<UploadFile>) -> (Vec<UploadFile>, Vec<Unrea
         match outcome {
             Probe::Readable(f) => readable.push(f),
             Probe::Vanished => {}
-            Probe::Unreadable(u) => {
-                tracing::warn!(
-                    path = %u.relative_path,
-                    error = %u.error,
-                    "upload: leaving out a file whose bytes can't be read"
-                );
-                unreadable.push(u);
-            }
+            // Not said here: a world's file holds the push rather than being
+            // left out, and only the upload knows which it is.
+            Probe::Unreadable(u) => unreadable.push(u),
         }
     }
     (readable, unreadable)
@@ -979,6 +1043,66 @@ pub async fn upload_directory<F>(
     save_id: &str,
     game_slug: &str,
     include: &[String],
+    world: &[String],
+    label: &str,
+    source: &Path,
+    base_version: Option<i64>,
+    world_base_version: Option<i64>,
+    world_from: Option<i64>,
+    head: Option<&ServerHead>,
+    origin: VersionOrigin,
+    progress: F,
+) -> Result<UploadOutcome>
+where
+    F: Fn(u64, u64) + Send + Sync,
+{
+    // A file the walk listed and that is gone by the time it is hashed or sent
+    // (Valheim 1.0 deletes the previous generation on every save) fails the
+    // attempt it is in, not the push: the folder is walked again at once, and
+    // that does not count against the caller's retries. Dropping the file and
+    // going on is not enough, because the walk may predate the generation that
+    // replaced it. Bounded: past `MAX_REWALKS` it is an ordinary failure.
+    const MAX_REWALKS: u32 = 5;
+    let mut rewalks = 0u32;
+    loop {
+        let attempt = upload_directory_attempt(
+            client,
+            save_id,
+            game_slug,
+            include,
+            world,
+            label,
+            source,
+            base_version,
+            world_base_version,
+            world_from,
+            head,
+            origin,
+            &progress,
+        )
+        .await;
+        match attempt {
+            Err(e) if rewalks < MAX_REWALKS && vanished_after_walk(&e) => {
+                rewalks += 1;
+                tracing::info!(
+                    save_id,
+                    rewalks,
+                    error = %format!("{e:#}"),
+                    "upload: a file left the folder after the walk; walking it again"
+                );
+            }
+            other => return other,
+        }
+    }
+}
+
+/// One walk of [`upload_directory`]: walk, probe, hash, send.
+#[allow(clippy::too_many_arguments)]
+async fn upload_directory_attempt<F>(
+    client: &ApiClient,
+    save_id: &str,
+    game_slug: &str,
+    include: &[String],
     // The share's world (`WatchedSave::world`), empty for an unshared save:
     // none of its files may be left out of the version ([`PartialWorld`]).
     world: &[String],
@@ -1011,6 +1135,8 @@ where
         bail!("source must be a folder or a file: {}", source.display());
     }
 
+    #[cfg(test)]
+    upload_hook("walk");
     let files = walk_source(
         &source,
         Scope {
@@ -1031,11 +1157,20 @@ where
         .map(|f| (f.relative_path.clone(), (f.size_bytes, f.modified)))
         .collect();
     let (files, unreadable) = split_unreadable(files).await;
+    #[cfg(test)]
+    upload_hook("probed");
     // A shared world is never published without one of its files. One that
     // did not change since `world_from` goes up as that version's entry
     // instead; any other holds the push.
     let (carried, unreadable) =
         carry_unreadable_world(client, save_id, world, world_from, &walked, unreadable).await?;
+    for u in &unreadable {
+        tracing::warn!(
+            path = %u.relative_path,
+            error = %u.error,
+            "upload: leaving out a file whose bytes can't be read"
+        );
+    }
     if files.is_empty() {
         // Nothing readable is left: uploading here would publish an empty version
         // and delete the last good copy in the cloud.
@@ -1192,9 +1327,7 @@ where
             // open the handle, wrap it as a byte stream and hand it to reqwest
             // as a streaming multipart part. A 2 GB save no longer means 2 GB
             // of process memory.
-            let file = tokio::fs::File::open(&f.absolute_path)
-                .await
-                .with_context(|| format!("reading {}", f.absolute_path.display()))?;
+            let file = open_listed(f).await?;
             let stream = tokio_util::io::ReaderStream::new(file);
             let body = reqwest::Body::wrap_stream(stream);
             let part = multipart::Part::stream_with_length(body, f.size_bytes)
@@ -1237,7 +1370,9 @@ async fn hash_manifest(files: &[UploadFile]) -> Result<HashMap<&str, String>> {
     for f in files {
         hash_futs.push(
             async move {
-                let sha = hash_file(&f.absolute_path).await?;
+                let sha = hash_file(&f.absolute_path)
+                    .await
+                    .map_err(|e| vanished_or(e, &f.relative_path))?;
                 Ok::<_, anyhow::Error>((f.relative_path.as_str(), sha))
             }
             .boxed(),
@@ -1438,9 +1573,7 @@ where
                     return Ok::<_, anyhow::Error>(());
                 }
                 put_blob_paced(&f.relative_path, paced_wait_ms, || async {
-                    let file = tokio::fs::File::open(&f.absolute_path)
-                        .await
-                        .with_context(|| format!("opening {}", f.absolute_path.display()))?;
+                    let file = open_listed(f).await?;
                     let (stream, sent) = hashing_stream(file);
                     client
                         .cas_upload_blob(
@@ -1792,9 +1925,7 @@ where
                     }
                 } else {
                     put_blob_paced(&f.relative_path, paced_wait_ms, || async {
-                        let file = tokio::fs::File::open(&f.absolute_path)
-                            .await
-                            .with_context(|| format!("opening {}", f.absolute_path.display()))?;
+                        let file = open_listed(f).await?;
                         let (stream, sent) = hashing_stream(file);
                         client
                             .put_presigned(
