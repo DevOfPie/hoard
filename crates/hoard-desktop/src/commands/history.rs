@@ -465,6 +465,9 @@ pub async fn restore_snapshot(
                 &save_id,
                 &game_slug,
                 &include,
+                // A shared world's safety copy is a version like any other,
+                // and is held rather than published without one of its files.
+                shared.as_ref().map_or(&[][..], |s| s.world()),
                 &label,
                 &local_path,
                 // Pre-restore safety backup is an explicit user action; don't

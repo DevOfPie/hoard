@@ -5520,6 +5520,42 @@ async fn run_backup_with_retry(
                         .await;
                     return;
                 }
+                // A shared world one of whose files is unreadable, or over the
+                // plan's cap: published, it would move good copies out of every
+                // puller's world folder (HRD-Q-0027). Held like the unreadable
+                // folder below: no `BackupDone` (the changes stay pending), the
+                // warning on the game's card, and the failure backoff to try
+                // again, by when the game has usually let go of the file.
+                let partial = e
+                    .chain()
+                    .find_map(|c| c.downcast_ref::<crate::backup::PartialWorld>())
+                    .map(|p| (p.count, p.first.clone(), p.reason.clone()));
+                if let Some((count, first, reason)) = partial {
+                    tracing::warn!(
+                        save_id = %save.save_id,
+                        game_slug = %save.game_slug,
+                        count,
+                        path = %first,
+                        error = %reason,
+                        "agent: holding the push, the shared world would go up without some of its files"
+                    );
+                    let _ = events_tx
+                        .send(AgentEvent::BackupFilesUnreadable {
+                            save_id: save.save_id.clone(),
+                            game_slug: save.game_slug.clone(),
+                            label: save.label.clone(),
+                            count: count as u64,
+                            kept_files: 0,
+                            sample_path: first,
+                            sample_error: reason,
+                            uploaded: false,
+                        })
+                        .await;
+                    let _ = cmd_tx
+                        .send(AgentCommand::RetryBackupAfterFailure(save.save_id.clone()))
+                        .await;
+                    return;
+                }
                 // Not one file in the folder would be read, so there is no snapshot to
                 // upload: an empty version would delete the last good copy in the
                 // cloud. `BackupDone` is NOT sent (the local changes are still
@@ -9682,6 +9718,77 @@ mod tests {
         }
         assert!(after.contains_key("worlds_local/Alpha/_main.8.db2"));
         assert!(files_under(conflict_root).is_empty());
+    }
+
+    /// A member's push whose world holds a file that cannot be read is held,
+    /// not published without it: nothing reaches the server, the changes stay
+    /// pending (no `BackupDone`), the card is warned, and the failure backoff
+    /// tries again.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_shared_world_with_an_unreadable_file_holds_the_push() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let root = &tmp.path().join("save");
+        valheim_generation(root, "Alpha", 9, &["0_0.chunk"]);
+        let held = root.join("worlds_local/Alpha/0_0.chunk");
+        std::fs::set_permissions(&held, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let (url, seen) = crate::testserver::serve(|_| {
+            vec![crate::testserver::ok(
+                "GET /v1/health",
+                r#"{"status":"ok","version":"test","cas":true,"groups":true}"#,
+            )]
+        })
+        .await;
+        let (events_tx, mut events_rx) = mpsc::channel(64);
+        let (done_tx, mut done_rx) = mpsc::channel(8);
+        let (cmd_tx, mut cmd_rx) = mpsc::channel(8);
+
+        run_backup_with_retry(
+            ApiClient::new(url, "t").unwrap(),
+            member_world(root),
+            None,
+            Some(3),
+            None,
+            None,
+            VersionOrigin::Automatic,
+            false,
+            events_tx,
+            done_tx,
+            cmd_tx,
+            0,
+            false,
+            None,
+            14,
+        )
+        .await;
+        std::fs::set_permissions(&held, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        assert!(done_rx.try_recv().is_err(), "still pending");
+        assert!(matches!(
+            cmd_rx.try_recv(),
+            Ok(AgentCommand::RetryBackupAfterFailure(id)) if id == "w1"
+        ));
+        let mut warned = None;
+        while let Ok(evt) = events_rx.try_recv() {
+            if let AgentEvent::BackupFilesUnreadable {
+                sample_path,
+                uploaded,
+                ..
+            } = evt
+            {
+                warned = Some((sample_path, uploaded));
+            }
+        }
+        assert_eq!(
+            warned,
+            Some(("worlds_local/Alpha/0_0.chunk".to_string(), false))
+        );
+        assert!(
+            !seen.lock().unwrap().iter().any(|l| l.starts_with("POST")),
+            "nothing was uploaded: {:?}",
+            seen.lock().unwrap()
+        );
     }
 
     /// Mirror image: when the target is a strict subset of the snapshot

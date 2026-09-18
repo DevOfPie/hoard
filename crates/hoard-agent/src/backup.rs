@@ -14,7 +14,7 @@ use futures::stream::{self, StreamExt, TryStreamExt};
 use futures::FutureExt;
 use reqwest::multipart;
 use sha2::{Digest, Sha256};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -236,6 +236,69 @@ pub struct UnreadableSource {
     pub count: usize,
     /// The first one's error, which is the one that explains the rest.
     pub first: String,
+}
+
+/// A shared world would go up without some of its files: unreadable right now
+/// ([`split_unreadable`]), or left out by the plan's per-save cap
+/// ([`trim_to_cap`]).
+///
+/// A partial version of anything else is published with a warning, since a
+/// save minus one file beats no save. Not a shared world's: a member who pulls
+/// it has the world's folder made equal to it, and the files the version lacks
+/// are moved out of their live folder (HRD-Q-0027), so a partial world would
+/// take good copies away from everyone who pulls it. The push is held instead,
+/// on the failure backoff, until every file of the world can go up.
+#[derive(Debug, thiserror::Error)]
+#[error("holding the push: {count} file(s) of the shared world would be left out of the version ({first}: {reason})")]
+pub struct PartialWorld {
+    /// How many of the world's files would be left out.
+    pub count: usize,
+    /// The first of them, relative to the save.
+    pub first: String,
+    /// Why: the system error for an unreadable file, or the cap.
+    pub reason: String,
+}
+
+/// [`PartialWorld`] when any of `left_out` (relative path and reason) is part
+/// of the shared world `world`; nothing for an unshared save (`world` empty).
+fn refuse_partial_world<'a>(
+    world: &[String],
+    left_out: impl Iterator<Item = (&'a str, &'a str)>,
+) -> Result<(), PartialWorld> {
+    if world.is_empty() {
+        return Ok(());
+    }
+    let mut hit: Vec<(&str, &str)> = left_out
+        .filter(|(rel, _)| hoard_core::kernel::fileclass::included(world, rel))
+        .collect();
+    hit.sort();
+    match hit.first() {
+        None => Ok(()),
+        Some((first, reason)) => Err(PartialWorld {
+            count: hit.len(),
+            first: first.to_string(),
+            reason: reason.to_string(),
+        }),
+    }
+}
+
+/// [`refuse_partial_world`] over what a cap trim left out of `files`.
+fn refuse_trimmed_world(
+    world: &[String],
+    files: &[UploadFile],
+    kept: &[&UploadFile],
+    plan: &str,
+) -> Result<(), PartialWorld> {
+    let kept: HashSet<&str> = kept.iter().map(|f| f.relative_path.as_str()).collect();
+    let reason = format!("over the {plan} plan's per-save cap");
+    refuse_partial_world(
+        world,
+        files
+            .iter()
+            .map(|f| f.relative_path.as_str())
+            .filter(|rel| !kept.contains(rel))
+            .map(|rel| (rel, reason.as_str())),
+    )
 }
 
 /// One file enumerated from the source directory.
@@ -788,6 +851,9 @@ pub async fn upload_directory<F>(
     save_id: &str,
     game_slug: &str,
     include: &[String],
+    // The share's world (`WatchedSave::world`), empty for an unshared save:
+    // none of its files may be left out of the version ([`PartialWorld`]).
+    world: &[String],
     label: &str,
     source: &Path,
     base_version: Option<i64>,
@@ -828,6 +894,13 @@ where
     // so the caller can report it: a silently incomplete version is the outcome
     // that does not count.
     let (files, unreadable) = split_unreadable(files).await;
+    // A shared world is never published without one of its files.
+    refuse_partial_world(
+        world,
+        unreadable
+            .iter()
+            .map(|u| (u.relative_path.as_str(), u.error.as_str())),
+    )?;
     if files.is_empty() {
         // Nothing readable is left: uploading here would publish an empty version
         // and delete the last good copy in the cloud.
@@ -878,6 +951,7 @@ where
             client,
             save_id,
             game_slug,
+            world,
             label,
             &files,
             total_bytes,
@@ -1282,6 +1356,7 @@ async fn upload_directory_cloud<F>(
     client: &ApiClient,
     save_id: &str,
     game_slug: &str,
+    world: &[String],
     label: &str,
     files: &[UploadFile],
     total_bytes: u64,
@@ -1352,6 +1427,7 @@ where
     if let Some(cap) = client.plan_cap() {
         if total_bytes > cap.limit_bytes {
             if let Some(info) = trim_to_cap(&mut working, cap.limit_bytes, &cap.plan) {
+                refuse_trimmed_world(world, files, &working, &cap.plan)?;
                 tracing::debug!(
                     save_id,
                     game_slug,
@@ -1435,6 +1511,7 @@ where
                     // too-large.
                     return Err(e).context("cloud cas init");
                 };
+                refuse_trimmed_world(world, files, &working, &detail.plan)?;
                 tracing::warn!(
                     save_id,
                     game_slug,
@@ -2097,6 +2174,9 @@ where
     }
     let (prev_cheap, prev_content) = split_signature(prev_signature);
     let cheap = compute_set_signature(&files);
+    // The list itself still goes to the upload, which refuses to leave any of
+    // its files out.
+    let world_list = world;
     let world = world_signature(&files, world);
     // `is_deliberate` rather than `== Manual`: the safety net taken before a
     // restore counts too, and skipping it there is worse, since it is the copy that
@@ -2126,6 +2206,7 @@ where
         save_id,
         game_slug,
         include,
+        world_list,
         label,
         &canonical,
         base_version,
@@ -2607,6 +2688,103 @@ mod tests {
             !skipped[0].error.is_empty(),
             "the system error is the only actionable thing the user sees"
         );
+    }
+
+    /// A shared world is never uploaded without one of its files: the upload
+    /// stops before the network with [`PartialWorld`]. A file outside the
+    /// world (an owner's character) and an unshared save keep the old rule,
+    /// the file left out and reported.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_unreadable_world_file_refuses_the_upload() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        for rel in [
+            "worlds_local/Alpha/_main.2.db2",
+            "worlds_local/Alpha/0_0.chunk",
+            "characters_local/Me.fch",
+        ] {
+            std::fs::create_dir_all(root.join(rel).parent().unwrap()).unwrap();
+            std::fs::write(root.join(rel), rel).unwrap();
+        }
+        let world = crate::worldfiles::template("valheim", "Alpha")
+            .unwrap()
+            .unwrap();
+        let client = ApiClient::new("http://127.0.0.1:1", "t").unwrap();
+        let upload = |include: Vec<String>, world: Vec<String>| {
+            let client = client.clone();
+            let root = root.to_path_buf();
+            async move {
+                upload_directory(
+                    &client,
+                    "w1",
+                    "valheim",
+                    &include,
+                    &world,
+                    "main",
+                    &root,
+                    None,
+                    None,
+                    None,
+                    VersionOrigin::Automatic,
+                    |_, _| {},
+                )
+                .await
+            }
+        };
+        let lock = |rel: &str, mode: u32| {
+            std::fs::set_permissions(root.join(rel), std::fs::Permissions::from_mode(mode)).unwrap()
+        };
+
+        lock("worlds_local/Alpha/0_0.chunk", 0o000);
+        let member = upload(world.clone(), world.clone()).await;
+        let owner = upload(Vec::new(), world.clone()).await;
+        let unshared = upload(Vec::new(), Vec::new()).await;
+        lock("worlds_local/Alpha/0_0.chunk", 0o644);
+
+        for (who, result) in [("member", member), ("owner", owner)] {
+            let err = result.expect_err(who);
+            let partial = err
+                .downcast_ref::<PartialWorld>()
+                .unwrap_or_else(|| panic!("{who}: {err:#}"));
+            assert_eq!(partial.count, 1);
+            assert_eq!(partial.first, "worlds_local/Alpha/0_0.chunk");
+        }
+        let err = unshared.expect_err("the fake server is not there");
+        assert!(err.downcast_ref::<PartialWorld>().is_none(), "{err:#}");
+
+        // The owner's character is outside the world: left out and reported,
+        // as before, not a reason to hold the push.
+        lock("characters_local/Me.fch", 0o000);
+        let owner = upload(Vec::new(), world.clone()).await;
+        lock("characters_local/Me.fch", 0o644);
+        let err = owner.expect_err("the fake server is not there");
+        assert!(err.downcast_ref::<PartialWorld>().is_none(), "{err:#}");
+    }
+
+    /// The cap trim's side of the same rule: a trim that leaves a world file
+    /// out refuses, one that only drops files outside the world does not.
+    #[test]
+    fn a_cap_trim_that_drops_a_world_file_refuses() {
+        let file = |rel: &str, size: u64| UploadFile {
+            relative_path: rel.to_string(),
+            absolute_path: PathBuf::from(rel),
+            size_bytes: size,
+            modified: None,
+        };
+        let files = vec![
+            file("worlds_local/Alpha/0_0.chunk", 10),
+            file("characters_local/Me.fch", 10),
+        ];
+        let world = vec!["worlds_local/Alpha".to_string()];
+        let only_world: Vec<&UploadFile> = vec![&files[0]];
+        let only_character: Vec<&UploadFile> = vec![&files[1]];
+        assert!(refuse_trimmed_world(&world, &files, &only_world, "free").is_ok());
+        let err = refuse_trimmed_world(&world, &files, &only_character, "free").unwrap_err();
+        assert_eq!(err.first, "worlds_local/Alpha/0_0.chunk");
+        assert!(err.reason.contains("free"), "{}", err.reason);
+        assert!(refuse_trimmed_world(&[], &files, &only_character, "free").is_ok());
     }
 
     /// A subfolder without permission cannot bring down the whole game's backup:
