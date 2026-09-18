@@ -213,6 +213,39 @@ pub fn included(include: &[String], rel_path: &str) -> bool {
             .any(|pattern| pattern_covers(pattern, rel_path))
 }
 
+/// The entries of a shared save's list that could name a folder outright: no
+/// `*` or `?` anywhere in them. Whether one is a folder or a file is the
+/// disk's answer, not the list's; [`in_mirrored_folder`] only takes paths
+/// beneath one.
+pub fn mirrored_folders(include: &[String]) -> impl Iterator<Item = &str> {
+    include
+        .iter()
+        .map(String::as_str)
+        .filter(|pattern| !pattern.is_empty() && !pattern.contains(['*', '?']))
+}
+
+/// Is `rel_path` inside a folder the share names whole, so that a version
+/// written into the save replaces the folder's contents instead of merging
+/// into them (HRD-Q-0027)?
+///
+/// A game that renames its files on every save (Valheim 1.0's
+/// `worlds_local/<W>/_main.<N>.*` generations) leaves the older generation
+/// beside a pulled one, and the game loads the newest; files there that the
+/// version does not have are moved aside, never deleted. True when an entry of
+/// [`mirrored_folders`] equals the path's leading segments and the path has
+/// more segments than the entry: `worlds_local/Alpha` covers
+/// `worlds_local/Alpha/_main.8.db2` but neither `worlds_local/Alpha.db` nor
+/// `worlds_local/Alpha2/x`. A wildcard entry (`worlds_local/Alpha_backup_*`)
+/// and a flat file keep the merge. An empty list is no share: nothing is.
+pub fn in_mirrored_folder(include: &[String], rel_path: &str) -> bool {
+    mirrored_folders(include).any(|folder| {
+        rel_path
+            .strip_prefix(folder.trim_end_matches('/'))
+            .and_then(|rest| rest.strip_prefix('/'))
+            .is_some_and(|rest| !rest.is_empty())
+    })
+}
+
 /// Can any file under the directory `rel_dir` be [`included`]? The walk asks
 /// before descending, so a shared save's fingerprint never reads the folders
 /// its list cannot name. A pattern reaches beneath when its leading segments
@@ -681,6 +714,40 @@ mod tests {
             &inc(&["worlds_local/alpha.db"]),
             "worlds_local/Alpha.db"
         ));
+    }
+
+    /// HRD-Q-0027: only a folder named outright, and only beneath it.
+    #[test]
+    fn a_mirrored_folder_is_a_wildcard_free_entry_covering_paths_beneath_it() {
+        let list = inc(&[
+            "worlds_local/Alpha",
+            "worlds_local/Alpha.db",
+            "worlds_local/Alpha_backup_*",
+            "saves/slot?",
+        ]);
+        assert!(in_mirrored_folder(&list, "worlds_local/Alpha/_main.8.db2"));
+        assert!(in_mirrored_folder(&list, "worlds_local/Alpha/sub/x.chunk"));
+        // A sibling whose name starts the same is another world.
+        assert!(!in_mirrored_folder(&list, "worlds_local/Alpha2/x"));
+        assert!(!in_mirrored_folder(&list, "worlds_local/Alpha2"));
+        // The entry itself, and the legacy flat files beside it.
+        assert!(!in_mirrored_folder(&list, "worlds_local/Alpha"));
+        assert!(!in_mirrored_folder(&list, "worlds_local/Alpha.db"));
+        // Wildcard entries keep the merge, file or folder.
+        assert!(!in_mirrored_folder(
+            &list,
+            "worlds_local/Alpha_backup_auto-1/_main.3.db2"
+        ));
+        assert!(!in_mirrored_folder(&list, "saves/slot1/a.sav"));
+        // Case is exact, as in `included`.
+        assert!(!in_mirrored_folder(&list, "worlds_local/alpha/_main.8.db2"));
+        // Characters, and a save that is not shared at all.
+        assert!(!in_mirrored_folder(&list, "characters_local/Me.fch"));
+        assert!(!in_mirrored_folder(&[], "worlds_local/Alpha/_main.8.db2"));
+        assert_eq!(
+            mirrored_folders(&list).collect::<Vec<_>>(),
+            vec!["worlds_local/Alpha", "worlds_local/Alpha.db"]
+        );
     }
 
     /// `?` is one character of one segment, like everywhere else in the module.
