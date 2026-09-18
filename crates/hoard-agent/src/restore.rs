@@ -1660,6 +1660,153 @@ mod tests {
         .is_none());
     }
 
+    /// A version with a world file and a config file the default gate does
+    /// not write, for the three download paths below.
+    const GATED_VERSION: &[(&str, &[u8])] = &[
+        ("worlds_local/Alpha/_main.2.db2", b"generation two"),
+        ("worlds_local/Alpha.fwl", b"flat"),
+        ("graphics.ini", b"res=4k"),
+    ];
+
+    fn version_names() -> Vec<String> {
+        GATED_VERSION
+            .iter()
+            .map(|(rel, _)| rel.to_string())
+            .collect()
+    }
+
+    fn sorted(mut v: Vec<String>) -> Vec<String> {
+        v.sort();
+        v
+    }
+
+    /// The self-hosted tar path fills `version_files` with every entry of
+    /// the archive, the one the gate refuses included, and writes only what
+    /// the gate lets through.
+    #[tokio::test]
+    async fn the_tar_download_lists_every_file_of_the_version() {
+        let routes = crate::testserver::selfhosted_version("w1", 4, GATED_VERSION).await;
+        let (url, _) = crate::testserver::serve(move |_| routes).await;
+        let client = ApiClient::new(url, "t").unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let dest = tmp.path().join("save");
+
+        let outcome = download_snapshot(
+            &client,
+            "w1",
+            4,
+            &dest,
+            RestoreOptions::default(),
+            |_, _| {},
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(sorted(outcome.version_files), sorted(version_names()));
+        assert_eq!(outcome.files_extracted, 2);
+        assert!(!dest.join("graphics.ini").exists(), "the gate refused it");
+    }
+
+    /// Cloud's content-addressed path: the list is the manifest's, gate or
+    /// no gate.
+    #[tokio::test]
+    async fn the_cas_download_lists_every_file_of_the_version() {
+        use crate::testserver::{ok, sha_hex};
+        let (url, _) = crate::testserver::serve(|url| {
+            let files: Vec<serde_json::Value> = GATED_VERSION
+                .iter()
+                .map(|(rel, bytes)| {
+                    serde_json::json!({
+                        "relative_path": rel,
+                        "sha256": sha_hex(bytes),
+                        "size_bytes": bytes.len(),
+                        "download": {"method": "GET", "url": format!("{url}/blob/{}", sha_hex(bytes))},
+                    })
+                })
+                .collect();
+            let mut routes = vec![
+                ok("GET /v1/health", r#"{"status":"ok","version":"test","mode":"cloud"}"#),
+                ok(
+                    "GET /v1/cloud/saves/w1/versions/4/manifest",
+                    serde_json::json!({"content_addressed": true, "files": files}).to_string(),
+                ),
+            ];
+            for (_, bytes) in GATED_VERSION {
+                routes.push(ok(format!("GET /blob/{}", sha_hex(bytes)), bytes.to_vec()));
+            }
+            routes
+        })
+        .await;
+        let client = ApiClient::new(url, "t").unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let dest = tmp.path().join("save");
+
+        let outcome = download_snapshot(
+            &client,
+            "w1",
+            4,
+            &dest,
+            RestoreOptions::default(),
+            |_, _| {},
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(sorted(outcome.version_files), sorted(version_names()));
+        assert_eq!(outcome.files_extracted, 2);
+        assert!(!dest.join("graphics.ini").exists());
+    }
+
+    /// Cloud's legacy whole-archive path lists the archive's entries.
+    #[tokio::test]
+    async fn the_legacy_cloud_archive_lists_every_file_of_the_version() {
+        use crate::testserver::{ok, sha_hex};
+        let archive = crate::testserver::tar_zst(GATED_VERSION).await;
+        let (url, _) = crate::testserver::serve(move |url| {
+            vec![
+                ok(
+                    "GET /v1/health",
+                    r#"{"status":"ok","version":"test","mode":"cloud"}"#,
+                ),
+                ok(
+                    "GET /v1/cloud/saves/w1/versions/4/manifest",
+                    r#"{"content_addressed":false}"#,
+                ),
+                ok(
+                    "GET /v1/cloud/saves/w1/versions/4/download",
+                    serde_json::json!({
+                        "save_id": "w1",
+                        "version_num": 4,
+                        "sha256": sha_hex(&archive),
+                        "size_bytes": archive.len(),
+                        "download": {"method": "GET", "url": format!("{url}/archive")},
+                    })
+                    .to_string(),
+                ),
+                ok("GET /archive", archive),
+            ]
+        })
+        .await;
+        let client = ApiClient::new(url, "t").unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let dest = tmp.path().join("save");
+
+        let outcome = download_snapshot(
+            &client,
+            "w1",
+            4,
+            &dest,
+            RestoreOptions::default(),
+            |_, _| {},
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(sorted(outcome.version_files), sorted(version_names()));
+        assert_eq!(outcome.files_extracted, 2);
+        assert!(!dest.join("graphics.ini").exists());
+    }
+
     #[test]
     fn retryable_blob_error_covers_truncation_and_sha() {
         use anyhow::anyhow;
