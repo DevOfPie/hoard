@@ -986,8 +986,12 @@ fn persist_into(state: &mut CliState, event: &AgentEvent) -> bool {
     // The world's signature travels with the set's: a backup or a pull that
     // knows the one knows the other, and a stale world hash beside a fresh
     // set hash would let the owner push past a lease on the next start.
+    // And a world hash on its own too: an owner's pull that kept the owner's
+    // other writes ends with the set diverged (no set hash) and the world equal
+    // to the head's. Dropped, a restart reads that world as the owner's change
+    // and asks for the lease (L-2).
     let backup = matches!(event, AgentEvent::BackupSuccess { .. });
-    if backup || set_hash.is_some() {
+    if backup || set_hash.is_some() || world_hash.is_some() {
         entry.world_hash = world_hash;
     }
     if let Some(hash) = set_hash {
@@ -1117,6 +1121,24 @@ mod tests {
         let entry = &state.saves["w1"];
         assert_eq!(entry.set_hash.as_deref(), Some("new:"));
         assert_eq!(entry.world_hash.as_deref(), Some("newworld"));
+
+        // L-2, the owner's pull that kept the owner's other writes: the folder
+        // is not the head (no set hash), its world is. The world's signature is
+        // kept, so after a restart the owner's unchanged world is not read as a
+        // change that needs the lease.
+        assert!(persist_into(
+            &mut state,
+            &pulled(None, Some("world-at-v7"))
+        ));
+        let entry = &state.saves["w1"];
+        assert_eq!(entry.set_hash.as_deref(), Some("new:"), "the set is not");
+        assert_eq!(entry.world_hash.as_deref(), Some("world-at-v7"));
+        let restarted = hoard_agent::library::watched_saves_from_state(
+            &state,
+            &std::collections::HashSet::new(),
+        );
+        let w1 = restarted.iter().find(|s| s.save_id == "w1").unwrap();
+        assert_eq!(w1.world_hash.as_deref(), Some("world-at-v7"));
     }
 
     /// An engine down with a reason and no `Running`, which is how a `note_error`
