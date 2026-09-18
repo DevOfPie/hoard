@@ -199,12 +199,16 @@ pub struct VanishedAfterWalk {
     pub path: String,
 }
 
+/// A test's hook into [`upload_directory_attempt`].
+#[cfg(test)]
+pub(crate) type UploadHook = Box<dyn Fn(&str)>;
+
 #[cfg(test)]
 thread_local! {
     /// Called by an upload attempt with where it is (`walk`, before the walk;
     /// `probed`, after the probe), on this thread: a test changes the folder
     /// between the two.
-    pub(crate) static UPLOAD_HOOK: std::cell::RefCell<Option<Box<dyn Fn(&str)>>> =
+    pub(crate) static UPLOAD_HOOK: std::cell::RefCell<Option<UploadHook>> =
         const { std::cell::RefCell::new(None) };
 }
 
@@ -432,7 +436,10 @@ async fn carry_unreadable_world(
         .with_context(|| format!("reading version {from}'s files to carry its world"))?;
     let mut carried = Vec::with_capacity(in_world.len());
     for u in &in_world {
-        let entry = detail.files.iter().find(|f| f.relative_path == u.relative_path);
+        let entry = detail
+            .files
+            .iter()
+            .find(|f| f.relative_path == u.relative_path);
         let walked = walked.get(&u.relative_path);
         match (entry, walked) {
             (Some(e), Some((size, modified)))

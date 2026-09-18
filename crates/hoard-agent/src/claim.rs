@@ -2266,8 +2266,7 @@ mod tests {
                     2
                 },
                 needs_attention: parked,
-                retry_at: (!parked)
-                    .then(|| OffsetDateTime::now_utc() + time::Duration::minutes(5)),
+                retry_at: (!parked).then(|| OffsetDateTime::now_utc() + time::Duration::minutes(5)),
                 by_change: false,
             };
             // Held under its own lease, on the head: nothing to set aside.
@@ -2283,10 +2282,24 @@ mod tests {
                 on_lease(slot, LeaseObs::Free, None, false, &tx, Some(&lease));
             } else {
                 // On its ladder the lease stays (H-B-1); the owner forces it.
-                on_lease(slot, LeaseObs::Other, Some("owner".into()), false, &tx, Some(&lease));
+                on_lease(
+                    slot,
+                    LeaseObs::Other,
+                    Some("owner".into()),
+                    false,
+                    &tx,
+                    Some(&lease),
+                );
             }
             // The owner hosts, pushes v4 and gives the world back.
-            on_lease(slot, LeaseObs::Other, Some("owner".into()), false, &tx, Some(&lease));
+            on_lease(
+                slot,
+                LeaseObs::Other,
+                Some("owner".into()),
+                false,
+                &tx,
+                Some(&lease),
+            );
             on_lease(slot, LeaseObs::Free, None, false, &tx, Some(&lease));
             slot.cloud_head = Some(4);
             assert_eq!(
@@ -2365,7 +2378,10 @@ mod tests {
             b"db",
             "the file already moved came back"
         );
-        assert_eq!(std::fs::read(folder.join("worlds_local/Alpha.fwl")).unwrap(), b"fwl");
+        assert_eq!(
+            std::fs::read(folder.join("worlds_local/Alpha.fwl")).unwrap(),
+            b"fwl"
+        );
         assert!(!dir.join("worlds_local/Alpha.db").exists());
     }
 

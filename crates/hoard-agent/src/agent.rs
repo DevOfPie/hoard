@@ -9039,7 +9039,12 @@ mod tests {
         let mut sys = System::new();
         sys.refresh_processes_specifics(ProcessesToUpdate::All, true, proc_refresh_kind());
         let me = sysinfo::get_current_pid().unwrap();
-        let name = sys.process(me).unwrap().name().to_string_lossy().into_owned();
+        let name = sys
+            .process(me)
+            .unwrap()
+            .name()
+            .to_string_lossy()
+            .into_owned();
         let mut save = owner_save(dir.path());
         save.processes = vec![name];
         let slot = test_slot(save);
@@ -9372,7 +9377,8 @@ mod tests {
         let err = upload(url).await.expect_err("it never stays");
         crate::backup::UPLOAD_HOOK.with(|h| *h.borrow_mut() = None);
         assert!(
-            err.downcast_ref::<crate::backup::VanishedAfterWalk>().is_some(),
+            err.downcast_ref::<crate::backup::VanishedAfterWalk>()
+                .is_some(),
             "{err:#}"
         );
         assert_eq!(walks.get(), 6, "one walk and five more");
@@ -9386,22 +9392,35 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let folder = tmp.path().join("save");
         write_file(&folder.join("worlds_local/Alpha.db"), b"alpha");
-        write_file(&folder.join("worlds_local/Alpha.db.hoard-restore.tmp"), b"half");
-        write_file(&folder.join("worlds_local/Alpha/0_0.chunk.hoard-restore.tmp"), b"x");
+        write_file(
+            &folder.join("worlds_local/Alpha.db.hoard-restore.tmp"),
+            b"half",
+        );
+        write_file(
+            &folder.join("worlds_local/Alpha/0_0.chunk.hoard-restore.tmp"),
+            b"x",
+        );
         write_file(&folder.join("notes.tmp"), b"the game's own");
         assert_eq!(sweep_restore_temps(&folder), 2);
         assert!(folder.join("worlds_local/Alpha.db").exists());
         assert!(folder.join("notes.tmp").exists());
-        assert!(!folder.join("worlds_local/Alpha.db.hoard-restore.tmp").exists());
+        assert!(!folder
+            .join("worlds_local/Alpha.db.hoard-restore.tmp")
+            .exists());
 
         // Before a merge: a leftover whose name the version does not reuse.
-        write_file(&folder.join("worlds_local/Alpha.db.old.hoard-restore.tmp"), b"x");
+        write_file(
+            &folder.join("worlds_local/Alpha.db.old.hoard-restore.tmp"),
+            b"x",
+        );
         let staging = tmp.path().join("staging");
         write_file(&staging.join("worlds_local/Alpha.db"), b"alpha");
         restore_files_into(&folder, &staging, None, Scope::default(), &[])
             .await
             .unwrap();
-        assert!(!folder.join("worlds_local/Alpha.db.old.hoard-restore.tmp").exists());
+        assert!(!folder
+            .join("worlds_local/Alpha.db.old.hoard-restore.tmp")
+            .exists());
     }
 
     /// L-7: staging sits beside the conflicts tree, under the state folder, so
@@ -9441,7 +9460,10 @@ mod tests {
         assert_eq!(sweep_stale_staging_in(root, &alive), 1);
         assert!(!root.join("hoard-restore-w1-0-4000001").exists());
         assert!(root.join("hoard-restore-w1-1-4000002").exists(), "alive");
-        assert!(root.join(format!("hoard-restore-w1-2-{me}")).exists(), "ours");
+        assert!(
+            root.join(format!("hoard-restore-w1-2-{me}")).exists(),
+            "ours"
+        );
         assert!(root.join("hoard-restore-notapid").exists());
         assert!(root.join("something-else-4000001").exists());
     }
@@ -9481,7 +9503,11 @@ mod tests {
         assert_eq!(std::fs::read(&local).unwrap(), b"new");
         let kept = backup.join("worlds_local/Alpha.db");
         std::fs::set_permissions(&kept, std::fs::Permissions::from_mode(0o644)).unwrap();
-        assert_eq!(std::fs::read(&kept).unwrap(), b"old", "the local copy is kept");
+        assert_eq!(
+            std::fs::read(&kept).unwrap(),
+            b"old",
+            "the local copy is kept"
+        );
     }
 
     /// M-2: an owner's push whose world is the synced one, file for file, is
@@ -9560,7 +9586,10 @@ mod tests {
         {
             let seen = seen.lock().unwrap();
             assert_eq!(seen.len(), 3, "{seen:?}");
-            assert!(seen[0].0.starts_with("GET /v1/saves/w1/snapshots/3"), "{seen:?}");
+            assert!(
+                seen[0].0.starts_with("GET /v1/saves/w1/snapshots/3"),
+                "{seen:?}"
+            );
             let init = &seen[1].1;
             assert!(init.contains("characters_local/Me.fch"), "{init}");
             assert!(

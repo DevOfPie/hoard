@@ -1126,10 +1126,7 @@ mod tests {
         // is not the head (no set hash), its world is. The world's signature is
         // kept, so after a restart the owner's unchanged world is not read as a
         // change that needs the lease.
-        assert!(persist_into(
-            &mut state,
-            &pulled(None, Some("world-at-v7"))
-        ));
+        assert!(persist_into(&mut state, &pulled(None, Some("world-at-v7"))));
         let entry = &state.saves["w1"];
         assert_eq!(entry.set_hash.as_deref(), Some("new:"), "the set is not");
         assert_eq!(entry.world_hash.as_deref(), Some("world-at-v7"));

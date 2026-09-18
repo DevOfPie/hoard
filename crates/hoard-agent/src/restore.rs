@@ -1984,7 +1984,10 @@ mod tests {
         assert_eq!(kept.len(), 1, "{kept:?}");
         let moved = tree(done.moved_to.as_deref().unwrap());
         assert_eq!(moved.get("characters_local/Me.fch").unwrap(), b"me now");
-        assert_eq!(tree(&save).get("characters_local/Me.fch").unwrap(), b"me at v4");
+        assert_eq!(
+            tree(&save).get("characters_local/Me.fch").unwrap(),
+            b"me at v4"
+        );
     }
 
     #[tokio::test]
