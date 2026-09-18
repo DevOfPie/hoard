@@ -920,6 +920,29 @@ pub async fn pump(
 /// cursor and the anti-reupload signature. Without this, every daemon restart would
 /// re-upload identical snapshots and re-download to diff them.
 fn persist(event: &AgentEvent) {
+    if !matches!(
+        event,
+        AgentEvent::BackupSuccess { .. } | AgentEvent::SaveAutoRestored { .. }
+    ) {
+        return;
+    }
+    let (mut state, path) = match CliState::load_default() {
+        Ok(v) => v,
+        Err(err) => {
+            tracing::warn!(error = %err, "hoardd: couldn't load state.json to persist an event");
+            return;
+        }
+    };
+    if !persist_into(&mut state, event) {
+        return;
+    }
+    if let Err(err) = state.save(&path) {
+        tracing::warn!(error = %err, "hoardd: couldn't write state.json");
+    }
+}
+
+/// [`persist`]'s decision over a loaded state: `true` when it changed.
+fn persist_into(state: &mut CliState, event: &AgentEvent) -> bool {
     let (save_id, version, set_hash, world_hash) = match event {
         AgentEvent::BackupSuccess {
             save_id,
@@ -935,43 +958,45 @@ fn persist(event: &AgentEvent) {
         ),
         // After a restore the slot is synced to that version: remembering it is what
         // makes the version gate survive a restart.
+        // And the folder's signatures after the merge, when it ended equal
+        // to the head: without them a restart reads the pull's own writes as
+        // a change, takes the lease and pushes the head back (F1).
         AgentEvent::SaveAutoRestored {
             save_id,
             version_num,
+            set_hash,
+            world_hash,
             ..
-        } => (save_id, Some(*version_num), None, None),
-        _ => return,
+        } => (
+            save_id,
+            Some(*version_num),
+            set_hash.clone(),
+            world_hash.clone(),
+        ),
+        _ => return false,
     };
 
-    let (mut state, path) = match CliState::load_default() {
-        Ok(v) => v,
-        Err(err) => {
-            tracing::warn!(error = %err, "hoardd: couldn't load state.json to persist an event");
-            return;
-        }
-    };
     let Some(entry) = state.saves.get_mut(save_id) else {
         // Un save de la nube respaldado antes de adoptarlo no tiene fila local.
-        return;
+        return false;
     };
     if let Some(v) = version {
         entry.last_version_num = Some(v);
     }
+    // The world's signature travels with the set's: a backup or a pull that
+    // knows the one knows the other, and a stale world hash beside a fresh
+    // set hash would let the owner push past a lease on the next start.
+    let backup = matches!(event, AgentEvent::BackupSuccess { .. });
+    if backup || set_hash.is_some() {
+        entry.world_hash = world_hash;
+    }
     if let Some(hash) = set_hash {
         entry.set_hash = Some(hash);
     }
-    // The world's signature travels with the set's: a backup that knows the
-    // one knows the other, and a stale world hash beside a fresh set hash
-    // would let the owner push past a lease on the next start.
-    if matches!(event, AgentEvent::BackupSuccess { .. }) {
-        entry.world_hash = world_hash;
-    }
-    if matches!(event, AgentEvent::BackupSuccess { .. }) {
+    if backup {
         entry.last_backup_at = Some(OffsetDateTime::now_utc());
     }
-    if let Err(err) = state.save(&path) {
-        tracing::warn!(error = %err, "hoardd: couldn't write state.json");
-    }
+    true
 }
 
 /// Re-hydrates the watched save set from `state.json` and hands the engine the
@@ -1043,6 +1068,56 @@ pub async fn apply_reseat(engine: &Engine, reseat: library::LiveReseat) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// F1: a pull that left the folder equal to the head persists its
+    /// signatures with the version, so a restart seeds the slot as synced.
+    /// One that kept local changes (no signature) keeps the stored ones.
+    #[test]
+    fn a_landed_pull_persists_the_folders_signatures() {
+        let mut state = CliState::default();
+        state.saves.insert(
+            "w1".into(),
+            hoard_agent::state::SaveState {
+                local_path: "/saves/w1".into(),
+                game_slug: "valheim".into(),
+                label: "main".into(),
+                last_backup_at: None,
+                last_version_num: Some(6),
+                paused: false,
+                preset: None,
+                allow_device_local: None,
+                shared: None,
+                include: Vec::new(),
+                set_hash: Some("old:abc".into()),
+                world_hash: Some("oldworld".into()),
+                processes: Vec::new(),
+                shared_processes: false,
+            },
+        );
+        let pulled =
+            |set_hash: Option<&str>, world_hash: Option<&str>| AgentEvent::SaveAutoRestored {
+                save_id: "w1".into(),
+                game_slug: "valheim".into(),
+                version_num: 7,
+                files_extracted: 3,
+                bytes_extracted: 10,
+                set_hash: set_hash.map(Into::into),
+                world_hash: world_hash.map(Into::into),
+            };
+        assert!(persist_into(&mut state, &pulled(None, None)));
+        let entry = &state.saves["w1"];
+        assert_eq!(entry.last_version_num, Some(7));
+        assert_eq!(entry.set_hash.as_deref(), Some("old:abc"));
+        assert_eq!(entry.world_hash.as_deref(), Some("oldworld"));
+
+        assert!(persist_into(
+            &mut state,
+            &pulled(Some("new:"), Some("newworld"))
+        ));
+        let entry = &state.saves["w1"];
+        assert_eq!(entry.set_hash.as_deref(), Some("new:"));
+        assert_eq!(entry.world_hash.as_deref(), Some("newworld"));
+    }
 
     /// An engine down with a reason and no `Running`, which is how a `note_error`
     /// leaves it. Enough for the two policies below, which only look at the state.

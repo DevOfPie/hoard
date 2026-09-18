@@ -737,6 +737,9 @@ export type AgentEvent =
       version_num: number;
       files_extracted: number;
       bytes_extracted: number;
+      /** The folder's signatures after the merge, for the service's state. */
+      set_hash?: string;
+      world_hash?: string;
     }
   | {
       type: "save_auto_restore_failed";

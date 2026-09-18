@@ -230,6 +230,18 @@ pub enum AgentEvent {
         version_num: i64,
         files_extracted: u64,
         bytes_extracted: u64,
+        /// The folder's signature after the merge, when it ended equal to the
+        /// head, in [`AgentEvent::BackupSuccess::set_hash`]'s shape. Persisted
+        /// with the version so a restart does not read the pull's own writes
+        /// as a change to push. `None` when the folder kept local changes, or
+        /// from an older daemon: the stored one stays.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        set_hash: Option<String>,
+        /// The shared world's signature after the merge, when it ended equal
+        /// to the head's. Persisted whenever `set_hash` is, `None` included,
+        /// so a stale world signature never outlives the pull.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        world_hash: Option<String>,
     },
     /// Auto-restore was attempted but failed (network error, sha mismatch,
     /// permission denied writing to the local path). Surfaced separately

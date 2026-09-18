@@ -3719,6 +3719,10 @@ fn spawn_auto_restore(
                             // announces a pull that changed the folder.
                             files_extracted: changed,
                             bytes_extracted: outcome.bytes_extracted,
+                            // What the slot adopts below, for `state.json`:
+                            // a restart then sees the folder as synced.
+                            set_hash: post_restore_set_hash.clone(),
+                            world_hash: post_restore_world_hash.clone(),
                         })
                         .await;
                     if outcome.conflicts_backed_up > 0 {
@@ -5501,6 +5505,9 @@ async fn run_backup_with_retry(
                                         version_num: outcome.version_num,
                                         files_extracted: touched,
                                         bytes_extracted: outcome.bytes_extracted,
+                                        // The push that follows persists them.
+                                        set_hash: None,
+                                        world_hash: None,
                                     })
                                     .await;
                                 if outcome.conflicts_backed_up > 0 {
@@ -10060,6 +10067,84 @@ mod tests {
         expected.insert("characters_local/Me.fch".into(), b"mine".to_vec());
         assert_eq!(files_under(root), expected);
         assert_eq!(outcome.world_files_set_aside, 4);
+    }
+
+    /// F1, restart: a pull that lands says the folder's signatures after the
+    /// merge, and a daemon started again from them (what `state.json` holds)
+    /// sees the folder as synced: nothing pending, no push, no lease asked.
+    /// Seeded from the stale signature, as before, it pushed the head back.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_restart_after_a_pull_sees_the_folder_synced() {
+        use kernel::reconcile::HOLD_LEASE_NEEDED;
+        let tmp = tempfile::tempdir().unwrap();
+        let root = &tmp.path().join("save");
+        let staging = &tmp.path().join("v4");
+        valheim_generation(root, "Alpha", 6, &["0_0.chunk"]);
+        write_file(&root.join("characters_local/Me.fch"), b"mine");
+        valheim_generation(staging, "Alpha", 8, &["0_0.chunk"]);
+        let v4 = files_under(staging);
+        let routes = crate::testserver::selfhosted_version("w1", 4, &as_routes_files(&v4)).await;
+        let (url, _) = crate::testserver::serve(move |_| routes).await;
+        let (events_tx, mut events_rx) = mpsc::channel(16);
+        let (cmd_tx, mut cmd_rx) = mpsc::channel(16);
+        let mut before = member_world(root);
+        before.known_version = Some(1);
+        spawn_auto_restore(
+            before,
+            ApiClient::new(url, "t").unwrap(),
+            events_tx,
+            cmd_tx,
+            Some(tmp.path().join("conflicts")),
+            14,
+            Some(1),
+            None,
+            None,
+            None,
+        );
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while !matches!(
+                cmd_rx.recv().await,
+                Some(AgentCommand::AutoRestoreFinished { .. })
+            ) {}
+        })
+        .await
+        .expect("the pull finishes");
+        let mut persisted = None;
+        while let Ok(evt) = events_rx.try_recv() {
+            if let AgentEvent::SaveAutoRestored {
+                version_num,
+                set_hash,
+                world_hash,
+                ..
+            } = evt
+            {
+                persisted = Some((version_num, set_hash, world_hash));
+            }
+        }
+        let (version, set_hash, world_hash) = persisted.expect("the pull was announced");
+        assert!(set_hash.is_some() && world_hash.is_some());
+
+        // The restart: the row as `state.json` now holds it.
+        let mut restarted = member_world(root);
+        restarted.known_version = Some(version);
+        restarted.set_hash = set_hash;
+        restarted.world_hash = world_hash;
+        let mut slots = HashMap::new();
+        let (fs_tx, _fs_rx) = mpsc::channel(4);
+        handle_add(&mut slots, restarted, &fs_tx);
+        let slot = slots.get_mut("w1").unwrap();
+        assert!(!slot.has_pending, "the pull's own writes are not a change");
+        let decisions = crate::agent::test_decisions(slot);
+        assert!(
+            !decisions.iter().any(|d| matches!(
+                d,
+                kernel::Decision::Act(kernel::Action::Backup)
+                    | kernel::Decision::Hold {
+                        reason: HOLD_LEASE_NEEDED
+                    }
+            )),
+            "{decisions:?}"
+        );
     }
 
     /// A pull whose only change is moving the previous generation's files
