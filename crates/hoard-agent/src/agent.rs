@@ -1208,6 +1208,11 @@ pub(crate) struct SaveSlot {
     /// failed or moved nothing). The slot stays a viewer and asks for no
     /// lease until `has_pending` clears, so they never go up as the head.
     pub(crate) local_only_pending: bool,
+    /// A held world's side copy failed (M-2): when it may be tried again,
+    /// despite `local_only_pending`. The held ladder's next deadline, or now
+    /// on a change to the save; `None` waits for a change
+    /// (`claim::set_aside_behind`).
+    pub(crate) held_side_copy_retry_at: Option<OffsetDateTime>,
     /// GameStarted came while a side copy was landing: the new session opens
     /// when the copy does (`claim::on_side_copied`). Cleared by GameStopped.
     pub(crate) relaunch_pending: bool,
@@ -3545,6 +3550,7 @@ fn handle_add(
         role: WorldRole::Host,
         role_pinned: false,
         local_only_pending: false,
+        held_side_copy_retry_at: None,
         relaunch_pending: false,
         side_copy_landed_at: None,
         lease_requested: false,
@@ -5303,7 +5309,7 @@ fn hit_reaches_walk(slot: &SaveSlot, paths: &[PathBuf]) -> bool {
 /// out the backoff for it is what held the H1 recovery for ten minutes. The
 /// retry is not counted toward the held push's budget, so a burst of saves
 /// does not park it.
-fn mark_fs_hit(slot: &mut SaveSlot, now: OffsetDateTime) {
+pub(crate) fn mark_fs_hit(slot: &mut SaveSlot, now: OffsetDateTime) {
     slot.has_pending = true;
     slot.last_fs_event_at = Some(now);
     slot.needs_l1 = true;
@@ -5312,6 +5318,10 @@ fn mark_fs_hit(slot: &mut SaveSlot, now: OffsetDateTime) {
         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     if kernel::reconcile::retry_held_world(&mut slot.world_held) {
         tracing::info!(save_id = %slot.save.save_id, "agent: the save changed while its world push was held; trying again");
+        // And a held world's failed side copy, once the folder is quiet.
+        if slot.local_only_pending {
+            slot.held_side_copy_retry_at = Some(now);
+        }
     }
 }
 
@@ -7367,6 +7377,7 @@ pub(crate) fn test_slot(save: WatchedSave) -> SaveSlot {
         role: WorldRole::Host,
         role_pinned: false,
         local_only_pending: false,
+        held_side_copy_retry_at: None,
         relaunch_pending: false,
         side_copy_landed_at: None,
         lease_requested: false,

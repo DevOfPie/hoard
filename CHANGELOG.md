@@ -77,7 +77,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   stops, with the game closed, the lease is given back so another member can
   host. Once the shared version moves past a held push, the held changes go
   to the conflicts folder and the new version comes down, whoever holds the
-  lease. An owner whose world is unchanged is not held for a world file that
+  lease; a move to the conflicts folder that fails is tried again at the next
+  retry, or after the next change once the push has stopped. An owner whose world is unchanged is not held for a world file that
   cannot be read: the characters go up and the version keeps the synced copy
   of that file (self-hosted 1.1.3 or later). A file deleted while the push
   reads the folder makes it read the folder again rather than fail. A restore

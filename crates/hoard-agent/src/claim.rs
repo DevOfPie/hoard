@@ -506,8 +506,15 @@ fn catch_up(slot: &mut SaveSlot, lease: Option<&LeaseHandle>) {
 /// world back), and parked or on its ladder. Its writes can never go up over
 /// that head, and waiting for its own next attempt to be refused as stale
 /// held the pull for minutes, and for good once parked, since a parked push
-/// makes no attempt of its own. Never under this machine's own lease.
+/// makes no attempt of its own. Never under this machine's own lease. A held
+/// world's side copy that failed is tried again (M-2), on the held ladder's
+/// deadline or after a change to the save (`held_side_copy_retry_at`): the
+/// files that held it are the ones that may not move, and waiting as a viewer
+/// for good left the world behind the head for good.
 fn set_aside_behind(slot: &mut SaveSlot, now: Instant) -> bool {
+    let wall = OffsetDateTime::now_utc();
+    let retry_due =
+        slot.world_held.active() && slot.held_side_copy_retry_at.is_some_and(|t| wall >= t);
     let hosted_elsewhere = (slot.save.owns_whole_folder() || slot.world_held.active())
         && slot.lease == LeaseObs::Other;
     let held_behind = slot.world_held.active()
@@ -519,14 +526,13 @@ fn set_aside_behind(slot: &mut SaveSlot, now: Instant) -> bool {
         || !slot.has_pending
         || slot.is_running
         || slot.in_flight.is_some()
-        || slot.local_only_pending
+        || (slot.local_only_pending && !retry_due)
         || slot.lease == LeaseObs::Mine
         // Only the world is set aside, the owner's included (HRD-D-0019).
         || !crate::agent::world_pending(slot)
     {
         return false;
     }
-    let wall = OffsetDateTime::now_utc();
     if slot
         .last_fs_event_at
         .is_some_and(|t| (wall - t).whole_seconds() < RECENT_SAVE_GRACE_SECS)
@@ -534,6 +540,10 @@ fn set_aside_behind(slot: &mut SaveSlot, now: Instant) -> bool {
         tracing::debug!(save_id = %slot.save.save_id, "agent: behind the head, but the folder was written recently; not setting it aside yet");
         return false;
     }
+    if retry_due {
+        tracing::info!(save_id = %slot.save.save_id, "agent: trying the held world's side copy again");
+    }
+    slot.held_side_copy_retry_at = None;
     tracing::info!(save_id = %slot.save.save_id, "agent: behind the head with local writes; setting them aside before the pull");
     let mut session = WorldSession::new(now);
     session.claimed = true;
@@ -1175,6 +1185,13 @@ pub(crate) fn on_side_copy_failed(
     }
     if slot.has_pending {
         end_session_local_only(slot);
+        // A held world tries again on its ladder's next deadline (M-2); with
+        // none ahead (parked), on the next change.
+        let wall = OffsetDateTime::now_utc();
+        slot.held_side_copy_retry_at = slot
+            .world_held
+            .retry_at
+            .filter(|t| slot.world_held.active() && *t > wall);
     } else {
         end_session(slot);
     }
@@ -2226,6 +2243,63 @@ mod tests {
                 let slot = &s["w1"];
                 assert_eq!(slot.world_held, kernel::WorldHeld::default());
             }
+        }
+    }
+
+    /// M-2: a held world's side copy that failed (a file that will not move)
+    /// is tried again: on the held ladder's deadline, or, parked, after a
+    /// change once the folder is quiet. Not on every pass.
+    #[tokio::test(start_paused = true)]
+    async fn a_held_worlds_failed_side_copy_is_tried_again() {
+        let now = Instant::now();
+        for parked in [false, true] {
+            let (tx, _rx) = mpsc::channel(8);
+            let mut s = slots(vec![world("w1", "valheim")]);
+            let deadline = OffsetDateTime::now_utc() + time::Duration::minutes(15);
+            {
+                let slot = s.get_mut("w1").unwrap();
+                slot.lease = LeaseObs::Other;
+                slot.has_pending = true;
+                slot.world_held = kernel::WorldHeld {
+                    consecutive: 2,
+                    needs_attention: parked,
+                    retry_at: (!parked).then_some(deadline),
+                    by_change: false,
+                };
+                assert_eq!(on_reconciled(slot, now, &tx, None), Followup::SideCopy);
+            }
+            on_side_copy_failed(&mut s, "w1", now, &tx);
+            let slot = s.get_mut("w1").unwrap();
+            assert!(slot.local_only_pending, "parked={parked}");
+            assert_eq!(
+                on_reconciled(slot, now, &tx, None),
+                Followup::Nothing,
+                "parked={parked}"
+            );
+            if parked {
+                assert_eq!(slot.held_side_copy_retry_at, None);
+                let wall = OffsetDateTime::now_utc();
+                crate::agent::mark_fs_hit(slot, wall);
+                // Written just now: not while the game may still hold it.
+                assert_eq!(on_reconciled(slot, now, &tx, None), Followup::Nothing);
+                slot.last_fs_event_at =
+                    Some(wall - time::Duration::seconds(RECENT_SAVE_GRACE_SECS + 1));
+            } else {
+                assert_eq!(slot.held_side_copy_retry_at, Some(deadline));
+                // The ladder's deadline comes.
+                slot.held_side_copy_retry_at = Some(OffsetDateTime::now_utc());
+            }
+            assert_eq!(
+                on_reconciled(slot, now, &tx, None),
+                Followup::SideCopy,
+                "parked={parked}"
+            );
+            assert_eq!(slot.held_side_copy_retry_at, None);
+            // It lands this time.
+            on_side_copied(&mut s, "w1", 1, now, &tx);
+            let slot = &s["w1"];
+            assert!(!slot.local_only_pending);
+            assert!(slot.pull_pending, "parked={parked}");
         }
     }
 

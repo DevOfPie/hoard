@@ -169,7 +169,9 @@ retries; once it stops, with the game closed, the lease is given back so
 somebody else can host. If the shared version moves past yours while your
 push is held (somebody hosted and pushed), your held changes go to the
 conflicts folder and their version comes down, whoever holds the lease by
-then.
+then. If they cannot be moved there (the file that held the push will not
+move either), that is tried again at the push's next retry, or after the next
+change once it has stopped.
 
 The owner is held only when the world changed. When the world is the one
 last synced and only a file of it cannot be read, the owner's other files
