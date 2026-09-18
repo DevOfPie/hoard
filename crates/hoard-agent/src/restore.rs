@@ -556,13 +556,35 @@ pub(crate) async fn move_aside(from: &Path, to: &Path) -> Result<()> {
             .with_context(|| format!("creating {}", parent.display()))?;
     }
     if tokio::fs::rename(from, to).await.is_err() {
-        tokio::fs::copy(from, to)
-            .await
-            .with_context(|| format!("copying {} aside to {}", from.display(), to.display()))?;
-        tokio::fs::remove_file(from)
-            .await
-            .with_context(|| format!("removing {} after moving it aside", from.display()))?;
+        copy_then_remove(from, to).await?;
     }
+    Ok(())
+}
+
+/// The cross-filesystem half of a move: copy, stamp the copy with the
+/// original's mtime, remove the original. The mtime is what the pull's
+/// merge and the game's "latest save" pick go by, so a file put back must
+/// not come back as brand new (L-D). A failed stamp is logged, not fatal.
+pub(crate) async fn copy_then_remove(from: &Path, to: &Path) -> Result<()> {
+    let mtime = tokio::fs::metadata(from)
+        .await
+        .and_then(|m| m.modified())
+        .ok();
+    tokio::fs::copy(from, to)
+        .await
+        .with_context(|| format!("copying {} to {}", from.display(), to.display()))?;
+    if let Some(mtime) = mtime {
+        if let Err(e) = filetime::set_file_mtime(to, filetime::FileTime::from_system_time(mtime)) {
+            tracing::warn!(
+                to = %to.display(),
+                error = %e,
+                "restore: couldn't keep a moved file's mtime"
+            );
+        }
+    }
+    tokio::fs::remove_file(from)
+        .await
+        .with_context(|| format!("removing {} after moving it", from.display()))?;
     Ok(())
 }
 
@@ -1893,6 +1915,23 @@ mod tests {
         let p = root.join(rel);
         std::fs::create_dir_all(p.parent().unwrap()).unwrap();
         std::fs::write(p, bytes).unwrap();
+    }
+
+    /// L-D: the copy fallback of a move (another filesystem) keeps the
+    /// file's mtime, so a file put back is not mistaken for a newer one.
+    #[tokio::test]
+    async fn a_move_by_copy_keeps_the_mtime() {
+        let tmp = tempfile::tempdir().unwrap();
+        let from = tmp.path().join("a/0_0.chunk");
+        let to = tmp.path().join("b/0_0.chunk");
+        put(tmp.path(), "a/0_0.chunk", b"chunk");
+        let old = filetime::FileTime::from_unix_time(1_600_000_000, 0);
+        filetime::set_file_mtime(&from, old).unwrap();
+        std::fs::create_dir_all(to.parent().unwrap()).unwrap();
+        copy_then_remove(&from, &to).await.unwrap();
+        assert!(!from.exists());
+        let meta = std::fs::metadata(&to).unwrap();
+        assert_eq!(filetime::FileTime::from_last_modification_time(&meta), old);
     }
 
     /// S6b / M-B: an explicit restore whose download fails half-way through

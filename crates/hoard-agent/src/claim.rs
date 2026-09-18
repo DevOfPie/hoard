@@ -1043,8 +1043,7 @@ pub(crate) async fn move_world_aside(save: &WatchedSave, dir: &Path) -> anyhow::
             tokio::fs::create_dir_all(parent).await?;
         }
         if tokio::fs::rename(&f.absolute_path, &dest).await.is_err() {
-            tokio::fs::copy(&f.absolute_path, &dest).await?;
-            tokio::fs::remove_file(&f.absolute_path).await?;
+            crate::restore::copy_then_remove(&f.absolute_path, &dest).await?;
         }
         moved += 1;
     }
