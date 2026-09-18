@@ -3529,6 +3529,11 @@ fn handle_reseat(
     slot.last_running_seen = old.last_running_seen;
     slot.running_now = old.running_now;
     slot.fs_writes = old.fs_writes;
+    // A held world push stays held, ladder and all: its file is no more
+    // readable for the reseat, and a push dropped to "not held" would go
+    // again at once and start the budget over (L-5).
+    slot.world_held = old.world_held;
+    slot.last_world_held = old.last_world_held;
     mark_pending_if_diverged(slot);
 }
 
@@ -8918,6 +8923,30 @@ mod tests {
         mark_fs_hit(&mut throttled, now);
         assert_eq!(throttled.next_backup_at, Some(backoff));
         assert!(throttled.world_held.by_change);
+    }
+
+    /// L-5: a reseat keeps a held world push held, ladder and all.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_reseat_keeps_a_held_world_push() {
+        let dir = tempfile::tempdir().unwrap();
+        owner_folder(dir.path());
+        let mut slots = HashMap::new();
+        let (fs_tx, _fs_rx) = mpsc::channel(4);
+        handle_add(&mut slots, owner_save(dir.path()), &fs_tx);
+        let held = kernel::WorldHeld {
+            consecutive: 3,
+            retry_at: Some(OffsetDateTime::now_utc() + time::Duration::seconds(900)),
+            ..kernel::WorldHeld::default()
+        };
+        {
+            let slot = slots.get_mut("w1").unwrap();
+            slot.world_held = held;
+            slot.last_world_held = Some((1, "a.db".into(), "denied".into()));
+        }
+        handle_reseat(&mut slots, owner_save(dir.path()), &fs_tx);
+        let slot = slots.get_mut("w1").unwrap();
+        assert_eq!(slot.world_held, held);
+        assert!(slot.last_world_held.is_some());
     }
 
     /// C7 of HRD-D-0019: the owner's whole-folder push refused 409
