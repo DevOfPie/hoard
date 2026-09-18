@@ -3538,8 +3538,11 @@ fn spawn_auto_restore(
                 }
                 post_restore_world_hash = outcome.disk_world_hash.clone();
                 let touched = outcome.files_restored + outcome.conflicts_backed_up;
-                // A move aside touches the folder as much as a copy does.
-                wrote_files = touched > 0 || outcome.world_files_set_aside > 0;
+                // A move aside touches the folder as much as a copy does, and
+                // counts in the notice: a pull that only moved the previous
+                // generation away changed the folder, it did not do nothing.
+                let changed = touched + outcome.world_files_set_aside;
+                wrote_files = changed > 0;
                 if wrote_files {
                     tracing::info!(
                         save_id = %save.save_id,
@@ -3549,9 +3552,10 @@ fn spawn_auto_restore(
                         set_aside = outcome.world_files_set_aside,
                         local_wins = outcome.conflicts_local_wins,
                         bytes = outcome.bytes_extracted,
-                        "auto-restore diff: applied {} files (incl. {} conflict-backups), {} kept local",
+                        "auto-restore diff: applied {} files (incl. {} conflict-backups), moved {} aside, {} kept local",
                         touched,
                         outcome.conflicts_backed_up,
+                        outcome.world_files_set_aside,
                         outcome.conflicts_local_wins
                     );
                     let _ = events_tx
@@ -3559,7 +3563,9 @@ fn spawn_auto_restore(
                             save_id: save.save_id.clone(),
                             game_slug: save.game_slug.clone(),
                             version_num: outcome.version_num,
-                            files_extracted: touched,
+                            // Written and moved aside alike: "0 files" never
+                            // announces a pull that changed the folder.
+                            files_extracted: changed,
                             bytes_extracted: outcome.bytes_extracted,
                         })
                         .await;
@@ -9533,6 +9539,64 @@ mod tests {
         expected.insert("characters_local/Me.fch".into(), b"mine".to_vec());
         assert_eq!(files_under(root), expected);
         assert_eq!(outcome.world_files_set_aside, 4);
+    }
+
+    /// A pull whose only change is moving the previous generation's files
+    /// aside still announces them: the notice counts the files moved, never
+    /// "0 files" for a folder it changed.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_pull_that_only_moves_files_aside_counts_them_in_the_notice() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = &tmp.path().join("save");
+        let staging = &tmp.path().join("v4");
+        valheim_generation(staging, "Alpha", 8, &["0_0.chunk"]);
+        let v4 = files_under(staging);
+        for (rel, bytes) in &v4 {
+            write_file(&root.join(rel), bytes);
+        }
+        // What generation 7 left behind that 8 did not rewrite.
+        write_file(&root.join("worlds_local/Alpha/_main.7.db2"), b"seven");
+        write_file(&root.join("worlds_local/Alpha/_main.7.fwl2"), b"seven");
+        let routes = crate::testserver::selfhosted_version("w1", 4, &as_routes_files(&v4)).await;
+        let (url, _) = crate::testserver::serve(move |_| routes).await;
+        let (events_tx, mut events_rx) = mpsc::channel(16);
+        let (cmd_tx, mut cmd_rx) = mpsc::channel(16);
+
+        spawn_auto_restore(
+            member_world(root),
+            ApiClient::new(url, "t").unwrap(),
+            events_tx,
+            cmd_tx,
+            Some(tmp.path().join("conflicts")),
+            14,
+            Some(1),
+            None,
+            None,
+            None,
+        );
+        let finished = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if let Some(AgentCommand::AutoRestoreFinished { wrote_files, .. }) =
+                    cmd_rx.recv().await
+                {
+                    return wrote_files;
+                }
+            }
+        })
+        .await
+        .expect("the pull finishes");
+        assert!(finished, "moving files aside is a write");
+        let mut notice = None;
+        while let Ok(evt) = events_rx.try_recv() {
+            if let AgentEvent::SaveAutoRestored {
+                files_extracted, ..
+            } = evt
+            {
+                notice = Some(files_extracted);
+            }
+        }
+        assert_eq!(notice, Some(2), "the two files moved aside");
+        assert_eq!(files_under(root), v4);
     }
 
     /// Mirror image: when the target is a strict subset of the snapshot
