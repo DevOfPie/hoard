@@ -2535,9 +2535,11 @@ async fn run_agent(
                 match cmd {
                     Some(AgentCommand::AddSave(save)) => {
                         // Staged copies an interrupted merge left in the folder
-                        // (L-1), before the watcher is armed on it.
+                        // (L-1). Off the loop, since it walks the whole folder
+                        // (L-4); they are litter to the watcher's walk anyway.
                         if !save.track_only {
-                            sweep_restore_temps(&save.local_path);
+                            let folder = save.local_path.clone();
+                            tokio::task::spawn_blocking(move || sweep_restore_temps(&folder));
                         }
                         // handle_add registers the slot, arms the watcher and, when
                         // the folder already holds content diverging from what is
@@ -4935,21 +4937,61 @@ struct StagedWrite {
     bytes: u64,
 }
 
-/// Where a file is staged beside `dest` before it takes `dest`'s name. The
-/// `.tmp` suffix is litter to the walk ([`kernel::fileclass::classify`]), so
-/// one left by a crash is never backed up.
+/// Where a file is staged beside `dest` before it takes `dest`'s name:
+/// `<name>.<pid>.hoard-restore.tmp`. The pid says whose it is, so a sweep
+/// ([`sweep_restore_temps`]) takes only a dead process's leftovers, never a
+/// merge still running in another process (a CLI restore overlapping a pull,
+/// M-1). The suffix is litter to the walk ([`kernel::fileclass::classify`]),
+/// so one left by a crash is never backed up.
 fn restore_tmp_path(dest: &Path) -> PathBuf {
     let mut name = dest.file_name().unwrap_or_default().to_os_string();
-    name.push(kernel::fileclass::RESTORE_TMP_SUFFIX);
+    name.push(format!(
+        ".{}{}",
+        std::process::id(),
+        kernel::fileclass::RESTORE_TMP_SUFFIX
+    ));
     dest.with_file_name(name)
 }
 
+/// Is `name` a staged copy ([`restore_tmp_path`]), and whose? `Some(None)`
+/// for one without a pid (made before the pid was in the name), whose process
+/// is gone. The suffix is matched whatever its case, as `classify` does.
+fn restore_tmp_owner(name: &str) -> Option<Option<u32>> {
+    let lower = name.to_ascii_lowercase();
+    let stem = lower.strip_suffix(kernel::fileclass::RESTORE_TMP_SUFFIX)?;
+    Some(stem.rsplit_once('.').and_then(|(_, pid)| pid.parse().ok()))
+}
+
 /// Removes the staged copies ([`restore_tmp_path`]) a merge killed between its
-/// copies and its renames left in `folder`, at any depth. Run when the save
-/// starts being watched and before each merge into it: a leftover whose name
-/// the next version does not reuse would otherwise stay in the folder for
-/// good. Symlinks are not followed. Returns how many went.
+/// copies and its renames left in `folder`, at any depth: those whose process
+/// is gone. A live one's (this process's, or a CLI's or desktop's merging into
+/// the same folder right now) are left alone. Run when the save starts being
+/// watched and before each merge into it: a leftover whose name the next
+/// version does not reuse would otherwise stay in the folder for good.
+/// Symlinks are not followed. Returns how many went.
 pub(crate) fn sweep_restore_temps(folder: &Path) -> usize {
+    // The process table is read only when a leftover names another process.
+    let mut sys: Option<System> = None;
+    let own = std::process::id();
+    sweep_restore_temps_in(folder, &mut |pid| {
+        pid == own
+            || sys
+                .get_or_insert_with(|| {
+                    let mut sys = System::new();
+                    sys.refresh_processes_specifics(
+                        ProcessesToUpdate::All,
+                        true,
+                        ProcessRefreshKind::new(),
+                    );
+                    sys
+                })
+                .process(Pid::from_u32(pid))
+                .is_some()
+    })
+}
+
+/// [`sweep_restore_temps`] with `alive` saying whether a pid still runs.
+fn sweep_restore_temps_in(folder: &Path, alive: &mut dyn FnMut(u32) -> bool) -> usize {
     let mut swept = 0;
     let mut stack = vec![folder.to_path_buf()];
     while let Some(dir) = stack.pop() {
@@ -4961,20 +5003,23 @@ pub(crate) fn sweep_restore_temps(folder: &Path) -> usize {
             let path = entry.path();
             if ft.is_dir() {
                 stack.push(path);
-            } else if ft.is_file()
-                && entry
-                    .file_name()
-                    .to_string_lossy()
-                    .ends_with(kernel::fileclass::RESTORE_TMP_SUFFIX)
-            {
-                match std::fs::remove_file(&path) {
-                    Ok(()) => swept += 1,
-                    Err(e) => tracing::warn!(
-                        path = %path.display(),
-                        error = %e,
-                        "restore: couldn't remove a leftover staged copy"
-                    ),
-                }
+                continue;
+            }
+            if !ft.is_file() {
+                continue;
+            }
+            match restore_tmp_owner(&entry.file_name().to_string_lossy()) {
+                None => continue,
+                Some(Some(pid)) if alive(pid) => continue,
+                Some(_) => {}
+            }
+            match std::fs::remove_file(&path) {
+                Ok(()) => swept += 1,
+                Err(e) => tracing::warn!(
+                    path = %path.display(),
+                    error = %e,
+                    "restore: couldn't remove a leftover staged copy"
+                ),
             }
         }
     }
@@ -9422,6 +9467,90 @@ mod tests {
         assert!(!folder
             .join("worlds_local/Alpha.db.old.hoard-restore.tmp")
             .exists());
+    }
+
+    /// M-1 and L-5: a sweep takes a dead process's staged copies, whatever
+    /// the suffix's case, and leaves a live one's (another merge into the same
+    /// folder, running now), this process's among them.
+    #[test]
+    fn the_sweep_leaves_a_live_merges_staged_copies() {
+        let tmp = tempfile::tempdir().unwrap();
+        let folder = tmp.path();
+        let own = std::process::id();
+        let mine = restore_tmp_path(&folder.join("worlds_local/A/0_0.chunk"));
+        assert!(mine
+            .to_string_lossy()
+            .ends_with(&format!("0_0.chunk.{own}.hoard-restore.tmp")));
+        write_file(&mine, b"mine, in flight");
+        write_file(
+            &folder.join("worlds_local/B/0_0.chunk.77.hoard-restore.tmp"),
+            b"live",
+        );
+        write_file(
+            &folder.join("worlds_local/B/1_0.chunk.78.hoard-restore.tmp"),
+            b"dead",
+        );
+        write_file(
+            &folder.join("worlds_local/B/2_0.chunk.79.HOARD-RESTORE.TMP"),
+            b"dead",
+        );
+        let mut alive = |pid: u32| pid == own || pid == 77;
+        assert_eq!(sweep_restore_temps_in(folder, &mut alive), 2);
+        assert!(mine.exists());
+        assert!(folder
+            .join("worlds_local/B/0_0.chunk.77.hoard-restore.tmp")
+            .exists());
+        std::fs::remove_file(folder.join("worlds_local/B/0_0.chunk.77.hoard-restore.tmp")).unwrap();
+        assert_eq!(sweep_restore_temps(folder), 0, "this process is alive");
+        assert!(mine.exists());
+        assert_eq!(restore_tmp_owner("x.chunk.hoard-restore.tmp"), Some(None));
+        assert_eq!(
+            restore_tmp_owner("x.chunk.12.Hoard-Restore.Tmp"),
+            Some(Some(12))
+        );
+        assert_eq!(restore_tmp_owner("notes.tmp"), None);
+    }
+
+    /// M-1: two merges into one folder at once (two shared worlds in it, or a
+    /// CLI restore overlapping a pull) both land: the second one's sweep does
+    /// not take the first one's staged copies from under it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn two_merges_into_one_folder_at_once_both_land() {
+        let tmp = tempfile::tempdir().unwrap();
+        let folder = tmp.path().join("save");
+        let a = tmp.path().join("a");
+        let b = tmp.path().join("b");
+        for i in 0..1500 {
+            write_file(&a.join(format!("worlds_local/A/{i}_0.chunk")), b"a");
+        }
+        write_file(&b.join("worlds_local/B/0_0.chunk"), b"b");
+        std::fs::create_dir_all(&folder).unwrap();
+        let first = restore_files_into(&folder, &a, None, Scope::default(), &[]);
+        let second = async {
+            // Once the first has staged copies in the folder, and before it
+            // places them.
+            let staged = folder.join("worlds_local/A");
+            loop {
+                let any = std::fs::read_dir(&staged).ok().is_some_and(|d| {
+                    d.flatten().any(|e| {
+                        e.file_name()
+                            .to_string_lossy()
+                            .ends_with(kernel::fileclass::RESTORE_TMP_SUFFIX)
+                    })
+                });
+                if any {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+            restore_files_into(&folder, &b, None, Scope::default(), &[]).await
+        };
+        let (first, second) = tokio::join!(first, second);
+        let first = first.expect("the first merge lands");
+        let second = second.expect("the second merge lands");
+        assert_eq!(first.restored, 1500);
+        assert_eq!(second.restored, 1);
+        assert_eq!(files_under(&folder).len(), 1501);
     }
 
     /// L-7: staging sits beside the conflicts tree, under the state folder, so

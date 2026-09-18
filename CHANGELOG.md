@@ -117,7 +117,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   keep their modification time. Staged `.hoard-restore.tmp` files and staging
   folders an interrupted merge or a killed restore left behind are removed
   when the save is next watched, before the next merge, and when the sync
-  service starts, and are never taken for save data.
+  service starts, and are never taken for save data. Both carry the id of
+  the process that made them, so a merge still running in another process
+  (a restore from the command line during a pull) keeps its own.
 - **An owner's restore keeps each replaced file once.** A file outside the
   shared world that the restore replaced was copied to one conflicts folder
   and moved to another; it is now only moved, with the rest of what the

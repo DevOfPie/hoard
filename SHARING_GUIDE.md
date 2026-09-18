@@ -143,7 +143,8 @@ in Hoard's data folder, not in the system's temporary folder (a RAM-backed
 `/tmp` would hold the whole version in memory); one a killed restore left
 behind is removed when the sync service next starts, and so are the
 half-written `.hoard-restore.tmp` files an interrupted merge leaves in a save
-folder. Then the version's files replace yours, each replaced file going to
+folder. Only those of a process that is gone: a restore running while the
+service pulls into the same folder keeps its own. Then the version's files replace yours, each replaced file going to
 the conflicts folder first, once, and the command prints (the desktop's
 notice shows) the folder they went to. Files already identical are not
 rewritten, but on a self-hosted server they are still downloaded: the server
