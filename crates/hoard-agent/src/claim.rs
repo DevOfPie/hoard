@@ -2330,7 +2330,7 @@ mod tests {
             let slot = s.get_mut("w1").unwrap();
             slot.lease = LeaseObs::Other;
             slot.has_pending = true;
-            slot.world_held = parked.clone();
+            slot.world_held = parked;
             assert_eq!(on_reconciled(slot, now, &tx, None), Followup::SideCopy);
         }
         on_side_copy_failed(&mut s, "w1", now, &tx);
