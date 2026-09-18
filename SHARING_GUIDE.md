@@ -108,6 +108,18 @@ it loads the world, leaving the `.old` twins and a `_backup_` copy behind.
 The share names both layouts, so a world shared before the conversion is
 still covered after it. The world picker lists worlds in either layout.
 
+**What a pull does to the world's folder.** Because 1.0 names its files anew
+on every save and loads the newest, a pull or a restore makes
+`worlds_local/<World>/` exactly what the version holds: files in it that the
+version does not have (the previous save's `_main.<N>.*` and chunks, or a
+newer save when you restore an older version) are moved into the conflicts
+folder, never deleted (see [Side copies, and where
+they are](#side-copies-and-where-they-are)). It happens only when the service
+pulls with the game closed and nothing unsent in the folder, or when you
+restore a version into the save's own folder. Everything else is merged as
+before and nothing of it is removed: the flat `.db` and `.fwl` files and their
+`.old` twins, the `_backup_` copies, other worlds and your characters.
+
 Nothing under `characters_local/` ever travels: a character is the player's,
 not the world's. Every member keeps their own. For any other game the whole
 save folder is shared, because Hoard has no template that says which files
@@ -269,7 +281,8 @@ it.
 A side copy holds the world files from a session that could not push: a
 viewer's writes, or a host's writes under somebody else's lease. Only the
 share's own files move there, nothing else in the folder. They land next to
-the restore conflict copies, under the sync service's state folder:
+the restore conflict copies and the world files a pull moved aside, under the
+sync service's state folder:
 
 ```
 ~/.local/share/hoard/conflicts/<save_id>/<timestamp>/                            # Linux

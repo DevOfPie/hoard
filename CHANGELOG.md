@@ -49,6 +49,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   worlds kept in 1.0's folder layout (`worlds_local/<name>/`) beside the flat
   ones, and a shared world names its folder too, so every file 1.0 writes in
   it travels and a world shared before 1.0 converted it stays covered after.
+- **A pull or a restore leaves a Valheim 1.0 world exactly as the version has
+  it.** 1.0 names its world files anew on every save and loads the newest, so
+  the older files a pull left beside the new ones made restoring an older
+  version do nothing and kept the owner asking for the lease after a pull.
+  Files in the shared world's folder that the version does not have now move
+  into the conflicts folder, never deleted; everything else is left alone.
 
 ## [1.1.7] - 2026-09-13
 
