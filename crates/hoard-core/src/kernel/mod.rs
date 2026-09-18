@@ -109,13 +109,25 @@ pub struct ConflictStall {
 /// on this disk reads again, so it does not reset. What does is the file
 /// changing ([`reconcile::retry_held_world`], off a watcher hit on the save),
 /// the user asking by hand, or a push that goes up.
+///
+/// Only the ladder's own attempts count toward the give-up budget. A retry a
+/// change asked for does not: a burst of saves would otherwise spend the
+/// budget in seconds and park a push whose file merely stayed locked a moment.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct WorldHeld {
-    /// Consecutive held pushes. Non-zero means the push is being held.
+    /// Held pushes on the ladder. Non-zero means the push is being held.
     pub consecutive: u32,
     /// Budget spent: retrying on a clock stops, and the save asks for the user.
-    /// A watcher hit on the save still retries once.
+    /// A watcher hit on the save still retries.
     pub needs_attention: bool,
+    /// When the ladder's next attempt is due. Its own deadline, apart from
+    /// `State::next_backup_at`: a change retrying the push clears nothing but
+    /// this hold, not a 429's Retry-After or a failure backoff.
+    pub retry_at: Option<OffsetDateTime>,
+    /// The next attempt was asked for by a change to the save (or the user),
+    /// not by the ladder: a hold it ends in is not counted, and the ladder's
+    /// deadline stands.
+    pub by_change: bool,
 }
 
 impl WorldHeld {

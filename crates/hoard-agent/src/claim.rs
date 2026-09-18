@@ -2127,6 +2127,7 @@ mod tests {
             slot.world_held = kernel::WorldHeld {
                 consecutive: kernel::reconcile::WORLD_HELD_GIVE_UP_AFTER,
                 needs_attention: true,
+                ..kernel::WorldHeld::default()
             };
         };
         for case in ["no session", "session stopped", "parked, pinned"] {
@@ -2171,7 +2172,7 @@ mod tests {
             held(&mut s);
             let on_ladder = kernel::WorldHeld {
                 consecutive: 1,
-                needs_attention: false,
+                ..kernel::WorldHeld::default()
             };
             match case {
                 "running" => s.get_mut("w1").unwrap().is_running = true,
@@ -2204,6 +2205,8 @@ mod tests {
             slot.has_pending = true;
             if held {
                 slot.world_held.consecutive = 2;
+                slot.world_held.retry_at =
+                    Some(OffsetDateTime::now_utc() + time::Duration::minutes(15));
             }
             let expected = if held {
                 Followup::SideCopy
@@ -2211,6 +2214,13 @@ mod tests {
                 Followup::Nothing
             };
             assert_eq!(on_reconciled(slot, now, &tx, None), expected, "held={held}");
+            if held {
+                // L-4: the side copy ends the held push, its deadline with it,
+                // so the next push does not wait out the old ladder.
+                on_side_copied(&mut s, "w1", 1, now, &tx);
+                let slot = &s["w1"];
+                assert_eq!(slot.world_held, kernel::WorldHeld::default());
+            }
         }
     }
 

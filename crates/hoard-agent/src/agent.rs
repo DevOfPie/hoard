@@ -1903,10 +1903,12 @@ fn reconcile_all(
                 error: err_for_conflict.unwrap_or_default(),
             });
         }
-        // A held world push: said on every attempt the reducer counts, with
-        // whether it parked; cleared when a push goes up.
+        // A held world push: said on every attempt the reducer counts, and when
+        // a change's retry parks it again; cleared when a push goes up.
         let now_held = slot.world_held;
-        if now_held.consecutive > was_held.consecutive {
+        if now_held.consecutive > was_held.consecutive
+            || (now_held.needs_attention && !was_held.needs_attention)
+        {
             let (count, sample_path, sample_error) = world_held_why.unwrap_or_default();
             tracing::warn!(
                 save_id = %id,
@@ -2654,10 +2656,7 @@ async fn run_agent(
                                 slot.next_backup_at = None;
                             }
                             // And a held world is tried again now, parked or not.
-                            kernel::reconcile::retry_held_world(
-                                &mut slot.world_held,
-                                &mut slot.next_backup_at,
-                            );
+                            kernel::reconcile::retry_held_world(&mut slot.world_held);
                             mark_pending_if_diverged(slot);
                         }
                         reconcile_all(
@@ -2751,9 +2750,10 @@ async fn run_agent(
                             slot.last_world_held = Some((count, path, error));
                             tracing::info!(
                                 save_id = %id,
-                                held = slot.world_held.consecutive + 1,
+                                held = slot.world_held.consecutive,
+                                after_a_change = slot.world_held.by_change,
                                 give_up_after = kernel::reconcile::WORLD_HELD_GIVE_UP_AFTER,
-                                "agent: shared world push held, escalating the backoff"
+                                "agent: shared world push held"
                             );
                         }
                         reconcile_all(
@@ -5013,7 +5013,9 @@ fn hit_reaches_walk(slot: &SaveSlot, paths: &[PathBuf]) -> bool {
 ///
 /// A world push held for a file that cannot be read is retried at once: the
 /// write may be the fix (a chmod, the game letting go of the file), and waiting
-/// out the backoff for it is what held the H1 recovery for ten minutes.
+/// out the backoff for it is what held the H1 recovery for ten minutes. The
+/// retry is not counted toward the held push's budget, so a burst of saves
+/// does not park it.
 fn mark_fs_hit(slot: &mut SaveSlot, now: OffsetDateTime) {
     slot.has_pending = true;
     slot.last_fs_event_at = Some(now);
@@ -5021,7 +5023,7 @@ fn mark_fs_hit(slot: &mut SaveSlot, now: OffsetDateTime) {
     slot.observed_world_fingerprint = None;
     slot.fs_writes
         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    if kernel::reconcile::retry_held_world(&mut slot.world_held, &mut slot.next_backup_at) {
+    if kernel::reconcile::retry_held_world(&mut slot.world_held) {
         tracing::info!(save_id = %slot.save.save_id, "agent: the save changed while its world push was held; trying again");
     }
 }
@@ -8873,6 +8875,7 @@ mod tests {
         slot.world_held = kernel::WorldHeld {
             consecutive: WORLD_HELD_GIVE_UP_AFTER,
             needs_attention: true,
+            ..kernel::WorldHeld::default()
         };
         let tick = |slot: &mut SaveSlot| {
             slot.needs_l1 = true;
@@ -8902,6 +8905,19 @@ mod tests {
         failed.next_backup_at = Some(backoff);
         mark_fs_hit(&mut failed, now);
         assert_eq!(failed.next_backup_at, Some(backoff));
+
+        // L-3: nor is a held world's retry: a Retry-After the server sent
+        // while the push was held stands through the change.
+        let mut throttled = test_slot(owner_save(dir.path()));
+        throttled.world_held = kernel::WorldHeld {
+            consecutive: 1,
+            retry_at: Some(now + time::Duration::seconds(60)),
+            ..kernel::WorldHeld::default()
+        };
+        throttled.next_backup_at = Some(backoff);
+        mark_fs_hit(&mut throttled, now);
+        assert_eq!(throttled.next_backup_at, Some(backoff));
+        assert!(throttled.world_held.by_change);
     }
 
     /// C7 of HRD-D-0019: the owner's whole-folder push refused 409
