@@ -92,7 +92,7 @@ but cannot list its worlds, so name one with `--world`.
 else:
 
 ```
-worlds_local/<World>/
+worlds_local/<World>
 worlds_local/<World>.db
 worlds_local/<World>.fwl
 worlds_local/<World>.db.old
@@ -110,15 +110,37 @@ still covered after it. The world picker lists worlds in either layout.
 
 **What a pull does to the world's folder.** Because 1.0 names its files anew
 on every save and loads the newest, a pull or a restore makes
-`worlds_local/<World>/` exactly what the version holds: files in it that the
-version does not have (the previous save's `_main.<N>.*` and chunks, or a
-newer save when you restore an older version) are moved into the conflicts
-folder, never deleted (see [Side copies, and where
-they are](#side-copies-and-where-they-are)). It happens only when the service
-pulls with the game closed and nothing unsent in the folder, or when you
-restore a version into the save's own folder. Everything else is merged as
-before and nothing of it is removed: the flat `.db` and `.fwl` files and their
-`.old` twins, the `_backup_` copies, other worlds and your characters.
+`worlds_local/<World>/` exactly what the version holds:
+
+- Files in it that the version does not have (the previous save's
+  `_main.<N>.*` and chunks, or a newer save when you restore an older version)
+  are moved into the conflicts folder.
+- A file in it that the version also has is replaced by the version's copy,
+  even when yours is newer; yours goes to the conflicts folder. A newer chunk
+  kept beside an older generation would mix two saves of the world.
+- Once the version holds the world as a folder, the world's flat files it
+  does not have (`<World>.db`, `<World>.fwl` and their `.old` twins, left
+  behind by 1.0's conversion) are moved aside too, so they do not travel back
+  with your next push. A version of a world not yet converted leaves them.
+
+Moved files are kept in the conflicts folder for the retention period
+(`conflict_retention_days`, 14 days by default) and then removed; see [Side
+copies, and where they are](#side-copies-and-where-they-are). Everything is
+moved before anything of the version is written: if a move fails, nothing is
+written, what already moved goes back, and the pull or restore reports the
+error. It happens only when the service pulls with the game closed and
+nothing unsent in the folder (checked again right before the pull writes: a
+game started during the download makes the pull wait until it closes), or
+when you restore a version into the save's own folder. Everything else is
+merged as before and nothing of it is removed: the `_backup_` copies, other
+worlds and your characters. The restore dialog and `hoard restore --dry-run`
+list the files that will move aside, and the notice after a pull counts them.
+
+A shared world never goes up without one of its files. When one cannot be
+read (the game holds it open) or would not fit the plan's per-save cap, the
+push waits and tries again later, with a warning on the game's card, instead
+of publishing a version that would move the missing file out of every other
+member's folder.
 
 Nothing under `characters_local/` ever travels: a character is the player's,
 not the world's. Every member keeps their own. For any other game the whole
@@ -170,7 +192,9 @@ the same flow as any save that only exists on the server:
 
 From then on the world is pulled to that folder whenever the game is closed
 and the server has a newer version. Your own characters in the same folder
-are untouched, because they are not in the share's file list.
+are untouched, because they are not in the share's file list, and they do
+not hold back the first pull: a folder with nothing of the world in it has
+nothing to push, so the world comes down without asking for the lease.
 
 **CLI.** Once you are in the group, `hoard save list` shows the shared save
 (`hoard saves` lists only what this machine tracks). Give it a folder here:

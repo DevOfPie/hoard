@@ -54,7 +54,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   the older files a pull left beside the new ones made restoring an older
   version do nothing and kept the owner asking for the lease after a pull.
   Files in the shared world's folder that the version does not have now move
-  into the conflicts folder, never deleted; everything else is left alone.
+  into the conflicts folder, where they are kept for the retention period
+  (`conflict_retention_days`, 14 days by default); a file there that the
+  version also has takes the version's copy even when the local one is newer,
+  the local one going to the conflicts folder, so a pull never mixes two
+  generations. Once the version holds the world as a folder, the world's flat
+  `.db`, `.fwl` and `.old` files it lacks move aside too, so a converted world's
+  leftovers stop travelling back. Everything moves before anything is written,
+  and a move that fails writes nothing and puts back what moved. A pull whose
+  game started during the download waits for it to close. Everything else in
+  the folder is left alone. The restore dialog, its success notice,
+  `hoard restore --dry-run` and the pull's notice say how many files moved.
+- **A shared world is never pushed partial.** A world file that cannot be read,
+  or that the plan's per-save cap would drop, holds the push and retries it
+  later, with the card's warning, instead of publishing a version that would
+  move that file out of every other member's folder.
+
+### Fixed
+- **A member adopting a world beside their own characters gets the world.** A
+  folder holding only the member's characters was taken for unsent changes:
+  the first pull waited on them, the lease was asked for to push nothing, and
+  the world never came down. Such a folder now has nothing to push, the first
+  pull runs, and no lease is asked for. A write outside the files a save
+  pushes no longer marks it as having changes.
 
 ## [1.1.7] - 2026-09-13
 

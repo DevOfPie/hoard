@@ -231,7 +231,8 @@ pub fn mirrored_folders(include: &[String]) -> impl Iterator<Item = &str> {
 /// A game that renames its files on every save (Valheim 1.0's
 /// `worlds_local/<W>/_main.<N>.*` generations) leaves the older generation
 /// beside a pulled one, and the game loads the newest; files there that the
-/// version does not have are moved aside, never deleted. True when an entry of
+/// version does not have are moved into the conflicts folder, kept there for
+/// the retention period. True when an entry of
 /// [`mirrored_folders`] equals the path's leading segments and the path has
 /// more segments than the entry: `worlds_local/Alpha` covers
 /// `worlds_local/Alpha/_main.8.db2` but neither `worlds_local/Alpha.db` nor
