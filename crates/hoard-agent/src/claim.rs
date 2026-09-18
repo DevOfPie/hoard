@@ -371,12 +371,16 @@ fn give_back(slot: &mut SaveSlot, lease: Option<&LeaseHandle>, release: bool) {
 }
 
 /// The user gave the world back (`ReleaseWorld`): the lease goes, an acquire
-/// still out is cancelled, and the answer is not a lost lease.
+/// still out is cancelled, and the answer is not a lost lease. A role pinned
+/// for the next launch (`ClaimWorld` or `ForceWorld` outside a session) goes
+/// with it: giving the world back is not hosting it next time, and a pin left
+/// standing kept every later sessionless push's lease (HRD-F-0028).
 pub(crate) fn on_release_world(
     slot: &mut SaveSlot,
     events_tx: &mpsc::Sender<AgentEvent>,
     lease: Option<&LeaseHandle>,
 ) {
+    slot.role_pinned = false;
     give_back(slot, lease, true);
     let _ = events_tx.try_send(AgentEvent::WorldReleased {
         save_id: slot.save.save_id.clone(),
@@ -2178,6 +2182,40 @@ mod tests {
             };
             assert_eq!(on_reconciled(slot, now, &tx, None), expected, "held={held}");
         }
+    }
+
+    /// HRD-F-0028: a claim made outside a session and then released leaves no
+    /// pin behind, so a later push with no session gives the lease back once
+    /// it is up, as any sessionless push does.
+    #[tokio::test(start_paused = true)]
+    async fn a_released_claim_does_not_keep_a_later_push_s_lease() {
+        let (tx, _rx) = mpsc::channel(16);
+        let (lease, mut seen) = LeaseHandle::probe();
+        let now = Instant::now();
+        let mut s = slots(vec![world("w1", "valheim")]);
+        let slot = s.get_mut("w1").unwrap();
+        on_claim_world(slot, WorldRole::Host, &tx, Some(&lease));
+        assert!(slot.role_pinned);
+        on_lease(slot, LeaseObs::Mine, None, true, &tx, Some(&lease));
+        on_release_world(slot, &tx, Some(&lease));
+        on_lease(slot, LeaseObs::Free, None, false, &tx, Some(&lease));
+        assert!(!slot.role_pinned);
+        tokio::task::yield_now().await;
+        while seen.try_recv().is_ok() {}
+
+        // A push with no session takes the lease, and goes up.
+        slot.has_pending = true;
+        request_acquire(slot, &lease);
+        on_lease(slot, LeaseObs::Mine, None, true, &tx, Some(&lease));
+        slot.has_pending = false;
+        tokio::task::yield_now().await;
+        while seen.try_recv().is_ok() {}
+        assert_eq!(
+            on_reconciled(slot, now, &tx, Some(&lease)),
+            Followup::Nothing
+        );
+        tokio::task::yield_now().await;
+        assert_eq!(seen.try_recv().unwrap(), "release w1");
     }
 
     /// A lease taken off this machine, or gone while the renew could not get
