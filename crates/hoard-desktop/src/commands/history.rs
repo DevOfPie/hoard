@@ -492,6 +492,8 @@ pub async fn restore_snapshot(
                 // gate it on fast-forward.
                 None,
                 None,
+                // Not a push of the synced world: nothing is carried.
+                None,
                 // No re-upload check either (ADR 0021 D.8.3): this safety copy has
                 // to exist as a version of its own before the folder is overwritten,
                 // even when its content matches the head.

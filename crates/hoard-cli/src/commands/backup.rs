@@ -89,6 +89,8 @@ pub async fn run(save_id: String, source: Option<PathBuf>, remember: bool) -> Re
         base_version,
         // The world is the base's: a one-off push never carried one forward.
         None,
+        // No synced world to carry from: a one-off push.
+        None,
         // With no head to compare against: the D.8.3 anti-relaunch check exists
         // for the engine, which restarts on its own and already brings the
         // observed manifest. A `hoard backup` is an explicit one-off order from

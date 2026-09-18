@@ -1251,7 +1251,7 @@ fn seed_for(save_id: &str) -> u64 {
 /// A process-stable `u64` hash of a set signature. It is only ever compared within
 /// one run (the sampled fingerprint against the synced one), so `DefaultHasher` is
 /// enough; it needs no cross-restart stability.
-fn fingerprint_of(sig: &str) -> u64 {
+pub(crate) fn fingerprint_of(sig: &str) -> u64 {
     let mut h = std::collections::hash_map::DefaultHasher::new();
     std::hash::Hash::hash(sig, &mut h);
     std::hash::Hasher::finish(&h)
@@ -2223,6 +2223,7 @@ fn execute_backup(
     let save = slot.save.clone();
     let prev_set_hash = slot.last_set_hash.clone();
     let (base_version, world_base_version) = push_bases(slot);
+    let synced_world = slot.synced_world_fingerprint;
     // The owner's push is held rather than reconciled into a live folder when
     // the head moved (HRD-D-0019, resolution 2).
     let hold_when_behind = slot.save.owns_whole_folder() && slot.is_running;
@@ -2251,6 +2252,7 @@ fn execute_backup(
             prev_set_hash,
             base_version,
             world_base_version,
+            synced_world,
             head,
             origin,
             hold_when_behind,
@@ -5115,6 +5117,10 @@ async fn run_backup_with_retry(
     // an owner's push the server carried the head's world into became the base
     // (HRD-D-0019). A reconcile below syncs the folder and drops it.
     mut world_base_version: Option<i64>,
+    // The world's fingerprint as last synced, for carrying the synced version's
+    // entries of world files that cannot be read when the world is unchanged
+    // (M-2). Dropped with the world base when a reconcile moves the folder.
+    mut synced_world: Option<u64>,
     // The server's head (version plus its content's digest) for D.8.3's anti-relaunch
     // check: if what we were about to upload is already that head, the previous upload
     // landed and uploading again would only create a duplicate version.
@@ -5196,6 +5202,7 @@ async fn run_backup_with_retry(
             // retry instead of clobbering the newer remote version.
             base_version,
             world_base_version,
+            synced_world,
             head.as_ref(),
             origin,
             |_, _| {},
@@ -5584,6 +5591,7 @@ async fn run_backup_with_retry(
                             // uploads.
                             base_version = Some(outcome.version_num);
                             world_base_version = None;
+                            synced_world = None;
                             continue;
                         }
                         // The reconcile pulled nothing because this folder
@@ -5614,6 +5622,7 @@ async fn run_backup_with_retry(
                             );
                             base_version = Some(version_num);
                             world_base_version = None;
+                            synced_world = None;
                             continue;
                         }
                         // The server named head 0: the save it is holding for
@@ -5639,6 +5648,7 @@ async fn run_backup_with_retry(
                             );
                             base_version = Some(0);
                             world_base_version = None;
+                            synced_world = None;
                             continue;
                         }
                         Ok(AutoRestorePull::AlreadyAtHead { .. })
@@ -8423,6 +8433,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             VersionOrigin::Automatic,
             false,
             events_tx,
@@ -8510,6 +8521,7 @@ mod tests {
             "main",
             root,
             Some(prev),
+            None,
             None,
             None,
             None,
@@ -8758,6 +8770,7 @@ mod tests {
             owner_save(root),
             None,
             Some(3),
+            None,
             None,
             None,
             VersionOrigin::Automatic,
@@ -9020,6 +9033,108 @@ mod tests {
         assert!(!seen[1].1.contains("characters_local"), "{seen:?}");
     }
 
+    /// M-2: an owner's push whose world is the synced one, file for file, is
+    /// not refused because a world file cannot be read (a root-owned chunk):
+    /// the file goes into the manifest as the synced version's entry, which the
+    /// server holds, and the characters go up. A world that changed and cannot
+    /// be read whole stays held, without asking the server anything.
+    #[tokio::test(flavor = "current_thread")]
+    async fn an_owners_unchanged_world_with_an_unreadable_file_still_pushes_the_rest() {
+        use sha2::Digest;
+        use std::os::unix::fs::PermissionsExt;
+        let lock = |p: &Path, mode: u32| {
+            std::fs::set_permissions(p, std::fs::Permissions::from_mode(mode)).unwrap()
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        owner_folder(root);
+        let alpha = root.join("worlds_local/Alpha.db");
+        let mut slot = test_slot(owner_save(root));
+        slot.known_version = Some(3);
+        test_sync_now(&mut slot);
+        // The owner played: the character changed, and the world file lost its
+        // read permission without its bytes or mtime moving.
+        write_file(&root.join("characters_local/Me.fch"), b"me, later");
+        lock(&alpha, 0o000);
+        if std::fs::read(&alpha).is_ok() {
+            // Root reads it anyway: nothing to test here.
+            lock(&alpha, 0o644);
+            return;
+        }
+        let sha = hex::encode(sha2::Sha256::digest(b"alpha"));
+        let detail: &'static str = Box::leak(
+            format!(
+                r#"{{"id":"s3","version_num":3,"total_size_bytes":7,"file_count":2,"is_pinned":false,"created_at":"2026-09-14T09:14:11Z","files":[{{"relative_path":"characters_local/Me.fch","size_bytes":2,"sha256":"{}"}},{{"relative_path":"worlds_local/Alpha.db","size_bytes":5,"sha256":"{sha}"}}]}}"#,
+                hex::encode(sha2::Sha256::digest(b"me"))
+            )
+            .into_boxed_str(),
+        );
+        let push = |slot: &SaveSlot, url: String| {
+            let save = slot.save.clone();
+            let base = slot.known_version;
+            let synced_world = slot.synced_world_fingerprint;
+            async move {
+                let (events_tx, _events_rx) = mpsc::channel(64);
+                let (done_tx, mut done_rx) = mpsc::channel(8);
+                let (cmd_tx, mut cmd_rx) = mpsc::channel(8);
+                run_backup_with_retry(
+                    ApiClient::new(&url, "fake").unwrap(),
+                    save,
+                    None,
+                    base,
+                    None,
+                    synced_world,
+                    None,
+                    VersionOrigin::Automatic,
+                    false,
+                    events_tx,
+                    done_tx,
+                    cmd_tx,
+                    0,
+                    false,
+                    None,
+                    14,
+                )
+                .await;
+                (done_rx.try_recv().ok(), cmd_rx.try_recv().ok())
+            }
+        };
+
+        let (url, seen) =
+            refusing_server(vec![(200, detail), (200, INIT_V5), (201, COMMIT_V5)]).await;
+        let (done, cmd) = push(&slot, url).await;
+        assert!(cmd.is_none(), "held");
+        let done = done.expect("the push landed");
+        assert!(done.committed);
+        {
+            let seen = seen.lock().unwrap();
+            assert_eq!(seen.len(), 3, "{seen:?}");
+            assert!(seen[0].0.starts_with("GET /v1/saves/w1/snapshots/3"), "{seen:?}");
+            let init = &seen[1].1;
+            assert!(init.contains("characters_local/Me.fch"), "{init}");
+            assert!(
+                init.contains(&format!(
+                    r#""relative_path":"worlds_local/Alpha.db","sha256":"{sha}","size_bytes":5"#
+                )),
+                "the world file goes up as v3's entry: {init}"
+            );
+        }
+
+        // A world that changed: nothing to carry it from, and the push holds.
+        lock(&alpha, 0o644);
+        write_file(&alpha, b"alpha, changed");
+        lock(&alpha, 0o000);
+        let (url, seen) = refusing_server(vec![]).await;
+        let (done, cmd) = push(&slot, url).await;
+        lock(&alpha, 0o644);
+        assert!(done.is_none());
+        assert!(
+            matches!(&cmd, Some(AgentCommand::ParkBackupPartialWorld { path, .. }) if path == "worlds_local/Alpha.db"),
+            "not held for the world file"
+        );
+        assert!(seen.lock().unwrap().is_empty(), "the server was not asked");
+    }
+
     const INIT_V5: &str = r#"{"upload_id":"u1","version_num":5,"missing":[],"missing_bytes":0}"#;
     const COMMIT_V5: &str = r#"{"id":"s5","version_num":5,"parent_version":4,"total_size_bytes":30,"file_count":3,"is_pinned":false,"created_at":"2026-09-14T09:14:11Z"}"#;
 
@@ -9078,6 +9193,7 @@ mod tests {
             slot.save.clone(),
             None,
             slot.known_version,
+            None,
             None,
             None,
             VersionOrigin::Automatic,
@@ -9172,6 +9288,7 @@ mod tests {
                 slot.last_set_hash.clone(),
                 base,
                 world_base,
+                None,
                 None,
                 VersionOrigin::Automatic,
                 slot.save.owns_whole_folder() && slot.is_running,
@@ -10299,6 +10416,7 @@ mod tests {
             Some(3),
             None,
             None,
+            None,
             VersionOrigin::Automatic,
             false,
             events_tx,
@@ -10357,6 +10475,7 @@ mod tests {
             member_world(root),
             None,
             Some(3),
+            None,
             None,
             None,
             VersionOrigin::Automatic,

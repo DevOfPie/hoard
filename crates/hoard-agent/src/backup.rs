@@ -301,6 +301,101 @@ fn refuse_trimmed_world(
     )
 }
 
+/// Splits the world files among `unreadable` off into entries carried from
+/// `world_from`, and refuses ([`PartialWorld`]) the ones that cannot be.
+/// Returns the carried entries and the unreadable files still left out (none
+/// of them the world's).
+///
+/// The route for M-2: an owner's whole-folder push whose world is unchanged
+/// was refused whole for one world file that could not be read (a root-owned
+/// chunk), and its characters never backed up again. The server already takes
+/// a content-addressed manifest entry for content it holds without the bytes
+/// travelling, and a version's own entries are content it holds, so the file
+/// goes into the manifest as `world_from`'s entry: same path, sha and size.
+/// The world the version publishes is then exactly the synced one, which is
+/// what the server's owner exemption compares (HRD-D-0019), so no lease is
+/// needed either.
+///
+/// Carried only when all of this holds, and refused otherwise:
+/// - the caller vouches that the folder's world is `world_from`'s (the cheap
+///   signature, paths, sizes and mtimes, equals the synced one; bytes that
+///   cannot be read cannot be compared);
+/// - the server speaks the content-addressed protocol (self-hosted 1.1.3 and
+///   later: the multipart paths need the bytes, and Cloud has no shares);
+/// - `world_from` lists the file with a sha and the size the walk saw.
+///
+/// A world that changed, or one whose file the version does not have, stays
+/// held, as before.
+async fn carry_unreadable_world(
+    client: &ApiClient,
+    save_id: &str,
+    world: &[String],
+    world_from: Option<i64>,
+    walked: &HashMap<String, (u64, Option<SystemTime>)>,
+    unreadable: Vec<UnreadableFile>,
+) -> Result<(Vec<CasFile>, Vec<UnreadableFile>)> {
+    if world.is_empty() {
+        return Ok((Vec::new(), unreadable));
+    }
+    let (in_world, rest): (Vec<UnreadableFile>, Vec<UnreadableFile>) = unreadable
+        .into_iter()
+        .partition(|u| fileclass::included(world, &u.relative_path));
+    if in_world.is_empty() {
+        return Ok((Vec::new(), rest));
+    }
+    let held = |in_world: &[UnreadableFile]| -> anyhow::Error {
+        match refuse_partial_world(
+            world,
+            in_world
+                .iter()
+                .map(|u| (u.relative_path.as_str(), u.error.as_str())),
+        ) {
+            Err(partial) => partial.into(),
+            Ok(()) => anyhow!("a world file left out was not refused"),
+        }
+    };
+    let Some(from) = world_from else {
+        return Err(held(&in_world));
+    };
+    let _ = client.server_mode().await;
+    if client.probed_is_cloud() != Some(false) || client.probed_supports_cas() != Some(true) {
+        return Err(held(&in_world));
+    }
+    let detail = client
+        .snapshot_detail(save_id, from)
+        .await
+        .with_context(|| format!("reading version {from}'s files to carry its world"))?;
+    let mut carried = Vec::with_capacity(in_world.len());
+    for u in &in_world {
+        let entry = detail.files.iter().find(|f| f.relative_path == u.relative_path);
+        let walked = walked.get(&u.relative_path);
+        match (entry, walked) {
+            (Some(e), Some((size, modified)))
+                if e.sha256.is_some() && e.size_bytes == *size as i64 =>
+            {
+                carried.push(CasFile {
+                    relative_path: u.relative_path.clone(),
+                    sha256: e.sha256.clone().expect("checked above"),
+                    size_bytes: e.size_bytes,
+                    modified_at: modified
+                        .and_then(|m| m.duration_since(UNIX_EPOCH).ok())
+                        .map(|d| d.as_secs() as i64),
+                });
+            }
+            _ => return Err(held(&in_world)),
+        }
+    }
+    tracing::info!(
+        save_id,
+        version = from,
+        files = carried.len(),
+        first = %in_world[0].relative_path,
+        error = %in_world[0].error,
+        "upload: the world is unchanged but some of its files can't be read; carrying the synced version's entries for them"
+    );
+    Ok((carried, rest))
+}
+
 /// One file enumerated from the source directory.
 #[derive(Debug, Clone)]
 pub struct UploadFile {
@@ -886,6 +981,11 @@ pub async fn upload_directory<F>(
     // The version the folder's shared world came from, sent only when it is
     // not the base (HRD-D-0019). Self-hosted only; Cloud has no shares.
     world_base_version: Option<i64>,
+    // The version whose world the folder's still is, file for file (its cheap
+    // signature is the one synced with that version), when the caller knows it
+    // is: a world file whose bytes cannot be read takes that version's entry
+    // instead of holding the push ([`carry_unreadable_world`], M-2).
+    world_from: Option<i64>,
     head: Option<&ServerHead>,
     origin: VersionOrigin,
     progress: F,
@@ -919,14 +1019,16 @@ where
     // meets it mid-transfer. Whatever is left out travels in the `UploadOutcome`
     // so the caller can report it: a silently incomplete version is the outcome
     // that does not count.
+    let walked: HashMap<String, (u64, Option<SystemTime>)> = files
+        .iter()
+        .map(|f| (f.relative_path.clone(), (f.size_bytes, f.modified)))
+        .collect();
     let (files, unreadable) = split_unreadable(files).await;
-    // A shared world is never published without one of its files.
-    refuse_partial_world(
-        world,
-        unreadable
-            .iter()
-            .map(|u| (u.relative_path.as_str(), u.error.as_str())),
-    )?;
+    // A shared world is never published without one of its files. One that
+    // did not change since `world_from` goes up as that version's entry
+    // instead; any other holds the push.
+    let (carried, unreadable) =
+        carry_unreadable_world(client, save_id, world, world_from, &walked, unreadable).await?;
     if files.is_empty() {
         // Nothing readable is left: uploading here would publish an empty version
         // and delete the last good copy in the cloud.
@@ -1003,6 +1105,8 @@ where
             client,
             save_id,
             &files,
+            carried,
+            world,
             total_bytes,
             base_version,
             world_base_version,
@@ -1158,6 +1262,11 @@ async fn upload_directory_cas<F>(
     client: &ApiClient,
     save_id: &str,
     files: &[UploadFile],
+    // Entries that go into the manifest without a file to read them from: the
+    // world's unreadable files, as the synced version has them
+    // ([`carry_unreadable_world`]).
+    carried: Vec<CasFile>,
+    world: &[String],
     total_bytes: u64,
     base_version: Option<i64>,
     world_base_version: Option<i64>,
@@ -1186,6 +1295,10 @@ where
                 .map(|d| d.as_secs() as i64),
         });
     }
+    if !carried.is_empty() {
+        manifest.extend(carried.iter().cloned());
+        manifest.sort_by(|a, b| a.relative_path.cmp(&b.relative_path));
+    }
 
     let init = client
         .cas_init(
@@ -1212,6 +1325,20 @@ where
     let mut pending: Vec<(&UploadFile, String)> = Vec::with_capacity(init.missing.len());
     for blob in &init.missing {
         let Some(f) = by_sha.get(blob.sha256.as_str()) else {
+            // A carried entry whose content the server no longer holds (its
+            // version purged meanwhile): the world would go up without it.
+            if let Some(c) = carried
+                .iter()
+                .find(|c| c.sha256.as_str() == blob.sha256.as_str())
+            {
+                refuse_partial_world(
+                    world,
+                    std::iter::once((
+                        c.relative_path.as_str(),
+                        "can't be read, and the synced version's copy is gone from the server",
+                    )),
+                )?;
+            }
             bail!(
                 "server requested a blob not in the manifest: {}",
                 blob.sha256.as_str()
@@ -2154,6 +2281,11 @@ pub async fn upload_directory_checked<F, G>(
     prev_signature: Option<&str>,
     base_version: Option<i64>,
     world_base_version: Option<i64>,
+    // The world's fingerprint as last synced (the agent's
+    // `synced_world_fingerprint`, `crate::agent::fingerprint_of` of its
+    // signature), when known. A folder whose world still matches it may carry
+    // that version's entries for world files it cannot read (M-2).
+    synced_world: Option<u64>,
     head: Option<&ServerHead>,
     origin: VersionOrigin,
     progress: F,
@@ -2204,6 +2336,12 @@ where
     // its files out.
     let world_list = world;
     let world = world_signature(&files, world);
+    // The folder's world is the synced one, file for file (paths, sizes and
+    // mtimes): its version is where an unreadable world file's entry comes
+    // from, the world base when the world was carried forward, else the base.
+    let world_from = synced_world
+        .filter(|synced| !world_list.is_empty() && crate::agent::fingerprint_of(&world) == *synced)
+        .and(world_base_version.or(base_version));
     // `is_deliberate` rather than `== Manual`: the safety net taken before a
     // restore counts too, and skipping it there is worse, since it is the copy that
     // lets a wrong restore be undone.
@@ -2237,6 +2375,7 @@ where
         &canonical,
         base_version,
         world_base_version,
+        world_from,
         head,
         origin,
         progress,
@@ -2789,6 +2928,7 @@ mod tests {
                     None,
                     None,
                     None,
+                    None,
                     VersionOrigin::Automatic,
                     |_, _| {},
                 )
@@ -2925,6 +3065,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             VersionOrigin::Automatic,
             |_, _| {},
             || {},
@@ -2956,6 +3097,7 @@ mod tests {
             &[],
             "main",
             &save_dir,
+            None,
             None,
             None,
             None,
