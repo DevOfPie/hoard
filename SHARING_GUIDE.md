@@ -131,16 +131,23 @@ written, what already moved goes back, and the pull or restore reports the
 error; a write that fails after the moves takes back what it wrote and puts
 every moved file back too. It happens only when the service pulls with the
 game closed and nothing unsent in the folder (checked again right before the
-pull writes: a game started during the download, or a write to the folder
-during it, makes the pull wait), or when you restore a version into the
+pull writes, with a fresh look for the game's process: a game started during
+the download, or a write to the folder during it, makes the pull wait), or when you restore a version into the
 save's own folder.
 
 **A restore downloads first.** `hoard restore` and the desktop's restore
-download the whole version into a temporary folder before touching the save's
+download the whole version into a staging folder before touching the save's
 folder, so a download that fails or is cut off leaves the folder exactly as
-it was. Then the version's files replace yours, each replaced file going to
-the conflicts folder first, and the command prints (the desktop's notice
-shows) the folder they went to. Files already identical are not rewritten.
+it was. The staging folder, the pull's too, sits beside the conflicts folder
+in Hoard's data folder, not in the system's temporary folder (a RAM-backed
+`/tmp` would hold the whole version in memory); one a killed restore left
+behind is removed when the sync service next starts, and so are the
+half-written `.hoard-restore.tmp` files an interrupted merge leaves in a save
+folder. Then the version's files replace yours, each replaced file going to
+the conflicts folder first, once, and the command prints (the desktop's
+notice shows) the folder they went to. Files already identical are not
+rewritten, but on a self-hosted server they are still downloaded: the server
+sends the whole version.
 The sync service is not paused for the restore: it runs on local copies only,
 so the window is short, but a backup it starts in it can still read a
 half-applied folder. Everything else is
@@ -151,16 +158,28 @@ list the files that will move aside, and the notice after a pull counts them.
 A shared world never goes up without one of its files. When one cannot be
 read (the game holds it open, a permission) or would not fit the plan's
 per-save cap, the push is held, with a warning on the game's card naming the
-file, instead of publishing a version that would move the missing file out of
-every other member's folder. It retries after 1, 5, 15 and 30 minutes and then
-stops, saying so on the card; any change to the save's files (fixing the
-permission is one) or *Back up now* tries again at once. While the push is
-held and the game is closed, the lease is given back so somebody else can
-host; if they do, your held changes go to the conflicts folder before their
-version comes down. A file deleted while the push reads the folder (1.0
-deletes the previous save's files) is simply not part of that version.
-If a restore's safety copy is held the same way, the desktop offers to
-restore without it.
+file and which of the two it is, instead of publishing a version that would
+move the missing file out of every other member's folder. It retries after 1,
+5, 15 and 30 minutes and then stops, saying so on the card; any change to the
+save's files (fixing the permission is one) or *Back up now* tries again at
+once, and those retries do not count toward the stop, so a game saving
+several times in a row does not use them up. You keep the lease while it
+retries; once it stops, with the game closed, the lease is given back so
+somebody else can host. If the shared version moves past yours while your
+push is held (somebody hosted and pushed), your held changes go to the
+conflicts folder and their version comes down, whoever holds the lease by
+then.
+
+The owner is held only when the world changed. When the world is the one
+last synced and only a file of it cannot be read, the owner's other files
+(the characters) still go up, the version keeping the synced copy of that
+file; this needs a self-hosted server of 1.1.3 or later.
+
+A file deleted while the push reads the folder (1.0 deletes the previous
+save's files) does not fail the push: the folder is read again, a few times
+at most. If a restore's safety copy is held, the desktop offers to restore
+without it, and that restore replaces the file that could not be read too,
+moving it to the conflicts folder first.
 
 Nothing under `characters_local/` ever travels: a character is the player's,
 not the world's. Every member keeps their own. For any other game the whole
