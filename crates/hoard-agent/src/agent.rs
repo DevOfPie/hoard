@@ -30,7 +30,7 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use hoard_core::kernel;
 use hoard_core::kernel::correlation::accept_correlation_signals;
-use hoard_core::kernel::fileclass::Scope;
+use hoard_core::kernel::fileclass::{RestoreGate, Scope};
 use hoard_core::wire::VersionOrigin;
 use notify_debouncer_mini::{new_debouncer, DebounceEventResult, Debouncer};
 use serde::{Deserialize, Serialize};
@@ -3498,6 +3498,7 @@ fn spawn_auto_restore(
             known_version,
             cached_latest,
             shared_manifest,
+            true,
         )
         .await
         {
@@ -3512,13 +3513,15 @@ fn spawn_auto_restore(
                 }
                 post_restore_world_hash = outcome.disk_world_hash.clone();
                 let touched = outcome.files_restored + outcome.conflicts_backed_up;
-                wrote_files = touched > 0;
-                if touched > 0 {
+                // A move aside touches the folder as much as a copy does.
+                wrote_files = touched > 0 || outcome.world_files_set_aside > 0;
+                if wrote_files {
                     tracing::info!(
                         save_id = %save.save_id,
                         version_num = outcome.version_num,
                         restored = outcome.files_restored,
                         backed_up = outcome.conflicts_backed_up,
+                        set_aside = outcome.world_files_set_aside,
                         local_wins = outcome.conflicts_local_wins,
                         bytes = outcome.bytes_extracted,
                         "auto-restore diff: applied {} files (incl. {} conflict-backups), {} kept local",
@@ -3761,8 +3764,13 @@ struct AutoRestoreOutcome {
     /// Files where the local copy was moved into the conflict backup dir
     /// before being overwritten by the remote version (ADR 0014).
     conflicts_backed_up: u64,
-    /// Where the local versions were parked, if any. `None` when
-    /// `conflicts_backed_up == 0`.
+    /// Files of the world the version does not have, moved into the same dir
+    /// (`RestoreStats::world_files_set_aside`, HRD-Q-0027). Every pull of a
+    /// game that renames its world files on each save moves the previous
+    /// generation, so this is logged, not raised as a conflict notice.
+    world_files_set_aside: u64,
+    /// Where the local versions were parked, if any. `None` when both
+    /// `conflicts_backed_up` and `world_files_set_aside` are 0.
     conflict_dir: Option<PathBuf>,
     /// Total bytes copied. Sum of `restored` + `conflicts_resolved_remote`
     /// file sizes.
@@ -3818,9 +3826,20 @@ pub(crate) struct RestoreStats {
     /// genuinely diverges from the head (a follow-up upload carries real data)
     /// or matches it exactly (re-uploading would only mint a redundant no-op
     /// version). Counted with the same recursive walk as the restore itself.
+    /// Excludes [`Self::world_files_set_aside`].
     pub target_only: usize,
+    /// Local-only files inside a folder the share names whole
+    /// ([`kernel::fileclass::in_mirrored_folder`]: Valheim 1.0's
+    /// `worlds_local/<W>/`), moved into the conflict backup dir so the folder
+    /// ends equal to the version's (HRD-Q-0027). Not `conflicts_backed_up`:
+    /// nothing replaced them, and that count is a subset of
+    /// `conflicts_resolved_remote`. Not `target_only` either: they are no
+    /// longer in the folder, so they are not divergence. Always 0 without a
+    /// `conflict_backup_dir`; then they stay and count as `target_only`.
+    pub world_files_set_aside: usize,
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_auto_restore(
     api: &ApiClient,
     save: &WatchedSave,
@@ -3834,6 +3853,13 @@ async fn run_auto_restore(
     // alongside: a version read off one row and downloaded from another 404s.
     cached_latest: Option<i64>,
     shared_manifest: Option<Arc<tokio::sync::OnceCell<crate::api::CloudManifest>>>,
+    // Move the world's files the version lacks aside (HRD-Q-0027). Only the
+    // reducer's pull, which runs behind the session veto (no game, no open
+    // save file, nothing unflushed). Never the reconcile of a refused push:
+    // the folder holds the very writes that push carried, a newer world
+    // generation among them, and moving it aside would settle on the head
+    // over them. That merge keeps local-only files, as before.
+    set_aside_world: bool,
 ) -> Result<AutoRestorePull> {
     // Prefer the version the cloud_pull poller already learned this tick: it
     // fetched the whole manifest once, so reusing it spares us a per-save
@@ -3988,27 +4014,8 @@ async fn run_auto_restore(
         root.join(&save.save_id).join(ts)
     });
 
-    let copy_result = restore_files_into(
-        &save.local_path,
-        &staging,
-        conflict_backup_dir.as_deref(),
-        gate.scope(),
-    )
-    .await;
-    // The owner's merge can keep newer files outside the world and still leave
-    // the world equal to the head's: the staged world, read before staging goes,
-    // is what tells (HRD-D-0019). Only then is it worth the walk.
-    let head_world = match &copy_result {
-        Ok(stats)
-            if save.owns_whole_folder()
-                && (stats.conflicts_resolved_local > 0 || stats.target_only > 0) =>
-        {
-            crate::backup::walk_source(&staging, gate.scope())
-                .ok()
-                .map(|files| crate::backup::world_signature(&files, save.world()))
-        }
-        _ => None,
-    };
+    let world: &[String] = if set_aside_world { save.world() } else { &[] };
+    let merged = merge_staged(save, &staging, conflict_backup_dir, &gate, world, version).await;
     cleanup_staging(&staging).await;
 
     // Best-effort TTL sweep regardless of the per-file outcome, because we want
@@ -4019,16 +4026,68 @@ async fn run_auto_restore(
         }
     }
 
+    Ok(AutoRestorePull::Merged(merged?))
+}
+
+/// Merges the version staged in `staging` into the save's live folder
+/// ([`restore_files_into`]) and reads back what the merge left: whether the
+/// folder is still ahead of the version, and the signatures to adopt when it
+/// is not. The half of [`run_auto_restore`] after the download, apart so a
+/// test can stage a version by hand.
+async fn merge_staged(
+    save: &WatchedSave,
+    staging: &Path,
+    conflict_backup_dir: Option<PathBuf>,
+    gate: &RestoreGate,
+    // The share's list whose whole folders the version replaces, or nothing
+    // (see `run_auto_restore`'s `set_aside_world`).
+    set_aside: &[String],
+    version: i64,
+) -> Result<AutoRestoreOutcome> {
+    let copy_result = restore_files_into(
+        &save.local_path,
+        staging,
+        conflict_backup_dir.as_deref(),
+        gate.scope(),
+        set_aside,
+    )
+    .await;
+    // The owner's merge can keep newer files outside the world and still leave
+    // the world equal to the head's: the staged world, read before staging goes,
+    // is what tells (HRD-D-0019). Only then is it worth the walk.
+    let head_world = match &copy_result {
+        Ok(stats)
+            if save.owns_whole_folder()
+                && (stats.conflicts_resolved_local > 0 || stats.target_only > 0) =>
+        {
+            crate::backup::walk_source(staging, gate.scope())
+                .ok()
+                .map(|files| crate::backup::world_signature(&files, save.world()))
+        }
+        _ => None,
+    };
+
     let stats = copy_result?;
-    let dir_used = if stats.conflicts_backed_up > 0 {
+    let dir_used = if stats.conflicts_backed_up > 0 || stats.world_files_set_aside > 0 {
         conflict_backup_dir
     } else {
         None
     };
+    if stats.world_files_set_aside > 0 {
+        tracing::info!(
+            save_id = %save.save_id,
+            version_num = version,
+            set_aside = stats.world_files_set_aside,
+            dir = %dir_used.as_deref().map(|d| d.display().to_string()).unwrap_or_default(),
+            "auto-restore diff: moved {} world files the version does not have aside",
+            stats.world_files_set_aside
+        );
+    }
 
     // Did anything local survive the merge that head doesn't have? A newer
     // local file (kept on mtime) or a local-only file means the merged tree is
-    // ahead of head; otherwise the tree now equals head exactly.
+    // ahead of head; otherwise the tree now equals head exactly. The world's
+    // files moved aside are no longer there to diverge.
     let local_diverged = stats.conflicts_resolved_local > 0 || stats.target_only > 0;
     // Cheap (no byte reads) signature of the merged folder, in the composite
     // `"<cheap>:"` shape `upload_directory_checked` splits on, and the empty
@@ -4044,17 +4103,18 @@ async fn run_auto_restore(
         .map(|files| crate::backup::world_signature(files, save.world()))
         .filter(|world| !local_diverged || head_world.as_ref() == Some(world));
 
-    Ok(AutoRestorePull::Merged(AutoRestoreOutcome {
+    Ok(AutoRestoreOutcome {
         version_num: version,
         files_restored: stats.restored as u64,
         conflicts_local_wins: stats.conflicts_resolved_local as u64,
         conflicts_backed_up: stats.conflicts_backed_up as u64,
+        world_files_set_aside: stats.world_files_set_aside as u64,
         conflict_dir: dir_used,
         bytes_extracted: stats.bytes_restored,
         local_diverged,
         disk_set_hash,
         disk_world_hash,
-    }))
+    })
 }
 
 /// What a reconcile pull found. Three answers and not `Option`, because the two
@@ -4191,6 +4251,14 @@ pub(crate) async fn cleanup_old_conflicts(conflict_root: &Path, retention: Durat
 ///     `conflicts_resolved_local` as a safety fallback (legacy 1.5.4
 ///     behaviour) and log a warn.
 ///
+/// Then walks `target` for files `source` does not have. Those inside a
+/// folder `world` names whole ([`kernel::fileclass::in_mirrored_folder`]),
+/// save data by `scope`, are moved into `conflict_backup_dir` and counted in
+/// `world_files_set_aside` (HRD-Q-0027): a game that renames its files on
+/// every save would otherwise keep the older generation beside the pulled
+/// one. The rest are left alone and counted in `target_only`. `world` is the
+/// share's list ([`WatchedSave::world`]), empty for an unshared save.
+///
 /// Errors propagate only for I/O failures we can't classify (e.g.
 /// permission denied reading a file we just listed).
 pub(crate) async fn restore_files_into(
@@ -4198,6 +4266,7 @@ pub(crate) async fn restore_files_into(
     source: &Path,
     conflict_backup_dir: Option<&Path>,
     scope: Scope<'_>,
+    world: &[String],
 ) -> Result<RestoreStats> {
     let mut stats = RestoreStats::default();
     let mut stack: Vec<PathBuf> = vec![source.to_path_buf()];
@@ -4321,6 +4390,7 @@ pub(crate) async fn restore_files_into(
     // filter transient lock files here: a stray lock counting as divergence
     // only costs one extra upload (the safe direction), never a skipped one.
     let mut tstack: Vec<PathBuf> = vec![target.to_path_buf()];
+    let mut stale: Vec<String> = Vec::new();
     while let Some(dir) = tstack.pop() {
         let mut entries = match tokio::fs::read_dir(&dir).await {
             Ok(e) => e,
@@ -4351,12 +4421,32 @@ pub(crate) async fn restore_files_into(
             // are in sync" and the next backup would skip the file down the fast path
             // without ever having uploaded it.
             let rel_str = rel.to_string_lossy().replace('\\', "/");
-            if !kernel::fileclass::classify(&rel_str, scope).is_backed_up() {
+            let class = kernel::fileclass::classify(&rel_str, scope);
+            if !class.is_backed_up() {
                 continue;
             }
-            if !source_rels.contains(rel) {
+            if source_rels.contains(rel) {
+                continue;
+            }
+            if conflict_backup_dir.is_some()
+                && class == kernel::fileclass::FileClass::SaveData
+                && kernel::fileclass::in_mirrored_folder(world, &rel_str)
+            {
+                stale.push(rel_str);
+            } else {
                 stats.target_only += 1;
             }
+        }
+    }
+
+    // Moved once the walk is done, so it never reads a folder it is emptying.
+    if let Some(dir) = conflict_backup_dir {
+        for rel in &stale {
+            crate::restore::move_aside(&target.join(rel), &dir.join(rel))
+                .await
+                .with_context(|| format!("moving {rel}, which the version lacks, aside"))?;
+            crate::restore::prune_emptied(target, rel, world);
+            stats.world_files_set_aside += 1;
         }
     }
 
@@ -5023,6 +5113,7 @@ async fn run_backup_with_retry(
                         base_version,
                         None,
                         None,
+                        false,
                     )
                     .await
                     {
@@ -8691,11 +8782,12 @@ mod tests {
                 shields: &shields,
                 include: &include,
             },
+            &include,
         )
         .await
         .unwrap();
         assert_eq!(stats.target_only, 0, "Beta and the character do not count");
-        let stats = restore_files_into(root, staging.path(), None, Scope::default())
+        let stats = restore_files_into(root, staging.path(), None, Scope::default(), &[])
             .await
             .unwrap();
         assert_eq!(stats.target_only, 2, "without the list they do");
@@ -8715,7 +8807,7 @@ mod tests {
         write_file(&source.join("nested/c.dat"), b"gamma");
         write_file(&target.join("a.dat"), b"alpha");
 
-        let stats = restore_files_into(target, source, None, Scope::default())
+        let stats = restore_files_into(target, source, None, Scope::default(), &[])
             .await
             .unwrap();
 
@@ -8756,14 +8848,14 @@ mod tests {
         std::fs::write(target.join("Player.log"), b"log").unwrap();
         std::fs::write(target.join(".DS_Store"), b"junk").unwrap();
 
-        let stats = restore_files_into(target, source, None, Scope::default())
+        let stats = restore_files_into(target, source, None, Scope::default(), &[])
             .await
             .unwrap();
         assert_eq!(stats.target_only, 0, "la basura no es divergencia");
 
         // But config does count: it exists only locally until it is uploaded.
         std::fs::write(target.join("graphics.ini"), b"res=1080").unwrap();
-        let stats = restore_files_into(target, source, None, Scope::default())
+        let stats = restore_files_into(target, source, None, Scope::default(), &[])
             .await
             .unwrap();
         assert_eq!(stats.target_only, 1, "the config does have to count");
@@ -8788,7 +8880,7 @@ mod tests {
         write_file(&target.join("local-only.sav"), b"unsynced");
         write_file(&target.join("nested/also-local.sav"), b"more");
 
-        let stats = restore_files_into(target, source, None, Scope::default())
+        let stats = restore_files_into(target, source, None, Scope::default(), &[])
             .await
             .unwrap();
 
@@ -8811,6 +8903,270 @@ mod tests {
         );
     }
 
+    /// Every file under `dir`, `/`-separated, with its bytes.
+    fn files_under(dir: &Path) -> std::collections::BTreeMap<String, Vec<u8>> {
+        let mut out = std::collections::BTreeMap::new();
+        let mut stack = vec![dir.to_path_buf()];
+        while let Some(d) = stack.pop() {
+            let Ok(entries) = std::fs::read_dir(&d) else {
+                continue;
+            };
+            for e in entries.flatten() {
+                let p = e.path();
+                if p.is_dir() {
+                    stack.push(p);
+                } else {
+                    let rel = p.strip_prefix(dir).unwrap();
+                    let rel = rel.to_string_lossy().replace('\\', "/");
+                    out.insert(rel, std::fs::read(&p).unwrap());
+                }
+            }
+        }
+        out
+    }
+
+    /// A Valheim 1.0 world generation `n` of world `w` under `root`, as the
+    /// game writes it: the four `_main.<n>.*` files, plus `chunks` chunk files.
+    fn valheim_generation(root: &Path, w: &str, n: u32, chunks: &[&str]) {
+        for ext in ["fwl2", "db2", "chunks", "ok"] {
+            write_file(
+                &root.join(format!("worlds_local/{w}/_main.{n}.{ext}")),
+                format!("{w} gen {n} {ext}").as_bytes(),
+            );
+        }
+        for c in chunks {
+            write_file(
+                &root.join(format!("worlds_local/{w}/{c}")),
+                format!("{w} gen {n} {c}").as_bytes(),
+            );
+        }
+    }
+
+    fn alpha_world() -> Vec<String> {
+        crate::worldfiles::template("valheim", "Alpha")
+            .unwrap()
+            .unwrap()
+    }
+
+    /// HRD-Q-0027: a member pulls generation 8 over a folder still holding
+    /// generation 6 and a chunk only 6 had. The world's folder ends exactly as
+    /// the version's; the stale files sit in the conflicts folder, bytes
+    /// intact, and are neither local-only divergence nor conflict backups.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_pull_moves_the_stale_world_generation_aside() {
+        let tmp = tempfile::tempdir().unwrap();
+        let target = &tmp.path().join("live");
+        let source = &tmp.path().join("staging");
+        let backup = &tmp.path().join("conflicts/w1/ts");
+        valheim_generation(target, "Alpha", 6, &["0_0.chunk", "old/1_1.chunk"]);
+        let stale = files_under(target);
+        valheim_generation(source, "Alpha", 8, &["0_0.chunk", "2_2.chunk"]);
+        let world = alpha_world();
+
+        let stats = restore_files_into(
+            target,
+            source,
+            Some(backup),
+            Scope {
+                shields: &[],
+                include: &world,
+            },
+            &world,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(files_under(target), files_under(source));
+        assert_eq!(stats.world_files_set_aside, 5, "{stats:?}");
+        assert_eq!(stats.target_only, 0, "moved aside is not divergence");
+        assert_eq!(stats.conflicts_backed_up, 1, "0_0.chunk, replaced");
+        // The stale generation and its chunk, bytes intact, plus the replaced
+        // chunk's old bytes, all in the one conflicts folder.
+        assert_eq!(files_under(backup), stale);
+        // The folder only the stale chunk lived in went with it.
+        assert!(!target.join("worlds_local/Alpha/old").exists());
+        assert!(target.join("worlds_local/Alpha").is_dir());
+    }
+
+    /// Restoring an OLDER version over a newer local generation: without the
+    /// move the game would go on loading generation 9.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_restore_of_an_older_version_moves_the_newer_generation_aside() {
+        let tmp = tempfile::tempdir().unwrap();
+        let target = &tmp.path().join("live");
+        let source = &tmp.path().join("staging");
+        let backup = &tmp.path().join("conflicts/w1/ts");
+        valheim_generation(target, "Alpha", 9, &["0_0.chunk"]);
+        let newer = files_under(target);
+        valheim_generation(source, "Alpha", 7, &[]);
+        let world = alpha_world();
+
+        let stats = restore_files_into(
+            target,
+            source,
+            Some(backup),
+            Scope {
+                shields: &[],
+                include: &world,
+            },
+            &world,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(files_under(target), files_under(source));
+        assert_eq!(files_under(backup), newer);
+        assert_eq!((stats.world_files_set_aside, stats.target_only), (5, 0));
+    }
+
+    /// Everything outside a world's 1.0 folder keeps the merge as it was:
+    /// local-only files stay and count as divergence. The legacy flat world
+    /// and its `.old` twin, a character, another world's folder (one whose
+    /// name starts the same included), a wildcard-named backup folder, and
+    /// the same layout in a save that is not shared.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_pull_leaves_local_files_outside_the_worlds_folder_alone() {
+        let tmp = tempfile::tempdir().unwrap();
+        let target = &tmp.path().join("live");
+        let source = &tmp.path().join("staging");
+        let backup = &tmp.path().join("conflicts/w1/ts");
+        valheim_generation(source, "Alpha", 8, &[]);
+        valheim_generation(target, "Alpha", 8, &[]);
+        write_file(&target.join("worlds_local/Alpha.db.old"), b"flat old");
+        write_file(&target.join("worlds_local/Alpha.fwl"), b"flat");
+        write_file(&target.join("characters_local/Me.fch"), b"me");
+        valheim_generation(target, "Beta", 3, &[]);
+        valheim_generation(target, "Alpha2", 3, &[]);
+        valheim_generation(target, "Alpha_backup_auto-20260913", 5, &[]);
+        let before = files_under(target);
+        let world = alpha_world();
+
+        // The owner's merge: the whole folder, the share's world.
+        let stats = restore_files_into(target, source, Some(backup), Scope::default(), &world)
+            .await
+            .unwrap();
+        assert_eq!(files_under(target), before);
+        assert!(!backup.exists());
+        assert_eq!(stats.world_files_set_aside, 0);
+        assert_eq!(stats.target_only, 3 + 3 * 4, "{stats:?}");
+
+        // Unshared: no world, nothing moves, not even inside `Alpha/`.
+        valheim_generation(target, "Alpha", 6, &[]);
+        let before = files_under(target);
+        let stats = restore_files_into(target, source, Some(backup), Scope::default(), &[])
+            .await
+            .unwrap();
+        assert_eq!(files_under(target), before);
+        assert_eq!(stats.world_files_set_aside, 0);
+        assert_eq!(stats.target_only, 3 + 4 * 4, "{stats:?}");
+
+        // No conflicts folder configured: the stale generation stays too.
+        let stats = restore_files_into(target, source, None, Scope::default(), &world)
+            .await
+            .unwrap();
+        assert_eq!(files_under(target), before);
+        assert_eq!(stats.world_files_set_aside, 0);
+    }
+
+    /// HRD-Q-0027 with HRD-D-0019: the owner synced at v3 on generation 6;
+    /// a member hosting pushed v4 on generation 8. The owner's pull moves 6
+    /// aside, so the world on disk is the head's: its fingerprint is adopted,
+    /// and a character-only change after it goes up without the lease. The
+    /// owner's local-only character keeps the merged tree ahead of the head,
+    /// the case where only the world is compared.
+    #[tokio::test(flavor = "current_thread")]
+    async fn an_owners_pull_over_a_stale_generation_leaves_the_world_at_the_head() {
+        use kernel::reconcile::{HOLD_LEASE_NEEDED, HOLD_LEASE_OTHER};
+        use kernel::{Action, Decision};
+
+        fn tick(slot: &mut SaveSlot, cloud: &CloudHeads, now: OffsetDateTime) -> Vec<Decision> {
+            let obs = observe_slot(slot, cloud);
+            let state = state_from_slot(slot, &AgentConfig::default(), now);
+            let (next, ds) =
+                kernel::reconcile::reconcile(&state, &obs, kernel::World { now, seed: 0 });
+            apply_state_to_slot(slot, next);
+            ds
+        }
+        let no_lease_hold = |ds: &[Decision]| {
+            !ds.iter().any(|d| {
+                matches!(d, Decision::Hold { reason } if *reason == HOLD_LEASE_OTHER || *reason == HOLD_LEASE_NEEDED)
+            })
+        };
+
+        let tmp = tempfile::tempdir().unwrap();
+        let root = &tmp.path().join("save");
+        let staging = &tmp.path().join("staging");
+        let conflicts = &tmp.path().join("conflicts/w1/ts");
+        valheim_generation(root, "Alpha", 6, &["0_0.chunk"]);
+        write_file(&root.join("characters_local/Me.fch"), b"me");
+        write_file(&root.join("characters_local/Alt.fch"), b"alt, never pushed");
+        let mut save = owner_save(root);
+        save.shared.as_mut().unwrap().include = alpha_world();
+        save.policy.auto_restore = Some(true);
+        assert!(save.owns_whole_folder());
+        let mut slot = test_slot(save);
+        slot.known_version = Some(3);
+        slot.lease = kernel::LeaseObs::Other;
+        test_sync_now(&mut slot);
+        let synced_world = slot.synced_world_fingerprint;
+
+        // v4, the member's: generation 8, the same character.
+        valheim_generation(staging, "Alpha", 8, &["0_0.chunk"]);
+        write_file(&staging.join("characters_local/Me.fch"), b"me");
+
+        let later = OffsetDateTime::now_utc() + time::Duration::hours(1);
+        let mut cloud = CloudHeads::new(later);
+        cloud.feed(HashMap::from([("w1".to_string(), 4)]), None, None, later);
+        assert_eq!(
+            tick(&mut slot, &cloud, later),
+            vec![Decision::Act(Action::Restore)]
+        );
+
+        // The restore's merge, over the staged v4, and its result handed back
+        // the way `AutoRestoreFinished` does.
+        let gate = slot.save.gate(false);
+        let world = slot.save.world().to_vec();
+        let outcome = merge_staged(
+            &slot.save,
+            staging,
+            Some(conflicts.clone()),
+            &gate,
+            &world,
+            4,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            outcome.world_files_set_aside, 4,
+            "0_0.chunk is replaced, not stale"
+        );
+        assert!(outcome.local_diverged, "Alt.fch is the owner's alone");
+        assert_eq!(outcome.conflict_dir.as_deref(), Some(conflicts.as_path()));
+        assert!(conflicts.join("worlds_local/Alpha/_main.6.db2").exists());
+        let world_hash = outcome.disk_world_hash.clone();
+        assert!(world_hash.is_some(), "the world on disk is the head's");
+        slot.pending_op_result = Some(kernel::OpResult::Ok {
+            version: Some(outcome.version_num),
+            fingerprint: None,
+            wrote: true,
+            world_fingerprint: world_hash.as_deref().map(fingerprint_from_set_hash),
+        });
+        after_pull_landed(&mut slot, None);
+        tick(&mut slot, &cloud, later + time::Duration::seconds(1));
+        assert_eq!(slot.known_version, Some(4));
+        assert_ne!(slot.synced_world_fingerprint, synced_world);
+        let (_, on_disk) = observe_local_fingerprint(root, "valheim", &[], &world).unwrap();
+        assert_eq!(slot.synced_world_fingerprint, Some(on_disk));
+
+        // A character-only change goes up without the lease.
+        let t = later + time::Duration::minutes(10);
+        write_file(&root.join("characters_local/Me.fch"), b"me, levelled up");
+        mark_fs_hit(&mut slot, t);
+        let ds = tick(&mut slot, &cloud, t + time::Duration::seconds(1));
+        assert!(ds.contains(&Decision::Act(Action::Backup)), "{ds:?}");
+        assert!(no_lease_hold(&ds), "{ds:?}");
+    }
+
     /// Mirror image: when the target is a strict subset of the snapshot
     /// (everything local also exists remotely), `target_only` is zero, and the
     /// signal that a purely-behind device can settle without re-uploading.
@@ -8826,7 +9182,7 @@ mod tests {
         // Target only has a.dat (subset); b.dat will be copied in.
         write_file(&target.join("a.dat"), b"alpha");
 
-        let stats = restore_files_into(target, source, None, Scope::default())
+        let stats = restore_files_into(target, source, None, Scope::default(), &[])
             .await
             .unwrap();
 
@@ -8848,7 +9204,7 @@ mod tests {
         write_file(&source.join("a.dat"), b"remote-version");
         write_file(&target.join("a.dat"), b"LOCAL-WORK");
 
-        let stats = restore_files_into(target, source, None, Scope::default())
+        let stats = restore_files_into(target, source, None, Scope::default(), &[])
             .await
             .unwrap();
 
@@ -8879,7 +9235,7 @@ mod tests {
         write_file(&target.join("a.dat"), b"alpha");
         write_file(&target.join("sub/b.dat"), b"beta");
 
-        let stats = restore_files_into(target, source, None, Scope::default())
+        let stats = restore_files_into(target, source, None, Scope::default(), &[])
             .await
             .unwrap();
 
@@ -8904,7 +9260,7 @@ mod tests {
         write_file(&source.join("b.dat"), b"beta-bytes");
         write_file(&source.join("deep/nested/c.dat"), b"gamma!");
 
-        let stats = restore_files_into(target, source, None, Scope::default())
+        let stats = restore_files_into(target, source, None, Scope::default(), &[])
             .await
             .unwrap();
 
@@ -8950,7 +9306,7 @@ mod tests {
         set_mtime(&target.join("a.dat"), now - Duration::from_secs(10));
         set_mtime(&source.join("a.dat"), now + Duration::from_secs(10));
 
-        let stats = restore_files_into(target, source, Some(backup), Scope::default())
+        let stats = restore_files_into(target, source, Some(backup), Scope::default(), &[])
             .await
             .unwrap();
 
@@ -8982,7 +9338,7 @@ mod tests {
         set_mtime(&source.join("a.dat"), now - Duration::from_secs(60));
         set_mtime(&target.join("a.dat"), now);
 
-        let stats = restore_files_into(target, source, Some(backup), Scope::default())
+        let stats = restore_files_into(target, source, Some(backup), Scope::default(), &[])
             .await
             .unwrap();
 
@@ -9019,7 +9375,7 @@ mod tests {
         set_mtime(&source.join("clash.dat"), old + Duration::from_secs(20));
         set_mtime(&target.join("clash.dat"), old);
 
-        let stats = restore_files_into(target, source, Some(backup), Scope::default())
+        let stats = restore_files_into(target, source, Some(backup), Scope::default(), &[])
             .await
             .unwrap();
         assert_eq!(stats.restored, 1);
@@ -9060,7 +9416,7 @@ mod tests {
         set_mtime(&target.join("a.dat"), now - Duration::from_secs(10));
         set_mtime(&source.join("a.dat"), now + Duration::from_secs(10));
 
-        let stats = restore_files_into(target, source, None, Scope::default())
+        let stats = restore_files_into(target, source, None, Scope::default(), &[])
             .await
             .unwrap();
 
