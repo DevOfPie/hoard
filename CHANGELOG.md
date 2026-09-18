@@ -66,9 +66,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   the folder is left alone. The restore dialog, its success notice,
   `hoard restore --dry-run` and the pull's notice say how many files moved.
 - **A shared world is never pushed partial.** A world file that cannot be read,
-  or that the plan's per-save cap would drop, holds the push and retries it
-  later, with the card's warning, instead of publishing a version that would
-  move that file out of every other member's folder.
+  or that the plan's per-save cap would drop, holds the push, with a warning
+  on the card and in the activity feed naming the file, instead of publishing
+  a version that would move that file out of every other member's folder. The
+  push retries after 1, 5, 15 and 30 minutes and then stops until the save's
+  files change or *Back up now* is pressed; a change to the files retries at
+  once. While it is held with the game closed, the lease is given back so
+  another member can host. A file deleted while the push reads the folder is
+  left out of that version rather than holding it. A restore whose safety copy
+  is held this way offers to go ahead without it.
+- **A restore downloads before it touches the folder.** `hoard restore` and
+  the desktop's restore download the version into a temporary folder first,
+  so a download that fails or is cut off leaves the save's folder as it was.
+  Every file the restore replaces is moved into the conflicts folder first,
+  and the folder is printed and shown in the notice.
 
 ### Fixed
 - **A member adopting a world beside their own characters gets the world.** A
@@ -77,6 +88,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   the world never came down. Such a folder now has nothing to push, the first
   pull runs, and no lease is asked for. A write outside the files a save
   pushes no longer marks it as having changes.
+- **A restart after a pull no longer pushes the pulled version back.** The
+  folder's signature after a pull is now kept with the version, so the service
+  starting again does not take the pull's own writes for changes, take the
+  lease and push.
+- **Releasing a world claimed with the game closed lets go of it.** The claim
+  was kept for the next launch, and every later push with no game running
+  held on to the lease.
+- **A pull or merge that fails half-way puts the folder back.** A write that
+  failed after the old files moved aside left some files in neither place;
+  the whole merge is now undone. A pull deferred by a game starting is no
+  longer counted as landed, and a write to the folder during a pull's
+  download defers it too, which catches a game the process check misses. Files
+  moved across drives keep their modification time.
 
 ## [1.1.7] - 2026-09-13
 
