@@ -743,6 +743,15 @@ fn ingest_op_result(
                 next.next_backup_at = Some(now + Duration::seconds(delay));
             }
         }
+        // The pull staged the head and did not merge it. Not landed: no
+        // version, no fingerprint, and the deferred-pull journal stays set, so
+        // the pull runs once the vetoes lift. Not failed: nothing escalates.
+        // The short cooldown keeps a veto the kernel cannot see (a game
+        // undetected on Linux) from turning into a download loop.
+        OpResult::Deferred => {
+            next.pull_pending = true;
+            next.next_restore_at = Some(now + Duration::seconds(RESTORE_COOLDOWN_SECS));
+        }
         // 409 `lease_required` (HRD-D-0019): the server wanted the lease for this
         // push, because the world it holds is not the one this owner synced, or
         // because it predates the owner's exception. Forgetting the world's
@@ -1569,6 +1578,29 @@ mod tests {
             &mut idle.world_held,
             &mut idle.next_backup_at
         ));
+    }
+
+    /// M-C: a pull that staged the head and did not merge it (the game came up
+    /// during the download) is not a landed pull: the deferred-pull journal
+    /// stays set and no version is adopted, and it does not escalate either.
+    #[test]
+    fn a_deferred_pull_keeps_the_pull_pending() {
+        let state = State {
+            in_flight: Some(Op::Restore),
+            known_version: Some(3),
+            ..base_state()
+        };
+        let obs = Observation {
+            op_result: Some(OpResult::Deferred),
+            cloud_version: Some(4),
+            ..quiet_obs()
+        };
+        let (next, _ds) = reconcile(&state, &obs, world(0));
+        assert_eq!(next.in_flight, None);
+        assert!(next.pull_pending, "the pull still waits");
+        assert_eq!(next.known_version, Some(3));
+        assert_eq!(next.restore_failures, RestoreFailures::default());
+        assert_eq!(next.last_restore_at, None, "nothing was written");
     }
 
     /// The 409-with-no-way-out bug: the shell answered "you are behind, but there
@@ -2592,7 +2624,7 @@ mod tests {
             fs_event in any::<bool>(),
             retry in 0u32..600,
             has_op in any::<bool>(),
-            op_kind in 0u8..7,
+            op_kind in 0u8..8,
             ok_ver in prop::option::of(0i64..20),
             ok_fp in prop::option::of(0u64..8),
             ok_wrote in any::<bool>(),
@@ -2613,6 +2645,7 @@ mod tests {
                     3 => OpResult::Throttled { retry_after_secs: retry },
                     4 => OpResult::LeaseRequired,
                     5 => OpResult::WorldHeld,
+                    6 => OpResult::Deferred,
                     _ => OpResult::Failed,
                 })
             };

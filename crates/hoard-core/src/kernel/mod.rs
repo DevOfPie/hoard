@@ -195,6 +195,12 @@ pub enum OpResult {
     /// past [`reconcile::WORLD_HELD_GIVE_UP_AFTER`], parks until the file
     /// changes or the user asks. Keeps `has_pending`: nothing went up.
     WorldHeld,
+    /// A pull downloaded the head but did not merge it: the game started, or
+    /// took a save file, during the download. Nothing was written, so it is
+    /// neither a landed pull (no bookkeeping, `pull_pending` stays) nor a
+    /// failure (no escalation): the pull waits, on the short cooldown, for the
+    /// vetoes to lift.
+    Deferred,
     /// Anything else (network, sha, permissions, timeout) once the executor has
     /// burned its internal retries. What it does depends on the op in flight. On
     /// a **download** it escalates the per-cloud-version failure counter and the

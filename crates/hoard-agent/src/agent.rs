@@ -322,6 +322,11 @@ enum AutoRestoreDisposition {
     /// Carries the formatted error chain for the event. Escalates the
     /// consecutive-failure counter and the backoff.
     Failed(String),
+    /// Staged, not merged: the game started or took a save file during the
+    /// download. Nothing was written and nothing failed; the pull waits for
+    /// the vetoes to lift. Reported as [`kernel::OpResult::Deferred`], never as
+    /// a landed pull.
+    Deferred,
 }
 
 /// Commands the host (Tauri command handlers, tests) sends to the agent.
@@ -2461,41 +2466,15 @@ async fn run_agent(
                         // not veto the next pull); the synced fingerprint comes from
                         // the post-merge signature only when the tree ended up equal
                         // to the head, with no local divergence.
-                        let fingerprint =
-                            post_restore_set_hash.as_deref().map(fingerprint_from_set_hash);
-                        let world_fingerprint =
-                            post_restore_world_hash.as_deref().map(fingerprint_from_set_hash);
-                        let op_result = match disposition {
-                            AutoRestoreDisposition::Ok => kernel::OpResult::Ok {
-                                version: synced_version,
-                                fingerprint,
-                                wrote: wrote_files,
-                                world_fingerprint,
-                            },
-                            AutoRestoreDisposition::NotOnServer => kernel::OpResult::NotFound,
-                            AutoRestoreDisposition::Unauthorized => kernel::OpResult::Unauthorized,
-                            AutoRestoreDisposition::Throttled { retry_after_secs } => {
-                                kernel::OpResult::Throttled { retry_after_secs }
-                            }
-                            AutoRestoreDisposition::Failed(err) => {
-                                if let Some(slot) = slots.get_mut(&id) {
-                                    slot.last_restore_error = Some(err);
-                                }
-                                kernel::OpResult::Failed
-                            }
-                        };
                         if let Some(slot) = slots.get_mut(&id) {
-                            // Adopting the post-merge signature also refreshes the
-                            // backup's skip: the merge's own writes do not bounce
-                            // back as a redundant re-upload of the head.
-                            if let Some(h) = post_restore_set_hash {
-                                slot.last_set_hash = Some(h);
-                            }
-                            let landed = matches!(op_result, kernel::OpResult::Ok { .. });
-                            slot.pending_op_result = Some(op_result);
-                            if landed {
-                                after_pull_landed(slot, fingerprint);
-                            }
+                            ingest_restore_finished(
+                                slot,
+                                disposition,
+                                synced_version,
+                                post_restore_set_hash,
+                                post_restore_world_hash,
+                                wrote_files,
+                            );
                         }
                         reconcile_all(
                             &mut slots, &api, &events_tx, &cmd_tx, &config, &done_tx,
@@ -3317,6 +3296,59 @@ fn apply_backup_done(slot: &mut SaveSlot, done: BackupDone) {
     }
 }
 
+/// A pull's end, as an input to the reducer: the disposition becomes the
+/// kernel's `OpResult`, queued for the next `reconcile_all`. Only a pull that
+/// landed (`Ok`) adopts the post-merge signature and runs the landed
+/// bookkeeping (`after_pull_landed`); a `Deferred` one wrote nothing and
+/// landed nothing, so the owner's pending re-check waits for the pull that
+/// does (M-C).
+fn ingest_restore_finished(
+    slot: &mut SaveSlot,
+    disposition: AutoRestoreDisposition,
+    synced_version: Option<i64>,
+    post_restore_set_hash: Option<String>,
+    post_restore_world_hash: Option<String>,
+    wrote_files: bool,
+) {
+    let fingerprint = post_restore_set_hash
+        .as_deref()
+        .map(fingerprint_from_set_hash);
+    let world_fingerprint = post_restore_world_hash
+        .as_deref()
+        .map(fingerprint_from_set_hash);
+    let op_result = match disposition {
+        AutoRestoreDisposition::Ok => kernel::OpResult::Ok {
+            version: synced_version,
+            fingerprint,
+            wrote: wrote_files,
+            world_fingerprint,
+        },
+        AutoRestoreDisposition::NotOnServer => kernel::OpResult::NotFound,
+        AutoRestoreDisposition::Unauthorized => kernel::OpResult::Unauthorized,
+        AutoRestoreDisposition::Throttled { retry_after_secs } => {
+            kernel::OpResult::Throttled { retry_after_secs }
+        }
+        AutoRestoreDisposition::Failed(err) => {
+            slot.last_restore_error = Some(err);
+            kernel::OpResult::Failed
+        }
+        AutoRestoreDisposition::Deferred => kernel::OpResult::Deferred,
+    };
+    let landed = matches!(op_result, kernel::OpResult::Ok { .. });
+    // Adopting the post-merge signature also refreshes the backup's skip: the
+    // merge's own writes do not bounce back as a redundant re-upload of the
+    // head.
+    if landed {
+        if let Some(h) = post_restore_set_hash {
+            slot.last_set_hash = Some(h);
+        }
+    }
+    slot.pending_op_result = Some(op_result);
+    if landed {
+        after_pull_landed(slot, fingerprint);
+    }
+}
+
 /// A pull landed. An owner's side copy that took the world away cleared
 /// `has_pending` so that pull could come through (`claim::on_side_copied`),
 /// though other writes were still unversioned: they are marked again now,
@@ -3706,6 +3738,7 @@ fn spawn_auto_restore(
             // still ahead of `known_version`, so the reducer asks again, and
             // with the game up that is a deferred pull, landing when it closes.
             Ok(AutoRestorePull::Deferred { version_num }) => {
+                disposition = AutoRestoreDisposition::Deferred;
                 tracing::info!(
                     save_id = %save.save_id,
                     version_num,
@@ -8588,6 +8621,44 @@ mod tests {
     fn owner_folder(root: &Path) {
         write_file(&root.join("worlds_local/Alpha.db"), b"alpha");
         write_file(&root.join("characters_local/Me.fch"), b"me");
+    }
+
+    /// M-C: an owner whose side copy just landed has other writes to re-check
+    /// once the pull lands. A pull deferred because the game came up during
+    /// the download landed nothing: the re-check waits, `has_pending` is not
+    /// set (it would veto the very pull that refills the world), and the pull
+    /// stays pending.
+    #[test]
+    fn a_deferred_pull_is_not_a_landed_one() {
+        let dir = tempfile::tempdir().unwrap();
+        owner_folder(dir.path());
+        let mut slot = test_slot(owner_save(dir.path()));
+        slot.recheck_pending_after_pull = true;
+        slot.known_version = None;
+        slot.in_flight = Some(kernel::Op::Restore);
+        ingest_restore_finished(
+            &mut slot,
+            AutoRestoreDisposition::Deferred,
+            None,
+            None,
+            None,
+            false,
+        );
+        assert!(!slot.has_pending, "nothing landed to re-check against");
+        assert!(
+            slot.recheck_pending_after_pull,
+            "the landing pull re-checks"
+        );
+        assert_eq!(slot.pending_op_result, Some(kernel::OpResult::Deferred));
+
+        let now = OffsetDateTime::now_utc();
+        let obs = observe_slot(&mut slot, &CloudHeads::new(now));
+        let state = state_from_slot(&slot, &AgentConfig::default(), now);
+        let (next, _ds) =
+            kernel::reconcile::reconcile(&state, &obs, kernel::World { now, seed: 0 });
+        apply_state_to_slot(&mut slot, next);
+        assert!(slot.pull_pending, "the pull still waits");
+        assert!(!slot.has_pending);
     }
 
     /// H-B recovery: a write to the save while its world push is held (the
