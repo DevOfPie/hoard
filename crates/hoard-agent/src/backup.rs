@@ -199,6 +199,18 @@ pub struct VanishedAfterWalk {
     pub path: String,
 }
 
+/// A file of the world moved (size or mtime) between the walk and the end of
+/// hashing, in an attempt that carries entries for unreadable world files: the
+/// carry was decided on a world that is no longer the one hashed. Not a
+/// failure of the push: [`upload_directory`] walks again, and the re-walk
+/// decides the carry afresh (M-B).
+#[derive(Debug, thiserror::Error)]
+#[error("{path} changed while the upload hashed the world")]
+pub struct WorldMovedAfterWalk {
+    /// Relative to the save.
+    pub path: String,
+}
+
 /// A test's hook into [`upload_directory_attempt`].
 #[cfg(test)]
 pub(crate) type UploadHook = Box<dyn Fn(&str)>;
@@ -206,8 +218,8 @@ pub(crate) type UploadHook = Box<dyn Fn(&str)>;
 #[cfg(test)]
 thread_local! {
     /// Called by an upload attempt with where it is (`walk`, before the walk;
-    /// `probed`, after the probe), on this thread: a test changes the folder
-    /// between the two.
+    /// `probed`, after the probe; `hashed`, after a CAS upload hashed its
+    /// files), on this thread: a test changes the folder between them.
     pub(crate) static UPLOAD_HOOK: std::cell::RefCell<Option<UploadHook>> =
         const { std::cell::RefCell::new(None) };
 }
@@ -221,11 +233,32 @@ fn upload_hook(phase: &str) {
     });
 }
 
-/// Is `e` a [`VanishedAfterWalk`]?
+/// Is `e` a [`VanishedAfterWalk`] or a [`WorldMovedAfterWalk`], either of
+/// which walks the folder again?
 fn vanished_after_walk(e: &anyhow::Error) -> bool {
     // `downcast_ref`, not `chain()`: it is attached as context, and anyhow
     // finds a context type through every layer above it.
     e.downcast_ref::<VanishedAfterWalk>().is_some()
+        || e.downcast_ref::<WorldMovedAfterWalk>().is_some()
+}
+
+/// `Err(WorldMovedAfterWalk)` for the first of `world_walk` (the world's files
+/// as the attempt walked them) whose size or mtime is not the walk's, or
+/// which is gone.
+async fn world_still_as_walked(world_walk: &[UploadFile]) -> Result<()> {
+    for f in world_walk {
+        let moved = match tokio::fs::metadata(&f.absolute_path).await {
+            Ok(m) => m.len() != f.size_bytes || m.modified().ok() != f.modified,
+            Err(_) => true,
+        };
+        if moved {
+            return Err(WorldMovedAfterWalk {
+                path: f.relative_path.clone(),
+            }
+            .into());
+        }
+    }
+    Ok(())
 }
 
 /// `e` as a [`VanishedAfterWalk`] for `rel` when the file was not found, else
@@ -1184,7 +1217,7 @@ where
                     save_id,
                     rewalks,
                     error = %format!("{e:#}"),
-                    "upload: a file left the folder after the walk; walking it again"
+                    "upload: a file left or changed after the walk; walking it again"
                 );
             }
             other => return other,
@@ -1262,6 +1295,13 @@ where
     let walked: HashMap<String, (u64, Option<SystemTime>)> = files
         .iter()
         .map(|f| (f.relative_path.clone(), (f.size_bytes, f.modified)))
+        .collect();
+    // The world as this walk saw it, readable files and not: checked again
+    // after hashing when anything is carried (M-B).
+    let world_walk: Vec<UploadFile> = files
+        .iter()
+        .filter(|f| !world.is_empty() && fileclass::included(world, &f.relative_path))
+        .cloned()
         .collect();
     let (files, unreadable) = split_unreadable(files).await;
     #[cfg(test)]
@@ -1357,6 +1397,7 @@ where
             save_id,
             &files,
             carried,
+            &world_walk,
             world,
             total_bytes,
             base_version,
@@ -1561,6 +1602,8 @@ async fn upload_directory_cas<F>(
     // world's unreadable files, as the synced version has them
     // ([`carry_unreadable_world`]).
     carried: Vec<CasFile>,
+    // The world's files as the attempt walked them.
+    world_walk: &[UploadFile],
     world: &[String],
     total_bytes: u64,
     base_version: Option<i64>,
@@ -1576,6 +1619,15 @@ where
 
     progress(0, total_bytes);
     let sha_by_path = hash_manifest(files, hashes).await?;
+    #[cfg(test)]
+    upload_hook("hashed");
+    // The carry was decided on the walk, and the readable files hashed after
+    // it: a world chunk the game rewrote meanwhile, beside a locked one, would
+    // go up torn, half the synced version's and half new. A world that moved
+    // is walked again, which decides the carry again (M-B).
+    if !carried.is_empty() {
+        world_still_as_walked(world_walk).await?;
+    }
 
     let mut manifest: Vec<CasFile> = Vec::with_capacity(files.len());
     for f in files {

@@ -9987,6 +9987,107 @@ mod tests {
         assert!(seen.lock().unwrap().is_empty(), "nothing was carried");
     }
 
+    /// M-B: the carry is decided on the attempt's walk, and the readable
+    /// files are hashed after it. A readable world file the game rewrote
+    /// during hashing, beside a locked one, would go up torn: the attempt
+    /// checks the world again after hashing and walks again, and that walk
+    /// finds a world that changed, which is held, not carried.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_world_that_changes_while_it_is_hashed_is_walked_again_not_carried() {
+        use sha2::Digest;
+        use std::os::unix::fs::PermissionsExt;
+        let lock = |p: &Path, mode: u32| {
+            std::fs::set_permissions(p, std::fs::Permissions::from_mode(mode)).unwrap()
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        owner_folder(root);
+        let fwl = root.join("worlds_local/Alpha.fwl");
+        write_file(&fwl, b"fwl");
+        let alpha = root.join("worlds_local/Alpha.db");
+        let mut save = owner_save(root);
+        save.shared.as_mut().unwrap().include = alpha_world();
+        let mut slot = test_slot(save);
+        slot.known_version = Some(3);
+        test_sync_now(&mut slot);
+        write_file(&root.join("characters_local/Me.fch"), b"me, later");
+        lock(&alpha, 0o000);
+        if std::fs::read(&alpha).is_ok() {
+            lock(&alpha, 0o644);
+            return;
+        }
+        let digest = |b: &[u8]| hex::encode(sha2::Sha256::digest(b));
+        let detail: &'static str = Box::leak(
+            format!(
+                r#"{{"id":"s3","version_num":3,"total_size_bytes":10,"file_count":3,"is_pinned":false,"created_at":"2026-09-14T09:14:11Z","files":[{{"relative_path":"characters_local/Me.fch","size_bytes":2,"sha256":"{}"}},{{"relative_path":"worlds_local/Alpha.db","size_bytes":5,"sha256":"{}"}},{{"relative_path":"worlds_local/Alpha.fwl","size_bytes":3,"sha256":"{}"}}]}}"#,
+                digest(b"me"),
+                digest(b"alpha"),
+                digest(b"fwl"),
+            )
+            .into_boxed_str(),
+        );
+        // Once hashed, before the manifest goes out: the game saves the
+        // readable world file.
+        let hook_fwl = fwl.clone();
+        let fired = std::rc::Rc::new(std::cell::Cell::new(0u32));
+        let fired_in = fired.clone();
+        crate::backup::UPLOAD_HOOK.with(|h| {
+            *h.borrow_mut() = Some(Box::new(move |phase: &str| {
+                if phase == "walk" {
+                    fired_in.set(fired_in.get() + 1);
+                }
+                if phase != "hashed" || fired_in.get() != 1 {
+                    return;
+                }
+                std::fs::write(&hook_fwl, b"FWL, saved").unwrap();
+                filetime::set_file_mtime(
+                    &hook_fwl,
+                    filetime::FileTime::from_unix_time(2_000_000_000, 0),
+                )
+                .unwrap();
+            }))
+        });
+        let (url, seen) =
+            refusing_server(vec![(200, detail), (200, INIT_V5), (201, COMMIT_V5)]).await;
+        let (events_tx, _events_rx) = mpsc::channel(64);
+        let (done_tx, mut done_rx) = mpsc::channel(8);
+        let (cmd_tx, mut cmd_rx) = mpsc::channel(8);
+        run_backup_with_retry(
+            ApiClient::new(&url, "fake").unwrap(),
+            slot.save.clone(),
+            None,
+            slot.known_version,
+            None,
+            slot.synced_world_fingerprint,
+            None,
+            VersionOrigin::Automatic,
+            false,
+            events_tx,
+            done_tx,
+            cmd_tx,
+            0,
+            false,
+            None,
+            14,
+        )
+        .await;
+        crate::backup::UPLOAD_HOOK.with(|h| *h.borrow_mut() = None);
+        lock(&alpha, 0o644);
+        assert_eq!(fired.get(), 2, "walked again");
+        assert!(done_rx.try_recv().is_err(), "nothing landed torn");
+        let cmd = cmd_rx.try_recv().ok();
+        assert!(
+            matches!(&cmd, Some(AgentCommand::ParkBackupPartialWorld { path, .. }) if path == "worlds_local/Alpha.db"),
+            "held for the world file"
+        );
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 1, "no manifest went out: {seen:?}");
+        assert!(
+            seen[0].0.starts_with("GET /v1/saves/w1/snapshots/3"),
+            "{seen:?}"
+        );
+    }
+
     const INIT_V5: &str = r#"{"upload_id":"u1","version_num":5,"missing":[],"missing_bytes":0}"#;
     const COMMIT_V5: &str = r#"{"id":"s5","version_num":5,"parent_version":4,"total_size_bytes":30,"file_count":3,"is_pinned":false,"created_at":"2026-09-14T09:14:11Z"}"#;
 
