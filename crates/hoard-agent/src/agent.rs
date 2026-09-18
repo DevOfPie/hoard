@@ -7386,6 +7386,98 @@ mod tests {
         );
     }
 
+    /// A member's share of a Valheim 1.0 world names the world's folder, and
+    /// the game writes chunk files one level inside it under names nobody saw
+    /// before: such a write is picked up by the watcher and goes up under the
+    /// share. The folder holds nothing else the list names, so a list that
+    /// missed the nested file would have nothing to push.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_chunk_written_inside_a_shared_1_0_world_backs_up() {
+        let tmp = tempfile::tempdir().expect("create tempdir");
+        let save_path = tmp.path().to_path_buf();
+        for dir in [
+            "worlds_local/Alpha",
+            "worlds_local/Gamma",
+            "characters_local",
+        ] {
+            std::fs::create_dir_all(save_path.join(dir)).expect("create folder");
+        }
+        std::fs::write(save_path.join("worlds_local/Gamma/_main.1.db2"), b"other")
+            .expect("write another world");
+        std::fs::write(save_path.join("characters_local/me.fch"), b"me")
+            .expect("write a character");
+
+        let api = ApiClient::new("http://127.0.0.1:1", "fake").expect("fake api client");
+        let (events_tx, mut events_rx) = mpsc::channel::<AgentEvent>(64);
+        let include = crate::worldfiles::template("valheim", "Alpha")
+            .unwrap()
+            .unwrap();
+        let mut save = shared_world("world-1", &save_path);
+        save.known_version = None;
+        save.include = include.clone();
+        if let Some(shared) = save.shared.as_mut() {
+            shared.include = include.clone();
+        }
+        let config = AgentConfig {
+            debounce_secs: 1,
+            poll_secs: 1,
+            max_retries: 0,
+            auto_restore: false,
+            global_sync: false,
+            conflict_root: None,
+            conflict_retention_days: 14,
+            min_snapshot_interval_secs: 0,
+        };
+
+        let (handle, task) = spawn(api, config, vec![save], events_tx);
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        handle
+            .set_lease("world-1".into(), kernel::LeaseObs::Mine, Some("me".into()))
+            .await
+            .unwrap();
+
+        let chunk = save_path.join("worlds_local/Alpha/-3_7.chunk");
+        let mut f = std::fs::File::create(&chunk).expect("create chunk file");
+        f.write_all(b"chunk").expect("write chunk file");
+        f.sync_all().expect("sync chunk file");
+        drop(f);
+
+        let started = tokio::time::timeout(Duration::from_secs(10), async {
+            while let Some(evt) = events_rx.recv().await {
+                match evt {
+                    AgentEvent::BackupStarted { save_id, .. } => return save_id,
+                    AgentEvent::BackupSkippedEmpty { .. } => return "<empty>".to_string(),
+                    _ => {}
+                }
+            }
+            "<channel closed>".to_string()
+        })
+        .await;
+
+        let _ = handle.shutdown().await;
+        let _ = tokio::time::timeout(Duration::from_secs(2), task).await;
+
+        assert_eq!(
+            started.expect("the nested chunk goes up under the share"),
+            "world-1"
+        );
+        // What that push carries: the chunk, and nothing of the other world
+        // or the character.
+        let shields = crate::savefilter::shields_for_slug("valheim");
+        let walked: Vec<String> = crate::backup::walk_source(
+            &save_path,
+            Scope {
+                shields: &shields,
+                include: &include,
+            },
+        )
+        .unwrap()
+        .into_iter()
+        .map(|f| f.relative_path)
+        .collect();
+        assert_eq!(walked, vec!["worlds_local/Alpha/-3_7.chunk"]);
+    }
+
     fn shared_world(save_id: &str, path: &Path) -> WatchedSave {
         WatchedSave {
             save_id: save_id.into(),

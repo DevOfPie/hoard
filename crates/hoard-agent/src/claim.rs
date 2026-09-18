@@ -2491,6 +2491,127 @@ mod tests {
         assert_eq!(on_reconciled(slot, now, &tx, None), Followup::SideCopy);
     }
 
+    /// A Valheim 1.0 world is a folder whose files change names on every save
+    /// (`_main.<N>.*`, `*.chunk`): a write, or the deletion of the generation
+    /// before, anywhere inside the shared world's folder claims it, and the
+    /// same inside another world's folder claims nothing.
+    #[tokio::test(start_paused = true)]
+    async fn a_write_inside_a_1_0_world_folder_claims_only_that_world() {
+        use notify_debouncer_mini::{DebouncedEvent, DebouncedEventKind};
+        let (tx, mut rx) = mpsc::channel(8);
+        let (lease, mut seen) = LeaseHandle::probe();
+        let tmp = tempfile::tempdir().unwrap();
+        let folder = tmp.path().join("save");
+        for f in [
+            "worlds_local/Alpha/_main.5.db2",
+            "worlds_local/Alpha/0_0.chunk",
+            "worlds_local/Gamma/_main.2.db2",
+            "characters_local/me.fch",
+        ] {
+            let path = folder.join(f);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, f).unwrap();
+        }
+        let mut save = world("w1", "valheim");
+        save.local_path = folder.clone();
+        if let Some(shared) = save.shared.as_mut() {
+            shared.include = crate::worldfiles::template("valheim", "Alpha")
+                .unwrap()
+                .unwrap();
+            shared.caller_owns = true;
+        }
+        let hit = |paths: &[PathBuf]| {
+            let events: Vec<DebouncedEvent> = paths
+                .iter()
+                .map(|p| DebouncedEvent {
+                    path: p.clone(),
+                    kind: DebouncedEventKind::Any,
+                })
+                .collect();
+            crate::agent::fs_hit(&folder, None, &events)
+                .expect("a hit under the folder")
+                .paths
+        };
+        let session = |rx: &mut mpsc::Receiver<AgentEvent>| {
+            let mut s = slots(vec![save.clone()]);
+            s.get_mut("w1").unwrap().lease = LeaseObs::Free;
+            on_game_started(&mut s, "w1", Instant::now(), &tx);
+            drain(rx);
+            s
+        };
+
+        // Another world's folder: a write, a generation gone, the folder itself.
+        let mut s = session(&mut rx);
+        let slot = s.get_mut("w1").unwrap();
+        for path in [
+            "worlds_local/Gamma/_main.2.db2",
+            "worlds_local/Gamma/_main.1.db2",
+            "worlds_local/Gamma",
+            "characters_local/me.fch",
+        ] {
+            on_write_at(slot, &hit(&[folder.join(path)]), &tx, Some(&lease));
+        }
+        tokio::task::yield_now().await;
+        assert!(
+            seen.try_recv().is_err(),
+            "a write in another world's folder asked for the lease"
+        );
+        assert!(!slot.session.as_ref().unwrap().claimed);
+        assert!(drain(&mut rx).is_empty());
+
+        // Inside the shared world's folder, each one claims.
+        for path in [
+            "worlds_local/Alpha/_main.5.db2",
+            "worlds_local/Alpha/0_0.chunk",
+            "worlds_local/Alpha/_main.4.db2",
+            "worlds_local/Alpha",
+        ] {
+            let mut s = session(&mut rx);
+            let slot = s.get_mut("w1").unwrap();
+            on_write_at(slot, &hit(&[folder.join(path)]), &tx, Some(&lease));
+            tokio::task::yield_now().await;
+            assert_eq!(seen.try_recv().unwrap(), "acquire w1", "{path}");
+            assert!(slot.session.as_ref().unwrap().claimed, "{path}");
+        }
+    }
+
+    /// The side copy of a 1.0 world takes its folder's files, nested paths
+    /// kept, and leaves another world's folder where it is.
+    #[tokio::test]
+    async fn the_side_copy_moves_a_1_0_world_folder() {
+        let tmp = tempfile::tempdir().unwrap();
+        let folder = tmp.path().join("save");
+        for f in [
+            "worlds_local/Alpha/_main.5.fwl2",
+            "worlds_local/Alpha/0_0.chunk",
+            "worlds_local/Gamma/_main.2.fwl2",
+            "characters_local/me.fch",
+        ] {
+            let path = folder.join(f);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, f).unwrap();
+        }
+        let mut save = world("w1", "valheim");
+        save.local_path = folder.clone();
+        save.include = crate::worldfiles::template("valheim", "Alpha")
+            .unwrap()
+            .unwrap();
+        if let Some(shared) = save.shared.as_mut() {
+            shared.include = save.include.clone();
+        }
+        let dir = side_copy_dir(
+            &tmp.path().join("conflicts"),
+            "w1",
+            OffsetDateTime::UNIX_EPOCH,
+        );
+        assert_eq!(move_world_aside(&save, &dir).await.unwrap(), 2);
+        assert!(dir.join("worlds_local/Alpha/_main.5.fwl2").exists());
+        assert!(dir.join("worlds_local/Alpha/0_0.chunk").exists());
+        assert!(!folder.join("worlds_local/Alpha/0_0.chunk").exists());
+        assert!(folder.join("worlds_local/Gamma/_main.2.fwl2").exists());
+        assert!(folder.join("characters_local/me.fch").exists());
+    }
+
     /// Finding 3 of the third end-to-end run: with no session, the owner
     /// changed the world and a character while a member hosts. The push holds
     /// for the lease, so the world is set aside; the pull brings the head's
