@@ -1049,6 +1049,12 @@ pub(crate) fn side_copy_dir(root: &Path, save_id: &str, at: OffsetDateTime) -> P
 /// `dir`, so the folder holds nothing newer than the head and the next pull
 /// puts the head back without an mtime contest. Rename first, copy and
 /// remove across filesystems. Returns how many moved.
+///
+/// All or nothing (M-4, `restore::move_all_aside`): a file that will not move
+/// puts back the ones already moved, and the error comes back with the folder
+/// as it was. A held world is exactly the one with a file that may not move,
+/// and half a world in the side copy with the rest left behind would be
+/// pulled over as if nothing were pending.
 pub(crate) async fn move_world_aside(save: &WatchedSave, dir: &Path) -> anyhow::Result<u64> {
     let shields = crate::savefilter::shields_for_slug(&save.game_slug);
     let files = crate::backup::walk_source(
@@ -1058,18 +1064,9 @@ pub(crate) async fn move_world_aside(save: &WatchedSave, dir: &Path) -> anyhow::
             include: save.world(),
         },
     )?;
-    let mut moved = 0;
-    for f in files {
-        let dest = dir.join(&f.relative_path);
-        if let Some(parent) = dest.parent() {
-            tokio::fs::create_dir_all(parent).await?;
-        }
-        if tokio::fs::rename(&f.absolute_path, &dest).await.is_err() {
-            crate::restore::copy_then_remove(&f.absolute_path, &dest).await?;
-        }
-        moved += 1;
-    }
-    Ok(moved)
+    let rels: Vec<String> = files.into_iter().map(|f| f.relative_path).collect();
+    crate::restore::move_all_aside(&save.local_path, &rels, dir).await?;
+    Ok(rels.len() as u64)
 }
 
 /// The side copy landed: the session's bytes are safe there, so the folder
@@ -2338,6 +2335,38 @@ mod tests {
                 "{case}"
             );
         }
+    }
+
+    /// M-4: the side copy is all or nothing. A world file that will not move
+    /// puts back the ones already moved, and the folder is as it was.
+    #[tokio::test]
+    async fn a_side_copy_that_cannot_move_a_file_moves_none() {
+        let tmp = tempfile::tempdir().unwrap();
+        let folder = tmp.path().join("save");
+        std::fs::create_dir_all(folder.join("worlds_local")).unwrap();
+        std::fs::write(folder.join("worlds_local/Alpha.db"), b"db").unwrap();
+        std::fs::write(folder.join("worlds_local/Alpha.fwl"), b"fwl").unwrap();
+        let mut save = world("w1", "valheim");
+        save.local_path = folder.clone();
+        save.include = vec![
+            "worlds_local/Alpha.db".into(),
+            "worlds_local/Alpha.fwl".into(),
+        ];
+        if let Some(shared) = save.shared.as_mut() {
+            shared.include = save.include.clone();
+        }
+        let dir = tmp.path().join("conflicts/w1/ts");
+        // The second file's place in the copy is taken by a folder with
+        // something in it: neither a rename nor a copy lands there.
+        std::fs::create_dir_all(dir.join("worlds_local/Alpha.fwl/in the way")).unwrap();
+        assert!(move_world_aside(&save, &dir).await.is_err());
+        assert_eq!(
+            std::fs::read(folder.join("worlds_local/Alpha.db")).unwrap(),
+            b"db",
+            "the file already moved came back"
+        );
+        assert_eq!(std::fs::read(folder.join("worlds_local/Alpha.fwl")).unwrap(), b"fwl");
+        assert!(!dir.join("worlds_local/Alpha.db").exists());
     }
 
     /// HRD-F-0028: a claim made outside a session and then released leaves no

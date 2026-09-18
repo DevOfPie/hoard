@@ -520,7 +520,7 @@ pub(crate) async fn move_all_aside(dest: &Path, rels: &[String], dir: &Path) -> 
     for (i, rel) in rels.iter().enumerate() {
         if let Err(e) = move_aside(&dest.join(rel), &dir.join(rel)).await {
             put_back_moved(dest, &rels[..i], dir).await;
-            return Err(e.context(format!("moving {rel}, which the version lacks, aside")));
+            return Err(e.context(format!("moving {rel} aside; nothing was moved")));
         }
     }
     Ok(())
