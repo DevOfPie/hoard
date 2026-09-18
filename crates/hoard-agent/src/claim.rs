@@ -595,8 +595,10 @@ pub(crate) fn may_request_lease(slot: &SaveSlot) -> bool {
 const SIDE_COPY_TAIL: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// A watcher hit while the side copy moves the world's files, or in the
-/// debouncer's tail once it landed, is the copy's own touch: not pending, not
-/// evidence. Marked pending it would veto the pull that refills the folder.
+/// debouncer's tail once it landed or failed (putting back what it moved), is
+/// the copy's own touch: not pending, not evidence. Marked pending it would
+/// veto the pull that refills the folder, or, after a failed copy, retry the
+/// held push and the copy with it, on end (M-A).
 pub(crate) fn hit_is_side_copy(slot: &SaveSlot, now: Instant) -> bool {
     if slot
         .session
@@ -607,9 +609,10 @@ pub(crate) fn hit_is_side_copy(slot: &SaveSlot, now: Instant) -> bool {
     }
     // A relaunch opened a session at the landing: its writes are the game's.
     slot.session.is_none()
-        && slot
-            .side_copy_landed_at
-            .is_some_and(|at| now.saturating_duration_since(at) < SIDE_COPY_TAIL)
+        && [slot.side_copy_landed_at, slot.side_copy_failed_at]
+            .into_iter()
+            .flatten()
+            .any(|at| now.saturating_duration_since(at) < SIDE_COPY_TAIL)
 }
 
 /// The user answered "not playing".
@@ -1183,6 +1186,8 @@ pub(crate) fn on_side_copy_failed(
     {
         return;
     }
+    // The copy put back what it had moved: those renames' hits are its own.
+    slot.side_copy_failed_at = Some(now);
     if slot.has_pending {
         end_session_local_only(slot);
         // A held world tries again on its ladder's next deadline (M-2); with
@@ -2301,6 +2306,81 @@ mod tests {
             assert!(!slot.local_only_pending);
             assert!(slot.pull_pending, "parked={parked}");
         }
+    }
+
+    /// M-A: a failed side copy puts back the files it moved, and the watcher
+    /// hits of that put-back reach the loop after the failure. They are the
+    /// copy's own: delivered as the watcher sends them, they neither un-park
+    /// the held push nor schedule the copy again, which otherwise cycled every
+    /// five minutes for good. A genuine change after the tail still does.
+    #[tokio::test(start_paused = true)]
+    async fn a_failed_side_copys_put_back_does_not_retry_it() {
+        use notify_debouncer_mini::{DebouncedEvent, DebouncedEventKind};
+        let now = Instant::now();
+        let (tx, _rx) = mpsc::channel(8);
+        let mut s = slots(vec![world("w1", "valheim")]);
+        let root = s["w1"].save.local_path.clone();
+        let parked = kernel::WorldHeld {
+            consecutive: 5,
+            needs_attention: true,
+            retry_at: None,
+            by_change: false,
+        };
+        {
+            let slot = s.get_mut("w1").unwrap();
+            slot.lease = LeaseObs::Other;
+            slot.has_pending = true;
+            slot.world_held = parked.clone();
+            assert_eq!(on_reconciled(slot, now, &tx, None), Followup::SideCopy);
+        }
+        on_side_copy_failed(&mut s, "w1", now, &tx);
+        let events = |rels: &[&str]| -> Vec<DebouncedEvent> {
+            rels.iter()
+                .map(|r| DebouncedEvent {
+                    path: root.join(r),
+                    kind: DebouncedEventKind::Any,
+                })
+                .collect()
+        };
+        let put_back = events(&[
+            "worlds_local/Alpha",
+            "worlds_local/Alpha/_main.3.db2",
+            "worlds_local/Alpha/_main.3.fwl2",
+        ]);
+        let wall = OffsetDateTime::now_utc();
+        let delivered = crate::agent::deliver_fs_events(
+            &mut s,
+            &root,
+            &put_back,
+            wall,
+            now + std::time::Duration::from_secs(3),
+        );
+        assert_eq!(delivered, None, "the put-back is not a write");
+        let slot = s.get_mut("w1").unwrap();
+        assert_eq!(slot.held_side_copy_retry_at, None);
+        assert_eq!(slot.world_held, parked, "still parked");
+        assert!(slot.local_only_pending);
+        assert_eq!(
+            on_reconciled(slot, now, &tx, None),
+            Followup::Nothing,
+            "no copy again"
+        );
+
+        // The game, or a chmod, changes the world after the tail.
+        let later = now + SIDE_COPY_TAIL;
+        let delivered = crate::agent::deliver_fs_events(
+            &mut s,
+            &root,
+            &events(&["worlds_local/Alpha/_main.3.db2"]),
+            wall,
+            later,
+        );
+        assert_eq!(delivered.as_deref(), Some("w1"));
+        let slot = s.get_mut("w1").unwrap();
+        assert_eq!(slot.held_side_copy_retry_at, Some(wall));
+        assert!(!slot.world_held.needs_attention, "tried again");
+        slot.last_fs_event_at = Some(wall - time::Duration::seconds(RECENT_SAVE_GRACE_SECS + 1));
+        assert_eq!(on_reconciled(slot, later, &tx, None), Followup::SideCopy);
     }
 
     /// The third end-to-end run: a member's world push is held (and parks);

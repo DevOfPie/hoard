@@ -1219,6 +1219,11 @@ pub(crate) struct SaveSlot {
     /// When the last side copy landed: watcher hits in its tail are the
     /// renames' own, not pending (`claim::hit_is_side_copy`).
     pub(crate) side_copy_landed_at: Option<TokioInstant>,
+    /// When the last side copy failed: it put back the files it had moved,
+    /// and their watcher hits in its tail are not writes either. Marked
+    /// pending they un-parked the held push and scheduled the side copy
+    /// again, every time it failed (M-A).
+    pub(crate) side_copy_failed_at: Option<TokioInstant>,
     /// An acquire is out and unanswered. Set on the hold's rising edge, cleared
     /// by the acquire's verdict (`SetLease { verdict: true }`), so a hold that
     /// repeats every tick asks once.
@@ -3546,6 +3551,7 @@ fn handle_add(
         held_side_copy_retry_at: None,
         relaunch_pending: false,
         side_copy_landed_at: None,
+        side_copy_failed_at: None,
         lease_requested: false,
         release_requested: false,
         stale_base: None,
@@ -7425,6 +7431,7 @@ pub(crate) fn test_slot(save: WatchedSave) -> SaveSlot {
         held_side_copy_retry_at: None,
         relaunch_pending: false,
         side_copy_landed_at: None,
+        side_copy_failed_at: None,
         lease_requested: false,
         release_requested: false,
         stale_base: None,
