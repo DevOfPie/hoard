@@ -433,19 +433,27 @@
               values: { count: out.world_files_set_aside },
             })
           : "";
+      const replaced =
+        out.files_replaced_set_aside > 0
+          ? $_("history.replaced_suffix", {
+              values: { count: out.files_replaced_set_aside },
+            })
+          : "";
       const safety = out.safety_version
         ? $_("history.safety_suffix", {
             values: { version: out.safety_version },
           })
         : "";
+      const restored = $_("history.restored_toast", {
+        values: {
+          version: target.version_num,
+          count: out.files_extracted,
+          safety: setAside + replaced + safety,
+        },
+      });
+      // Where the moved files went: the only way to undo by hand.
       toastSuccess(
-        $_("history.restored_toast", {
-          values: {
-            version: target.version_num,
-            count: out.files_extracted,
-            safety: setAside + safety,
-          },
-        }),
+        out.set_aside_dir ? `${restored}\n${out.set_aside_dir}` : restored,
       );
       restoreTarget = null;
       pickingDestination = null;

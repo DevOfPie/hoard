@@ -1,4 +1,4 @@
-//! CLI wrapper around `hoard_agent::restore::download_snapshot`.
+//! CLI wrapper around `hoard_agent::restore::restore_staged`.
 //!
 //! The streaming download / decode / SHA-verify / extract logic lives in the
 //! agent crate. This file is the clap front-end and the indicatif progress
@@ -13,7 +13,7 @@ use std::sync::{Arc, Mutex};
 use hoard_agent::api::ApiClient;
 use hoard_agent::config::CliConfig;
 use hoard_agent::library;
-use hoard_agent::restore::{download_snapshot, resolve_version, RestoreOptions};
+use hoard_agent::restore::{resolve_version, RestoreOptions};
 use hoard_agent::state::CliState;
 
 use crate::commands::link;
@@ -71,6 +71,12 @@ pub struct RestoredOut {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub world_set_aside: Option<String>,
     pub world_files_set_aside: u64,
+    /// The folder the local copies this restore replaced were moved to before
+    /// it wrote, so a restore of the wrong version can be undone by hand.
+    /// Absent when nothing was replaced.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub replaced_set_aside: Option<String>,
+    pub files_replaced_set_aside: u64,
 }
 
 #[derive(Serialize)]
@@ -283,41 +289,42 @@ pub async fn apply(
         None
     };
 
-    let shields = gate.shields.clone();
     let root = CliConfig::state_dir()?.join("conflicts");
-    // Moved before anything is written, into the tree the side copies above
-    // use, and kept there for the retention period. Without `--force` the
-    // folder has to be empty and nothing is there to move.
-    let world_set_aside = if force {
-        hoard_agent::restore::set_aside_before_restore(
-            &client, &save_id, version, &dest, &shields, &world, &root,
-        )
-        .await
-        .context("couldn't move the world's files this version does not have aside; nothing was restored")?
-    } else {
-        None
-    };
-
-    let options = RestoreOptions {
-        skip_verify: no_verify,
-        force,
-        // Extraction goes straight into `dest`, so that's also the folder worth
-        // deduping against: identical bytes already there aren't downloaded again.
-        reuse_from: Some(dest.clone()),
-        gate,
-    };
-    let outcome =
-        match download_snapshot(&client, &save_id, version, &dest, options, on_progress).await {
-            Ok(outcome) => outcome,
-            Err(e) => {
-                // The version has none of those paths, so they go back where they
-                // were whatever the download managed to write.
-                if let Some(moved) = &world_set_aside {
-                    hoard_agent::restore::put_back(&dest, moved).await;
-                }
-                return Err(e).context("restore failed");
+    // Downloaded whole into a staging folder first; the save's folder is only
+    // touched once that succeeded, so a download that fails or is killed
+    // leaves it as it was. Then, all or nothing, what the version replaces or
+    // does not have (in the shared world) moves into the conflicts tree, kept
+    // there for the retention period, and the version is copied in.
+    // Identical files are neither downloaded (where the server allows it) nor
+    // rewritten.
+    let quiet = output::json();
+    let staged = hoard_agent::restore::restore_staged(
+        &client,
+        &save_id,
+        version,
+        &dest,
+        RestoreOptions {
+            skip_verify: no_verify,
+            force,
+            reuse_from: None,
+            gate,
+        },
+        &world,
+        &root,
+        |dir| {
+            if !quiet {
+                println!(
+                    "  downloaded; anything this restore replaces or moves out of the \
+                     folder goes to {}",
+                    dir.display()
+                );
             }
-        };
+        },
+        on_progress,
+    )
+    .await
+    .context("restore failed")?;
+    let outcome = &staged.outcome;
 
     {
         let bar = pb.lock().unwrap();
@@ -353,10 +360,18 @@ pub async fn apply(
             bytes_reused: outcome.bytes_reused,
             destination: outcome.destination.display().to_string(),
             set_aside: set_aside.as_ref().map(|s| s.dir.display().to_string()),
-            world_set_aside: world_set_aside
+            world_set_aside: staged
+                .moved_to
                 .as_ref()
-                .map(|s| s.dir.display().to_string()),
-            world_files_set_aside: world_set_aside.as_ref().map_or(0, |s| s.files as u64),
+                .filter(|_| staged.world_files_set_aside > 0)
+                .map(|d| d.display().to_string()),
+            world_files_set_aside: staged.world_files_set_aside as u64,
+            replaced_set_aside: staged
+                .moved_to
+                .as_ref()
+                .filter(|_| staged.replaced_set_aside > 0)
+                .map(|d| d.display().to_string()),
+            files_replaced_set_aside: staged.replaced_set_aside as u64,
         }),
         remembered,
     };
@@ -386,6 +401,12 @@ pub async fn apply(
             println!(
                 "  {} file(s) of the shared world that v{} does not have were moved to {dir}",
                 r.world_files_set_aside, out.version
+            );
+        }
+        if let Some(dir) = &r.replaced_set_aside {
+            println!(
+                "  {} file(s) it replaced were moved to {dir} first",
+                r.files_replaced_set_aside
             );
         }
         if let Some(applied) = &out.remembered {

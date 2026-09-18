@@ -391,6 +391,7 @@
   "history.restored_toast": "{count, plural, other {v{version} をリストア、# ファイル{safety}。}}",
   "history.safety_suffix": " (安全バックアップ: v{version})",
   "history.set_aside_suffix": "{count, plural, other {、ワールドの#個のファイルを競合フォルダーへ移動}}",
+  "history.replaced_suffix": "{count, plural, other {、置き換えた#個のファイルを競合フォルダーへ移動}}",
   "history.trashed_toast": "v{version} をゴミ箱へ。",
   "history.recovered_toast": "v{version} を復元。",
   "history.progress_pre_backup": "現在の状態をバックアップ中、{downloaded} / {total}",

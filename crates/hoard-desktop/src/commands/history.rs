@@ -378,6 +378,11 @@ pub struct RestoreOutcome {
     /// conflicts folder (kept there for the retention period) so the world's
     /// folder ends as the version's.
     pub world_files_set_aside: usize,
+    /// Local files the version replaced, moved into the same folder before
+    /// it was written.
+    pub files_replaced_set_aside: usize,
+    /// Where the files moved out went, when any did.
+    pub set_aside_dir: Option<String>,
 }
 
 /// Restore an old snapshot into the local save folder.
@@ -522,7 +527,6 @@ pub async fn restore_snapshot(
         hoard_agent::savefilter::restore_include(shared.as_ref()),
         allow_config,
     );
-    let shields = gate.shields.clone();
 
     // 1b) The owner's restore writes the whole folder, and a file outside the
     //     share it overwrites may hold bytes no version has yet. Those files
@@ -546,38 +550,20 @@ pub async fn restore_snapshot(
         .map_err(pretty_error)?;
     }
 
-    // 2) The folder is this save's (or becomes it below), so the shared world's
-    //    folders end as the version has them: what it does not have is moved
-    //    into the conflicts tree before anything is written, and kept there for
-    //    the retention period (HRD-Q-0027). A move that fails stops the restore
-    //    with the folder as it was.
+    // 2) Download + verify into a staging folder, then apply locally, all or
+    //    nothing: the version wins every file it carries, and a different
+    //    local copy is moved into the conflicts tree first, as are the shared
+    //    world's files the version does not have (HRD-Q-0027), kept there for
+    //    the retention period. The save's folder is not touched until the
+    //    download succeeded, so one that fails or is killed leaves it as it
+    //    was (M-B). `force` because the user confirmed the overwrite.
     let conflicts = CliConfig::state_dir()
         .map_err(|e| e.to_string())?
         .join("conflicts");
-    let world_set_aside = restore::set_aside_before_restore(
-        &client,
-        &save_id,
-        version,
-        &local_path,
-        &shields,
-        shared.as_ref().map_or(&[][..], |s| s.world()),
-        &conflicts,
-    )
-    .await
-    .map_err(|e| {
-        format!(
-            "Couldn't move the world's files version {version} doesn't have aside, so nothing was restored: {}",
-            pretty_error(e)
-        )
-    })?;
-
-    // 3) Download + verify + extract. We pass `force = true` because the
-    //    user has explicitly confirmed they want to overwrite; refusing on
-    //    "destination not empty" here would defeat the whole point.
     let app_for_dl = app.clone();
     let save_id_for_dl = save_id.clone();
     emit_phase(&app, &save_id, version, RestorePhase::Downloading, 0, 0);
-    let downloaded = restore::download_snapshot(
+    let staged = restore::restore_staged(
         &client,
         &save_id,
         version,
@@ -585,11 +571,18 @@ pub async fn restore_snapshot(
         RestoreOptions {
             skip_verify: false,
             force: true,
-            // Files land straight into the save folder here, so the folder we
-            // dedup against is the destination itself: anything already there
-            // with the right bytes is copied (or left) instead of re-downloaded.
-            reuse_from: Some(local_path.clone()),
+            reuse_from: None,
             gate,
+        },
+        shared.as_ref().map_or(&[][..], |s| s.world()),
+        &conflicts,
+        |dir| {
+            tracing::info!(
+                save_id = %save_id,
+                version,
+                dir = %dir.display(),
+                "restore: downloaded; what it replaces or moves out goes here"
+            );
         },
         move |downloaded, total| {
             let _ = app_for_dl.emit(
@@ -604,17 +597,9 @@ pub async fn restore_snapshot(
             );
         },
     )
-    .await;
-    let outcome = match downloaded {
-        Ok(outcome) => outcome,
-        Err(e) => {
-            // The version has none of those paths: they go back where they were.
-            if let Some(moved) = &world_set_aside {
-                restore::put_back(&local_path, moved).await;
-            }
-            return Err(pretty_error(e));
-        }
-    };
+    .await
+    .map_err(pretty_error)?;
+    let outcome = &staged.outcome;
 
     emit_phase(&app, &save_id, version, RestorePhase::Done, 0, 0);
 
@@ -637,7 +622,12 @@ pub async fn restore_snapshot(
         bytes_extracted: outcome.bytes_extracted,
         destination: outcome.destination.to_string_lossy().into_owned(),
         safety_version,
-        world_files_set_aside: world_set_aside.map_or(0, |s| s.files),
+        world_files_set_aside: staged.world_files_set_aside,
+        files_replaced_set_aside: staged.replaced_set_aside,
+        set_aside_dir: staged
+            .moved_to
+            .as_ref()
+            .map(|d| d.to_string_lossy().into_owned()),
     })
 }
 

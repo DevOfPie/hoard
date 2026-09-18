@@ -4330,7 +4330,7 @@ pub(crate) type StillQuiet = Arc<dyn Fn() -> bool + Send + Sync>;
 /// Build a unique staging directory under the system temp dir. We embed
 /// the save_id (sanitised to alphanumeric+dash) and a monotonic nanosecond
 /// counter so concurrent restores for the same save never collide.
-fn staging_dir_for(save_id: &str) -> PathBuf {
+pub(crate) fn staging_dir_for(save_id: &str) -> PathBuf {
     use std::sync::atomic::{AtomicU64, Ordering};
     static COUNTER: AtomicU64 = AtomicU64::new(0);
     let n = COUNTER.fetch_add(1, Ordering::Relaxed);
@@ -4353,7 +4353,7 @@ fn staging_dir_for(save_id: &str) -> PathBuf {
 /// Best-effort tempdir cleanup. We log but never propagate the error: a
 /// leaked staging dir is annoying but not user-visible, and the OS will
 /// reap `/tmp` on reboot anyway.
-async fn cleanup_staging(staging: &Path) {
+pub(crate) async fn cleanup_staging(staging: &Path) {
     if let Err(e) = tokio::fs::remove_dir_all(staging).await {
         tracing::debug!(
             staging = %staging.display(),

@@ -391,6 +391,7 @@
   "history.restored_toast": "{count, plural, one {Version v{version} restaurée, # fichier{safety}.} other {Version v{version} restaurée, # fichiers{safety}.}}",
   "history.safety_suffix": " (sauvegarde de sécurité : v{version})",
   "history.set_aside_suffix": "{count, plural, one {, # fichier du monde déplacé dans le dossier des conflits} other {, # fichiers du monde déplacés dans le dossier des conflits}}",
+  "history.replaced_suffix": "{count, plural, one {, # fichier remplacé déplacé dans le dossier des conflits} other {, # fichiers remplacés déplacés dans le dossier des conflits}}",
   "history.trashed_toast": "v{version} envoyée à la corbeille.",
   "history.recovered_toast": "v{version} récupérée.",
   "history.progress_pre_backup": "Sauvegarde de l'état actuel · {downloaded} / {total}",

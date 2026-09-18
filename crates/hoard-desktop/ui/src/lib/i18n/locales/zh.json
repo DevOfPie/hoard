@@ -391,6 +391,7 @@
   "history.restored_toast": "{count, plural, other {已还原 v{version}，# 个文件{safety}。}}",
   "history.safety_suffix": "（安全备份：v{version}）",
   "history.set_aside_suffix": "{count, plural, other {，已将 # 个世界文件移至冲突文件夹}}",
+  "history.replaced_suffix": "{count, plural, other {，已将 # 个被替换的文件移至冲突文件夹}}",
   "history.trashed_toast": "v{version} 已移到回收站。",
   "history.recovered_toast": "已恢复 v{version}。",
   "history.progress_pre_backup": "正在备份当前状态，{downloaded} / {total}",

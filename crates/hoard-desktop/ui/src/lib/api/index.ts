@@ -1238,6 +1238,11 @@ export type RestoreOutcome = {
    *  conflicts folder (kept there for the retention period) so the world's
    *  folder ends as the version's. 0 on any other restore. */
   world_files_set_aside: number;
+  /** Local files the version replaced, moved into the same folder before it
+   *  was written (the restore is downloaded whole first, then applied). */
+  files_replaced_set_aside: number;
+  /** Where the files moved out went, when any did. */
+  set_aside_dir: string | null;
 };
 
 export type LogLine = {

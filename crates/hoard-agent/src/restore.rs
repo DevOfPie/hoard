@@ -391,33 +391,126 @@ pub async fn set_aside_stale_world(
     }))
 }
 
-/// [`set_aside_stale_world`] for an explicit restore of `version` into the
-/// shared save's own folder, before the download: the version's list comes
-/// from its manifest ([`crate::preview::remote_files`]), the gate-refused
-/// files included. A version with no per-file listing (Cloud's legacy
-/// archives; Cloud has no shares) moves nothing: an empty list is "not
-/// known", never "the version has nothing". Nothing to do without a world.
-pub async fn set_aside_before_restore(
+/// What [`restore_staged`] did.
+#[derive(Debug, Clone)]
+pub struct StagedRestore {
+    /// The download into staging; `destination` is the save's folder.
+    pub outcome: RestoreOutcome,
+    /// Where the files that left the folder went, when any did.
+    pub moved_to: Option<PathBuf>,
+    /// The shared world's files the version does not have, moved aside.
+    pub world_files_set_aside: usize,
+    /// Local copies the version replaced, moved aside before it was written.
+    pub replaced_set_aside: usize,
+}
+
+/// An explicit restore of `version` into `dest`, the CLI's and the desktop's,
+/// done the way the engine's pull is (M-B): the whole version is downloaded
+/// into a staging folder first, and the live folder is touched only once that
+/// succeeded. A download that fails, or is killed, leaves `dest` as it was.
+///
+/// Then, locally and all or nothing ([`crate::agent::restore_files_into_as`]):
+/// the version wins every file it carries whatever the mtimes, a different
+/// local copy is moved into a folder under `conflict_root` first, and so are
+/// the shared world's files the version does not have (HRD-Q-0027; `world`
+/// empty for an unshared save). Files identical to the version are neither
+/// downloaded (`reuse_from` is the live folder, where the server's path allows
+/// it) nor rewritten. What the gate keeps out stays as it is, and so does
+/// anything else the version does not carry.
+///
+/// `on_moving` is told the folder before anything can move out of `dest`
+/// (not called for an empty or new folder). Without
+/// `options.force` a folder with files in it is refused before the download.
+#[allow(clippy::too_many_arguments)]
+pub async fn restore_staged<F>(
     client: &ApiClient,
     save_id: &str,
     version: i64,
     dest: &Path,
-    shields: &[String],
+    options: RestoreOptions,
     world: &[String],
-    root: &Path,
-) -> Result<Option<SetAside>> {
-    if world.is_empty() || !dest.is_dir() {
-        return Ok(None);
+    conflict_root: &Path,
+    on_moving: impl FnOnce(&Path),
+    progress: F,
+) -> Result<StagedRestore>
+where
+    F: Fn(u64, u64) + Send + Sync + 'static,
+{
+    crate::library::validate_path_shape(dest)?;
+    if dest.is_dir() && std::fs::read_dir(dest)?.next().is_some() && !options.force {
+        bail!(
+            "destination is not empty: {} (set force = true to extract anyway)",
+            dest.display()
+        );
     }
-    let version_files: Vec<String> = crate::preview::remote_files(client, save_id, version)
-        .await?
-        .into_iter()
-        .map(|f| f.relative_path)
-        .collect();
-    if version_files.is_empty() {
-        return Ok(None);
+    let staging = crate::agent::staging_dir_for(save_id);
+    tokio::fs::create_dir_all(&staging)
+        .await
+        .with_context(|| format!("creating staging dir {}", staging.display()))?;
+    let reuse_from = if dest.is_dir() {
+        Some(dest.to_path_buf())
+    } else {
+        dest.parent().filter(|p| p.is_dir()).map(Path::to_path_buf)
+    };
+    let gate = options.gate.clone();
+    let downloaded = download_snapshot(
+        client,
+        save_id,
+        version,
+        &staging,
+        RestoreOptions {
+            skip_verify: options.skip_verify,
+            force: false,
+            reuse_from,
+            gate: gate.clone(),
+        },
+        progress,
+    )
+    .await;
+    let mut outcome = match downloaded {
+        Ok(outcome) => outcome,
+        Err(e) => {
+            crate::agent::cleanup_staging(&staging).await;
+            return Err(e.context(format!(
+                "downloading v{version}; nothing in {} was changed",
+                dest.display()
+            )));
+        }
+    };
+
+    let names: Vec<&str> = outcome.version_files.iter().map(String::as_str).collect();
+    let root = extraction_root(dest, &names);
+    let applied = async {
+        tokio::fs::create_dir_all(&root)
+            .await
+            .with_context(|| format!("creating {}", root.display()))?;
+        let dir =
+            crate::claim::side_copy_dir(conflict_root, save_id, time::OffsetDateTime::now_utc());
+        if std::fs::read_dir(&root)?.next().is_some() {
+            on_moving(&dir);
+        }
+        let stats = crate::agent::restore_files_into_as(
+            &root,
+            &staging,
+            Some(&dir),
+            gate.scope(),
+            world,
+            true,
+        )
+        .await?;
+        anyhow::Ok((dir, stats))
     }
-    set_aside_stale_world(dest, &version_files, shields, world, root, save_id).await
+    .await;
+    crate::agent::cleanup_staging(&staging).await;
+    let (dir, stats) = applied?;
+    outcome.destination = dest.to_path_buf();
+    let moved = stats.world_files_set_aside + stats.conflicts_backed_up;
+    Ok(StagedRestore {
+        outcome,
+        moved_to: (moved > 0).then_some(dir),
+        world_files_set_aside: stats.world_files_set_aside,
+        replaced_set_aside: stats.conflicts_backed_up,
+    })
 }
 
 /// Moves each of `rels` from `dest` to the same path under `dir`, in order.
@@ -1783,6 +1876,106 @@ mod tests {
     fn sorted(mut v: Vec<String>) -> Vec<String> {
         v.sort();
         v
+    }
+
+    fn tree(dir: &Path) -> std::collections::BTreeMap<String, Vec<u8>> {
+        crate::backup::walk_source(dir, Default::default())
+            .map(|files| {
+                files
+                    .into_iter()
+                    .map(|f| (f.relative_path, std::fs::read(f.absolute_path).unwrap()))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    fn put(root: &Path, rel: &str, bytes: &[u8]) {
+        let p = root.join(rel);
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(p, bytes).unwrap();
+    }
+
+    /// S6b / M-B: an explicit restore whose download fails half-way through
+    /// the archive leaves the save's folder byte-for-byte as it was: nothing
+    /// moved aside, nothing extracted into it. The same restore with the whole
+    /// archive lands: the world's folder is the version's, the older
+    /// generation and the replaced chunk are in the conflicts folder, and the
+    /// member's own character is untouched.
+    #[tokio::test]
+    async fn a_restore_whose_download_fails_leaves_the_folder_untouched() {
+        let tmp = tempfile::tempdir().unwrap();
+        let save = tmp.path().join("save");
+        let conflicts = tmp.path().join("conflicts");
+        put(&save, "worlds_local/Alpha/_main.8.db2", b"gen 8 db");
+        put(&save, "worlds_local/Alpha/_main.8.fwl2", b"gen 8 fwl");
+        put(&save, "worlds_local/Alpha/0_0.chunk", b"gen 8 chunk");
+        put(&save, "worlds_local/Alpha/1_0.chunk", b"same chunk");
+        put(&save, "characters_local/Me.fch", b"me");
+        let before = tree(&save);
+        let big: Vec<u8> = (0..200_000u32).flat_map(|i| i.to_le_bytes()).collect();
+        let version: Vec<(&str, &[u8])> = vec![
+            ("worlds_local/Alpha/0_0.chunk", b"gen 5 chunk"),
+            ("worlds_local/Alpha/1_0.chunk", b"same chunk"),
+            ("worlds_local/Alpha/_main.5.db2", &big),
+            ("worlds_local/Alpha/_main.5.fwl2", b"gen 5 fwl"),
+        ];
+        let world = crate::worldfiles::template("valheim", "Alpha")
+            .unwrap()
+            .unwrap();
+        let restore = |url: String| {
+            let save = save.clone();
+            let conflicts = conflicts.clone();
+            let world = world.clone();
+            async move {
+                let client = ApiClient::new(url, "t").unwrap();
+                restore_staged(
+                    &client,
+                    "w1",
+                    4,
+                    &save,
+                    RestoreOptions {
+                        force: true,
+                        ..Default::default()
+                    },
+                    &world,
+                    &conflicts,
+                    |_| {},
+                    |_, _| {},
+                )
+                .await
+            }
+        };
+
+        let mut routes = crate::testserver::selfhosted_version("w1", 4, &version).await;
+        let archive = &mut routes.last_mut().unwrap().2;
+        archive.truncate(archive.len() / 2);
+        let (url, _) = crate::testserver::serve(move |_| routes).await;
+        let err = restore(url).await.expect_err("the archive is cut");
+        assert!(format!("{err:#}").contains("nothing in"), "{err:#}");
+        assert_eq!(tree(&save), before);
+        assert!(tree(&conflicts).is_empty());
+
+        let routes = crate::testserver::selfhosted_version("w1", 4, &version).await;
+        let (url, _) = crate::testserver::serve(move |_| routes).await;
+        let done = restore(url).await.unwrap();
+        let after = tree(&save);
+        for (rel, bytes) in &version {
+            assert_eq!(after.get(*rel).map(Vec::as_slice), Some(*bytes), "{rel}");
+        }
+        assert_eq!(after.get("characters_local/Me.fch").unwrap(), b"me");
+        assert_eq!(after.len(), version.len() + 1, "{:?}", after.keys());
+        assert_eq!(done.world_files_set_aside, 2);
+        assert_eq!(done.replaced_set_aside, 1);
+        let moved = tree(done.moved_to.as_deref().unwrap());
+        assert_eq!(
+            moved.keys().cloned().collect::<Vec<_>>(),
+            [
+                "worlds_local/Alpha/0_0.chunk",
+                "worlds_local/Alpha/_main.8.db2",
+                "worlds_local/Alpha/_main.8.fwl2",
+            ]
+        );
+        assert_eq!(moved["worlds_local/Alpha/0_0.chunk"], b"gen 8 chunk");
     }
 
     /// The self-hosted tar path fills `version_files` with every entry of
