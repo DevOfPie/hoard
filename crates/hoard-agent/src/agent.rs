@@ -2412,6 +2412,9 @@ async fn run_agent(
 ) {
     let mut slots: HashMap<String, SaveSlot> = HashMap::new();
 
+    // Staging folders a killed pull or restore left behind (L-1, L-7).
+    tokio::task::spawn_blocking(sweep_stale_staging);
+
     // Latest cloud version per save id. Since ADR 0021 D.12 the engine keeps
     // this fresh **itself** (`observe_cloud_heads`: cloud `/v1/cloud/sync` or
     // self-hosted `/v1/saves`); the client-side pollers' `SetCloudVersions`
@@ -2531,6 +2534,11 @@ async fn run_agent(
             cmd = cmd_rx.recv() => {
                 match cmd {
                     Some(AgentCommand::AddSave(save)) => {
+                        // Staged copies an interrupted merge left in the folder
+                        // (L-1), before the watcher is armed on it.
+                        if !save.track_only {
+                            sweep_restore_temps(&save.local_path);
+                        }
                         // handle_add registers the slot, arms the watcher and, when
                         // the folder already holds content diverging from what is
                         // synced, seeds `has_pending` for the initial baseline. The
@@ -4442,9 +4450,70 @@ enum AutoRestorePull {
 /// Asked by a pull right before it writes.
 pub(crate) type StillQuiet = Arc<dyn Fn() -> bool + Send + Sync>;
 
-/// Build a unique staging directory under the system temp dir. We embed
-/// the save_id (sanitised to alphanumeric+dash) and a monotonic nanosecond
-/// counter so concurrent restores for the same save never collide.
+/// Where pulls and explicit restores stage the version they download.
+pub(crate) fn staging_root() -> PathBuf {
+    std::env::temp_dir()
+}
+
+/// The name every staging folder starts with ([`staging_dir_for`]).
+const STAGING_PREFIX: &str = "hoard-restore-";
+
+/// Removes the staging folders ([`staging_dir_for`]) whose process is gone:
+/// a pull or restore killed mid-download leaves a whole version behind. The
+/// folder's name ends in the pid that made it; one of a process still alive
+/// (this one, a CLI or desktop restore running now) is left alone. Run once
+/// when the engine starts.
+pub(crate) fn sweep_stale_staging() {
+    let mut roots = vec![staging_root(), std::env::temp_dir()];
+    roots.dedup();
+    let mut sys = System::new();
+    sys.refresh_processes_specifics(ProcessesToUpdate::All, true, ProcessRefreshKind::new());
+    let alive = |pid: u32| sys.process(Pid::from_u32(pid)).is_some();
+    for root in roots {
+        sweep_stale_staging_in(&root, &alive);
+    }
+}
+
+/// [`sweep_stale_staging`] over one `root`, with `alive` saying whether a pid
+/// still runs. Returns how many folders went.
+fn sweep_stale_staging_in(root: &Path, alive: &dyn Fn(u32) -> bool) -> usize {
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return 0;
+    };
+    let mut swept = 0;
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let Some(rest) = name.strip_prefix(STAGING_PREFIX) else {
+            continue;
+        };
+        let Some(pid) = rest.rsplit('-').next().and_then(|p| p.parse::<u32>().ok()) else {
+            continue;
+        };
+        if pid == std::process::id() || alive(pid) {
+            continue;
+        }
+        if !entry.file_type().is_ok_and(|t| t.is_dir()) {
+            continue;
+        }
+        match std::fs::remove_dir_all(entry.path()) {
+            Ok(()) => {
+                swept += 1;
+                tracing::info!(dir = %entry.path().display(), "restore: removed a staging folder a killed pull or restore left behind");
+            }
+            Err(e) => tracing::warn!(
+                dir = %entry.path().display(),
+                error = %e,
+                "restore: couldn't remove a stale staging folder"
+            ),
+        }
+    }
+    swept
+}
+
+/// Build a unique staging directory under [`staging_root`]. We embed
+/// the save_id (sanitised to alphanumeric+dash), a counter, and the pid, so
+/// concurrent restores for the same save never collide and a stale one can be
+/// told from a live one ([`sweep_stale_staging`]).
 pub(crate) fn staging_dir_for(save_id: &str) -> PathBuf {
     use std::sync::atomic::{AtomicU64, Ordering};
     static COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -4459,8 +4528,8 @@ pub(crate) fn staging_dir_for(save_id: &str) -> PathBuf {
             }
         })
         .collect();
-    std::env::temp_dir().join(format!(
-        "hoard-restore-{safe_id}-{n}-{}",
+    staging_root().join(format!(
+        "{STAGING_PREFIX}{safe_id}-{n}-{}",
         std::process::id()
     ))
 }
@@ -4611,6 +4680,10 @@ pub(crate) async fn restore_files_into_as(
     world: &[String],
     version_wins: bool,
 ) -> Result<RestoreStats> {
+    // What an interrupted merge left behind goes first: its names are this
+    // merge's too, and one the version does not reuse would stay for good.
+    let target_for_sweep = target.to_path_buf();
+    let _ = tokio::task::spawn_blocking(move || sweep_restore_temps(&target_for_sweep)).await;
     let mut stats = RestoreStats::default();
     // Relative paths seen in the remote snapshot. Used after the merge to spot
     // local-only files (in `target`, not in `source`) → `stats.target_only`.
@@ -4845,8 +4918,48 @@ struct StagedWrite {
 /// one left by a crash is never backed up.
 fn restore_tmp_path(dest: &Path) -> PathBuf {
     let mut name = dest.file_name().unwrap_or_default().to_os_string();
-    name.push(".hoard-restore.tmp");
+    name.push(kernel::fileclass::RESTORE_TMP_SUFFIX);
     dest.with_file_name(name)
+}
+
+/// Removes the staged copies ([`restore_tmp_path`]) a merge killed between its
+/// copies and its renames left in `folder`, at any depth. Run when the save
+/// starts being watched and before each merge into it: a leftover whose name
+/// the next version does not reuse would otherwise stay in the folder for
+/// good. Symlinks are not followed. Returns how many went.
+pub(crate) fn sweep_restore_temps(folder: &Path) -> usize {
+    let mut swept = 0;
+    let mut stack = vec![folder.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let Ok(ft) = entry.file_type() else { continue };
+            let path = entry.path();
+            if ft.is_dir() {
+                stack.push(path);
+            } else if ft.is_file()
+                && entry
+                    .file_name()
+                    .to_string_lossy()
+                    .ends_with(kernel::fileclass::RESTORE_TMP_SUFFIX)
+            {
+                match std::fs::remove_file(&path) {
+                    Ok(()) => swept += 1,
+                    Err(e) => tracing::warn!(
+                        path = %path.display(),
+                        error = %e,
+                        "restore: couldn't remove a leftover staged copy"
+                    ),
+                }
+            }
+        }
+    }
+    if swept > 0 {
+        tracing::info!(folder = %folder.display(), swept, "restore: removed staged copies an interrupted merge left behind");
+    }
+    swept
 }
 
 /// Copies `src` to `tmp`, creating its parents, with `src`'s mtime.
@@ -9242,6 +9355,57 @@ mod tests {
         );
         assert_eq!(walks.get(), 6, "one walk and five more");
         assert!(seen.lock().unwrap().is_empty(), "nothing was sent");
+    }
+
+    /// L-1: staged copies an interrupted merge left behind are swept, at any
+    /// depth, and nothing else; the next merge sweeps them before it starts.
+    #[tokio::test]
+    async fn leftover_restore_temps_are_swept() {
+        let tmp = tempfile::tempdir().unwrap();
+        let folder = tmp.path().join("save");
+        write_file(&folder.join("worlds_local/Alpha.db"), b"alpha");
+        write_file(&folder.join("worlds_local/Alpha.db.hoard-restore.tmp"), b"half");
+        write_file(&folder.join("worlds_local/Alpha/0_0.chunk.hoard-restore.tmp"), b"x");
+        write_file(&folder.join("notes.tmp"), b"the game's own");
+        assert_eq!(sweep_restore_temps(&folder), 2);
+        assert!(folder.join("worlds_local/Alpha.db").exists());
+        assert!(folder.join("notes.tmp").exists());
+        assert!(!folder.join("worlds_local/Alpha.db.hoard-restore.tmp").exists());
+
+        // Before a merge: a leftover whose name the version does not reuse.
+        write_file(&folder.join("worlds_local/Alpha.db.old.hoard-restore.tmp"), b"x");
+        let staging = tmp.path().join("staging");
+        write_file(&staging.join("worlds_local/Alpha.db"), b"alpha");
+        restore_files_into(&folder, &staging, None, Scope::default(), &[])
+            .await
+            .unwrap();
+        assert!(!folder.join("worlds_local/Alpha.db.old.hoard-restore.tmp").exists());
+    }
+
+    /// L-1: a staging folder whose process is gone is removed when the engine
+    /// starts; one of a live process (this one, or a CLI restore running now)
+    /// and anything not named as staging are left alone.
+    #[test]
+    fn stale_staging_folders_are_swept_and_live_ones_kept() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let me = std::process::id();
+        for name in [
+            "hoard-restore-w1-0-4000001".to_string(),
+            "hoard-restore-w1-1-4000002".to_string(),
+            format!("hoard-restore-w1-2-{me}"),
+            "hoard-restore-notapid".to_string(),
+            "something-else-4000001".to_string(),
+        ] {
+            write_file(&root.join(&name).join("worlds_local/Alpha.db"), b"x");
+        }
+        let alive = |pid: u32| pid == 4000002;
+        assert_eq!(sweep_stale_staging_in(root, &alive), 1);
+        assert!(!root.join("hoard-restore-w1-0-4000001").exists());
+        assert!(root.join("hoard-restore-w1-1-4000002").exists(), "alive");
+        assert!(root.join(format!("hoard-restore-w1-2-{me}")).exists(), "ours");
+        assert!(root.join("hoard-restore-notapid").exists());
+        assert!(root.join("something-else-4000001").exists());
     }
 
     /// M-3: a local copy that cannot be read is different from the version's,

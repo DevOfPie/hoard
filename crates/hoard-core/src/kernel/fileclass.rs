@@ -358,6 +358,11 @@ impl RestoreGate {
 /// without meeting another rule. `scope.include`, when set, is checked first:
 /// a file a shared save does not name is [`FileClass::Junk`], never backed up,
 /// never restored, never counted.
+/// The suffix a restore gives each file it stages beside its destination
+/// before renaming it into place. Never save data ([`classify`]); a leftover
+/// is swept at the save's start and before the next merge.
+pub const RESTORE_TMP_SUFFIX: &str = ".hoard-restore.tmp";
+
 pub fn classify(rel_path: &str, scope: Scope<'_>) -> FileClass {
     // 0. A shared save is its named files and nothing else.
     if !included(scope.include, rel_path) {
@@ -366,6 +371,13 @@ pub fn classify(rel_path: &str, scope: Scope<'_>) -> FileClass {
 
     let lower = rel_path.to_ascii_lowercase();
     let name = lower.rsplit('/').next().unwrap_or(&lower);
+
+    // 0b. Hoard's own restore staging, ahead of the shields: a shield ending
+    //     in `*` (438 catalog games) would take a crash's leftover for save
+    //     data and push it (L-1).
+    if name.ends_with(RESTORE_TMP_SUFFIX) {
+        return FileClass::Junk;
+    }
 
     // 1. The manifest rules: if it says this is a save, it is a save.
     if scope.shields.iter().any(|p| glob_match(p, name)) {
@@ -847,6 +859,26 @@ mod tests {
         assert_eq!(classify("worlds_local/Beta.db", scope), FileClass::Junk);
         assert!(!classify("worlds_local/Beta.db", scope).is_backed_up());
         assert!(!classify("worlds_local/Beta.db", scope).is_restored(true));
+    }
+
+    /// L-1: a restore's staged copy left by a crash is litter even where a
+    /// shield ending in `*` would take every file for save data, and inside a
+    /// shared world's folder.
+    #[test]
+    fn a_restore_temp_file_is_junk_before_the_shields() {
+        let star = inc(&["*"]);
+        let tmp = "worlds_local/Alpha/0_0.chunk.hoard-restore.tmp";
+        assert_eq!(shielded(tmp, &star), FileClass::Junk);
+        let include = inc(&["worlds_local/Alpha"]);
+        let scope = Scope {
+            shields: &star,
+            include: &include,
+        };
+        assert_eq!(classify(tmp, scope), FileClass::Junk);
+        assert_eq!(
+            classify("worlds_local/Alpha/0_0.chunk", scope),
+            FileClass::SaveData
+        );
     }
 
     #[test]
