@@ -60,6 +60,12 @@ pub struct RestoredOut {
     /// the restore wrote over them. Absent when nothing needed keeping.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub set_aside: Option<String>,
+    /// The folder the shared world's files that the version does not have
+    /// were moved to, so the world's folder ends as the version's. Absent
+    /// when nothing moved.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub world_set_aside: Option<String>,
+    pub world_files_set_aside: u64,
 }
 
 #[derive(Serialize)]
@@ -260,6 +266,17 @@ pub async fn apply(
         None
     };
 
+    // The share's world, owner and member alike, when `dest` is (or is about to
+    // become) this save's folder: a restore there leaves the world's folders as
+    // the version has them. A restore into some other folder is a copy and keeps
+    // whatever it finds.
+    let is_home = home.is_some() || row.as_ref().is_some_and(|s| s.local_path == dest);
+    let world: Vec<String> = match shared {
+        Some(s) if is_home => s.world().to_vec(),
+        _ => Vec::new(),
+    };
+    let shields = gate.shields.clone();
+
     let options = RestoreOptions {
         skip_verify: no_verify,
         force,
@@ -271,6 +288,20 @@ pub async fn apply(
     let outcome = download_snapshot(&client, &save_id, version, &dest, options, on_progress)
         .await
         .context("restore failed")?;
+    // Moved, never deleted, into the tree the side copies above use. Without
+    // `--force` the folder was empty and nothing is there to move.
+    let world_set_aside = hoard_agent::restore::set_aside_stale_world(
+        &dest,
+        &outcome.version_files,
+        &shields,
+        &world,
+        &CliConfig::state_dir()?.join("conflicts"),
+        &save_id,
+    )
+    .await
+    .with_context(|| {
+        format!("restored v{version}, but couldn't move the world's files it does not have aside")
+    })?;
 
     {
         let bar = pb.lock().unwrap();
@@ -306,6 +337,10 @@ pub async fn apply(
             bytes_reused: outcome.bytes_reused,
             destination: outcome.destination.display().to_string(),
             set_aside: set_aside.as_ref().map(|s| s.dir.display().to_string()),
+            world_set_aside: world_set_aside
+                .as_ref()
+                .map(|s| s.dir.display().to_string()),
+            world_files_set_aside: world_set_aside.as_ref().map_or(0, |s| s.files as u64),
         }),
         remembered,
     };
@@ -329,6 +364,12 @@ pub async fn apply(
             println!(
                 "  {} file(s) outside the shared world were copied to {dir} first",
                 kept.files
+            );
+        }
+        if let Some(dir) = &r.world_set_aside {
+            println!(
+                "  {} file(s) of the shared world that v{} does not have were moved to {dir}",
+                r.world_files_set_aside, out.version
             );
         }
         if let Some(applied) = &out.remembered {

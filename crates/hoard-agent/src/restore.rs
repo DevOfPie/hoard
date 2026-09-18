@@ -125,6 +125,10 @@ pub struct RestoreOutcome {
     pub bytes_reused: u64,
     /// What each half of the restore cost. See [`RestoreTimings`].
     pub timings: RestoreTimings,
+    /// Every file the version carries, `/`-separated relative paths, whether
+    /// or not the gate let it be written: what [`set_aside_stale_world`]
+    /// holds the folder against.
+    pub version_files: Vec<String>,
 }
 
 /// How a restore's time is split between its phases.
@@ -285,6 +289,109 @@ async fn copy_aside(dest: &Path, files: &[String], dir: &Path) -> Result<()> {
     Ok(())
 }
 
+/// After a version was written into a shared save's own folder: moves the
+/// files inside the world's folders
+/// ([`hoard_core::kernel::fileclass::in_mirrored_folder`]) that the version
+/// does not carry into a conflicts folder under `root`, the tree the pull's
+/// conflict backups and a session's side copies use, so the folder ends as
+/// the version's world and one retention sweep covers all three
+/// (HRD-Q-0027). Moved, never deleted.
+///
+/// Valheim 1.0 writes a world as `worlds_local/<W>/_main.<N>.*` and loads the
+/// highest `N`, so without this a restored older version sits beside the newer
+/// generation it was meant to replace and never loads. Only save data moves:
+/// config the gate would not write and litter the backup never reads stay put,
+/// as does everything outside those folders (the legacy flat world files, the
+/// characters, other worlds). `world` is the share's list, owner and member
+/// alike ([`crate::state::SharedRef::world`]); empty, and for a single-file
+/// save, nothing moves. `None` when nothing moved.
+pub async fn set_aside_stale_world(
+    dest: &Path,
+    version_files: &[String],
+    shields: &[String],
+    world: &[String],
+    root: &Path,
+    save_id: &str,
+) -> Result<Option<SetAside>> {
+    use hoard_core::kernel::fileclass::{classify, in_mirrored_folder, mirrored_folders};
+    use hoard_core::kernel::fileclass::{FileClass, Scope};
+
+    let names: Vec<&str> = version_files.iter().map(String::as_str).collect();
+    if mirrored_folders(world).next().is_none()
+        || !dest.is_dir()
+        || is_single_file_snapshot(dest, &names)
+    {
+        return Ok(None);
+    }
+    let kept: HashSet<&str> = names.into_iter().collect();
+    let scope = Scope {
+        shields,
+        include: world,
+    };
+    let stale: Vec<String> = crate::backup::walk_source(dest, scope)?
+        .into_iter()
+        .map(|f| f.relative_path)
+        .filter(|rel| {
+            in_mirrored_folder(world, rel)
+                && classify(rel, scope) == FileClass::SaveData
+                && !kept.contains(rel.as_str())
+        })
+        .collect();
+    if stale.is_empty() {
+        return Ok(None);
+    }
+    let dir = crate::claim::side_copy_dir(root, save_id, time::OffsetDateTime::now_utc());
+    for rel in &stale {
+        move_aside(&dest.join(rel), &dir.join(rel)).await?;
+        prune_emptied(dest, rel, world);
+    }
+    tracing::info!(
+        save_id,
+        files = stale.len(),
+        dir = %dir.display(),
+        "restore: moved the world's files the version does not have aside"
+    );
+    Ok(Some(SetAside {
+        dir,
+        files: stale.len(),
+    }))
+}
+
+/// Moves `from` to `to`, creating `to`'s parents: a rename, or a copy and a
+/// remove when the two sit on different filesystems.
+pub(crate) async fn move_aside(from: &Path, to: &Path) -> Result<()> {
+    if let Some(parent) = to.parent() {
+        tokio::fs::create_dir_all(parent)
+            .await
+            .with_context(|| format!("creating {}", parent.display()))?;
+    }
+    if tokio::fs::rename(from, to).await.is_err() {
+        tokio::fs::copy(from, to)
+            .await
+            .with_context(|| format!("copying {} aside to {}", from.display(), to.display()))?;
+        tokio::fs::remove_file(from)
+            .await
+            .with_context(|| format!("removing {} after moving it aside", from.display()))?;
+    }
+    Ok(())
+}
+
+/// After `rel` moved out of `dest`: removes the folders it leaves empty
+/// between it and the world's folder, never that folder itself. `remove_dir`
+/// refuses a folder with anything in it, so only an empty folder goes.
+pub(crate) fn prune_emptied(dest: &Path, rel: &str, world: &[String]) {
+    let mut dir = Path::new(rel).parent();
+    while let Some(d) = dir {
+        let d_str = d.to_string_lossy().replace('\\', "/");
+        if !hoard_core::kernel::fileclass::in_mirrored_folder(world, &d_str)
+            || std::fs::remove_dir(dest.join(d)).is_err()
+        {
+            return;
+        }
+        dir = d.parent();
+    }
+}
+
 /// Resolve the snapshot version to use: the explicit one if supplied, else the
 /// save's `latest_version_num`. Errors if the save has no snapshots yet.
 pub async fn resolve_version(
@@ -407,6 +514,7 @@ where
     let mut entries = archive.entries().context("opening tar archive")?;
     let mut files_extracted = 0usize;
     let mut bytes_extracted = 0u64;
+    let mut version_files = Vec::new();
 
     while let Some(entry) = entries.next().await {
         let mut entry = entry.context("reading tar entry")?;
@@ -433,6 +541,7 @@ where
         }
 
         let key = safe_rel.to_string_lossy().replace('\\', "/");
+        version_files.push(key.clone());
         // Config and litter from the machine that uploaded the snapshot are not
         // written over this one's unless the user asked for it.
         if !single_file && !options.gate.allows(&key) {
@@ -516,6 +625,7 @@ where
         // Whole-archive path: nothing to skip per file.
         files_reused: 0,
         bytes_reused: 0,
+        version_files,
     })
 }
 
@@ -823,6 +933,7 @@ where
         .collect();
     let root = extraction_root(dest, &names);
     let single_file = root != dest;
+    let version_files: Vec<String> = names.iter().map(|n| n.to_string()).collect();
 
     if dest.exists() {
         let empty = !single_file && std::fs::read_dir(dest)?.next().is_none();
@@ -1078,6 +1189,7 @@ where
             transfer_ms,
             total_ms: 0,
         },
+        version_files,
     })
 }
 
@@ -1167,6 +1279,7 @@ where
     let mut entries = archive.entries().context("opening tar archive")?;
     let mut files_extracted = 0usize;
     let mut bytes_extracted = 0u64;
+    let mut version_files = Vec::new();
 
     while let Some(entry) = entries.next().await {
         let mut entry = entry.context("reading tar entry")?;
@@ -1189,11 +1302,9 @@ where
                 .with_context(|| format!("creating parent {}", parent.display()))?;
         }
 
-        if !single_file
-            && !options
-                .gate
-                .allows(&safe_rel.to_string_lossy().replace('\\', "/"))
-        {
+        let key = safe_rel.to_string_lossy().replace('\\', "/");
+        version_files.push(key.clone());
+        if !single_file && !options.gate.allows(&key) {
             tracing::debug!(path = %safe_rel.display(), "restore: skipping device-local file");
             continue;
         }
@@ -1234,6 +1345,7 @@ where
         // The total is stamped by `download_snapshot_cloud`, which started the
         // stopwatch (asking for the manifest included).
         timings: RestoreTimings::default(),
+        version_files,
     })
 }
 
@@ -1453,6 +1565,99 @@ mod tests {
                 .await
                 .is_empty()
         );
+    }
+
+    /// HRD-Q-0027, the explicit restore: v7 was just written into the save's
+    /// own folder over generation 9. What the world's folder holds and v7
+    /// does not moves into the conflicts tree, bytes intact; the legacy flat
+    /// files, the character, another world and config the gate would not
+    /// write stay. Unshared, and into a fresh folder, nothing moves.
+    #[tokio::test]
+    async fn a_restore_into_the_saves_folder_moves_the_worlds_newer_generation_aside() {
+        let tmp = tempfile::tempdir().unwrap();
+        let save = tmp.path().join("save");
+        let root = tmp.path().join("conflicts");
+        let put = |rel: &str| {
+            let p = save.join(rel);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(&p, rel).unwrap();
+        };
+        let gen = |n: u32| -> Vec<String> {
+            ["fwl2", "db2", "chunks", "ok"]
+                .iter()
+                .map(|e| format!("worlds_local/Alpha/_main.{n}.{e}"))
+                .collect()
+        };
+        let mut version_files = gen(7);
+        version_files.push("worlds_local/Alpha.fwl".into());
+        version_files.push("characters_local/Me.fch".into());
+        let mut stale = gen(9);
+        stale.push("worlds_local/Alpha/sub/3_3.chunk".into());
+        let stays = [
+            "worlds_local/Alpha.fwl",
+            "worlds_local/Alpha.db.old",
+            "worlds_local/Alpha/graphics.ini",
+            "worlds_local/Beta/_main.2.fwl2",
+            "worlds_local/Alpha2/_main.2.fwl2",
+            "characters_local/Me.fch",
+            "characters_local/Other.fch",
+        ];
+        for rel in version_files.iter().chain(&stale) {
+            put(rel);
+        }
+        for rel in stays {
+            put(rel);
+        }
+        let world = crate::worldfiles::template("valheim", "Alpha")
+            .unwrap()
+            .unwrap();
+
+        // Not shared: nothing moves.
+        assert!(
+            set_aside_stale_world(&save, &version_files, &[], &[], &root, "w1")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(save.join(&stale[0]).exists());
+
+        let moved = set_aside_stale_world(&save, &version_files, &[], &world, &root, "w1")
+            .await
+            .unwrap()
+            .expect("generation 9 moved");
+        assert_eq!(moved.files, stale.len());
+        assert!(moved.dir.starts_with(root.join("w1")));
+        for rel in &stale {
+            assert!(!save.join(rel).exists(), "{rel}");
+            assert_eq!(std::fs::read(moved.dir.join(rel)).unwrap(), rel.as_bytes());
+        }
+        assert!(!save.join("worlds_local/Alpha/sub").exists());
+        for rel in version_files.iter().map(String::as_str).chain(stays) {
+            assert_eq!(
+                std::fs::read(save.join(rel)).unwrap(),
+                rel.as_bytes(),
+                "{rel}"
+            );
+        }
+
+        // Nothing left to move; a fresh folder has nothing either.
+        assert!(
+            set_aside_stale_world(&save, &version_files, &[], &world, &root, "w1")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(set_aside_stale_world(
+            &tmp.path().join("nowhere"),
+            &version_files,
+            &[],
+            &world,
+            &root,
+            "w1"
+        )
+        .await
+        .unwrap()
+        .is_none());
     }
 
     #[test]

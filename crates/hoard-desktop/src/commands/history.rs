@@ -362,6 +362,9 @@ pub struct RestoreOutcome {
     pub bytes_extracted: u64,
     pub destination: String,
     pub safety_version: Option<i64>,
+    /// Files of the shared world the version does not have, moved into the
+    /// conflicts folder so the world's folder ends as the version's.
+    pub world_files_set_aside: usize,
 }
 
 /// Restore an old snapshot into the local save folder.
@@ -503,6 +506,7 @@ pub async fn restore_snapshot(
         hoard_agent::savefilter::restore_include(shared.as_ref()),
         allow_config,
     );
+    let shields = gate.shields.clone();
 
     // 1b) The owner's restore writes the whole folder, and a file outside the
     //     share it overwrites may hold bytes no version has yet. Those files
@@ -562,6 +566,28 @@ pub async fn restore_snapshot(
     .await
     .map_err(pretty_error)?;
 
+    // 3) The folder is this save's (or becomes it below), so the shared world's
+    //    folders end as the version has them: what it does not have is moved
+    //    into the conflicts tree, never deleted (HRD-Q-0027).
+    let conflicts = CliConfig::state_dir()
+        .map_err(|e| e.to_string())?
+        .join("conflicts");
+    let world_set_aside = restore::set_aside_stale_world(
+        &local_path,
+        &outcome.version_files,
+        &shields,
+        shared.as_ref().map_or(&[][..], |s| s.world()),
+        &conflicts,
+        &save_id,
+    )
+    .await
+    .map_err(|e| {
+        format!(
+            "Restored version {version}, but couldn't move the world's files it doesn't have aside: {}",
+            pretty_error(e)
+        )
+    })?;
+
     emit_phase(&app, &save_id, version, RestorePhase::Done, 0, 0);
 
     // Only now, with the files in, is the picked folder recorded. Then the service
@@ -583,6 +609,7 @@ pub async fn restore_snapshot(
         bytes_extracted: outcome.bytes_extracted,
         destination: outcome.destination.to_string_lossy().into_owned(),
         safety_version,
+        world_files_set_aside: world_set_aside.map_or(0, |s| s.files),
     })
 }
 
