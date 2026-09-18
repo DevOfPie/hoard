@@ -205,6 +205,8 @@
     destinationOverride: string | null;
     path: string;
     error: string;
+    /** The plan's per-save cap left the file out; it is not unreadable. */
+    overCap: boolean;
   } | null>(null);
 
   let togglingPause = $state(false);
@@ -476,8 +478,14 @@
         pickingDestination = target;
         restoreTarget = null;
       } else if (msg.startsWith(`${SAFETY_COPY_HELD}\n`)) {
-        const [, path = "", error = ""] = msg.split("\n");
-        safetyHeld = { target, destinationOverride, path, error };
+        const [, path = "", error = "", cause = ""] = msg.split("\n");
+        safetyHeld = {
+          target,
+          destinationOverride,
+          path,
+          error,
+          overCap: cause === "cap",
+        };
         restoreTarget = null;
       } else {
         toastError(msg);
@@ -1486,7 +1494,7 @@
   }}
 >
   <p class="text-sm text-zinc-300" title={safetyHeld?.error ?? ""}>
-    {$_("history.safety_held_body", {
+    {$_(safetyHeld?.overCap ? "history.safety_held_cap_body" : "history.safety_held_body", {
       values: { path: safetyHeld?.path ?? "" },
     })}
   </p>

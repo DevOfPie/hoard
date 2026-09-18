@@ -124,6 +124,8 @@ export type FeedEntry = {
   path?: string;
   /** A `backup_world_held` row whose retries stopped. */
   parked?: boolean;
+  /** A `backup_world_held` row left out by the plan's cap, not unreadable. */
+  over_cap?: boolean;
 };
 
 const MAX_FEED_ENTRIES = 80;
@@ -306,6 +308,7 @@ function feedRowFor(p: AgentEvent): Omit<FeedEntry, "id" | "at"> | null {
         count: p.count,
         path: p.sample_path,
         parked: p.parked,
+        over_cap: p.over_cap ?? false,
         error: p.sample_error,
       };
     case "save_auto_restore_failed":
@@ -677,6 +680,7 @@ export async function subscribeLive() {
         count: p.count,
         path: p.sample_path,
         parked: p.parked,
+        over_cap: p.over_cap ?? false,
         error: p.sample_error,
       });
     }),

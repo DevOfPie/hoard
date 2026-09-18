@@ -340,6 +340,11 @@ pub enum AgentEvent {
         attempts: u32,
         /// Retrying on a clock has stopped.
         parked: bool,
+        /// The files were left out by the plan's per-save cap, not because
+        /// they can't be read: the UI says which (M-3). Absent from older
+        /// engines, which reads as unreadable.
+        #[serde(default)]
+        over_cap: bool,
     },
     /// A save that had emitted [`AgentEvent::BackupNeedsAttention`] is uploading
     /// again (or has a fresh reason to try). Lets the frontends drop the

@@ -257,6 +257,9 @@ pub struct PartialWorld {
     pub first: String,
     /// Why: the system error for an unreadable file, or the cap.
     pub reason: String,
+    /// Left out by the plan's per-save cap rather than unreadable. What the
+    /// user is told follows it: a permissions hint is wrong for a cap (M-3).
+    pub over_cap: bool,
 }
 
 /// [`PartialWorld`] when any of `left_out` (relative path and reason) is part
@@ -264,6 +267,7 @@ pub struct PartialWorld {
 fn refuse_partial_world<'a>(
     world: &[String],
     left_out: impl Iterator<Item = (&'a str, &'a str)>,
+    over_cap: bool,
 ) -> Result<(), PartialWorld> {
     if world.is_empty() {
         return Ok(());
@@ -278,6 +282,7 @@ fn refuse_partial_world<'a>(
             count: hit.len(),
             first: first.to_string(),
             reason: reason.to_string(),
+            over_cap,
         }),
     }
 }
@@ -298,6 +303,7 @@ fn refuse_trimmed_world(
             .map(|f| f.relative_path.as_str())
             .filter(|rel| !kept.contains(rel))
             .map(|rel| (rel, reason.as_str())),
+        true,
     )
 }
 
@@ -349,6 +355,7 @@ async fn carry_unreadable_world(
             in_world
                 .iter()
                 .map(|u| (u.relative_path.as_str(), u.error.as_str())),
+            false,
         ) {
             Err(partial) => partial.into(),
             Ok(()) => anyhow!("a world file left out was not refused"),
@@ -1337,6 +1344,7 @@ where
                         c.relative_path.as_str(),
                         "can't be read, and the synced version's copy is gone from the server",
                     )),
+                    false,
                 )?;
             }
             bail!(
@@ -2886,7 +2894,8 @@ mod tests {
             &world,
             skipped
                 .iter()
-                .map(|u| (u.relative_path.as_str(), u.error.as_str()))
+                .map(|u| (u.relative_path.as_str(), u.error.as_str())),
+            false,
         )
         .is_ok());
     }
@@ -2952,6 +2961,7 @@ mod tests {
                 .unwrap_or_else(|| panic!("{who}: {err:#}"));
             assert_eq!(partial.count, 1);
             assert_eq!(partial.first, "worlds_local/Alpha/0_0.chunk");
+            assert!(!partial.over_cap, "{who}: unreadable, not the cap");
         }
         let err = unshared.expect_err("the fake server is not there");
         assert!(err.downcast_ref::<PartialWorld>().is_none(), "{err:#}");
@@ -2986,6 +2996,8 @@ mod tests {
         let err = refuse_trimmed_world(&world, &files, &only_character, "free").unwrap_err();
         assert_eq!(err.first, "worlds_local/Alpha/0_0.chunk");
         assert!(err.reason.contains("free"), "{}", err.reason);
+        // M-3: said as the cap, not as a file that can't be read.
+        assert!(err.over_cap);
         assert!(refuse_trimmed_world(&[], &files, &only_character, "free").is_ok());
     }
 

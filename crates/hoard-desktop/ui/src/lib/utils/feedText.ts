@@ -132,7 +132,13 @@ export function feedSummary(e: FeedEntry, $_: Translate): string {
       });
     case "backup_world_held":
       return $_(
-        e.parked ? "activity.backup_world_parked" : "activity.backup_world_held",
+        e.over_cap
+          ? e.parked
+            ? "activity.backup_world_parked_cap"
+            : "activity.backup_world_held_cap"
+          : e.parked
+            ? "activity.backup_world_parked"
+            : "activity.backup_world_held",
         { values: { name, path: e.path ?? "", error: e.error ?? "" } },
       );
     case "auto_restore_failed":

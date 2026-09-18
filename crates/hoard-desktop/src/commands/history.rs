@@ -635,7 +635,9 @@ pub async fn restore_snapshot(
 
 /// Sentinel prefix of the error a restore returns when its safety copy is
 /// held because a file of the shared world can't be read
-/// ([`backup::PartialWorld`]): `SAFETY_COPY_HELD\n<path>\n<reason>`. The UI
+/// ([`backup::PartialWorld`]): `SAFETY_COPY_HELD\n<path>\n<reason>\n<cause>`,
+/// the cause `cap` when the plan's per-save cap left the file out and
+/// `unreadable` otherwise, so the text says which (M-3). The UI
 /// offers the restore again without the safety copy (`backup_first: false`),
 /// which is the user's call: a copy without that file is never made (M-D).
 pub const SAFETY_COPY_HELD: &str = "SAFETY_COPY_HELD";
@@ -647,7 +649,12 @@ fn safety_copy_error(e: anyhow::Error) -> String {
         .chain()
         .find_map(|c| c.downcast_ref::<backup::PartialWorld>())
     {
-        Some(p) => format!("{SAFETY_COPY_HELD}\n{}\n{}", p.first, p.reason),
+        Some(p) => format!(
+            "{SAFETY_COPY_HELD}\n{}\n{}\n{}",
+            p.first,
+            p.reason,
+            if p.over_cap { "cap" } else { "unreadable" }
+        ),
         None => pretty_error(e),
     }
 }
@@ -849,11 +856,23 @@ mod tests {
             count: 1,
             first: "worlds_local/Alpha/0_0.chunk".into(),
             reason: "Permission denied".into(),
+            over_cap: false,
         })
         .context("uploading the safety copy");
         assert_eq!(
             safety_copy_error(held),
-            "SAFETY_COPY_HELD\nworlds_local/Alpha/0_0.chunk\nPermission denied"
+            "SAFETY_COPY_HELD\nworlds_local/Alpha/0_0.chunk\nPermission denied\nunreadable"
+        );
+        // M-3: the plan's cap is its own cause, and the text follows it.
+        let capped = anyhow::Error::new(backup::PartialWorld {
+            count: 1,
+            first: "worlds_local/Alpha/0_0.chunk".into(),
+            reason: "over the free plan's per-save cap".into(),
+            over_cap: true,
+        });
+        assert_eq!(
+            safety_copy_error(capped),
+            "SAFETY_COPY_HELD\nworlds_local/Alpha/0_0.chunk\nover the free plan's per-save cap\ncap"
         );
         let other = safety_copy_error(anyhow::anyhow!("network down"));
         assert!(!other.starts_with(SAFETY_COPY_HELD), "{other}");

@@ -729,6 +729,9 @@ export type AgentEvent =
       sample_error: string;
       attempts: number;
       parked: boolean;
+      /** Left out by the plan's per-save cap, not unreadable. Absent from
+       *  older engines. */
+      over_cap?: boolean;
     }
   | {
       type: "save_auto_restored";

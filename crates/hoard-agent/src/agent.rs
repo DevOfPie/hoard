@@ -493,6 +493,8 @@ enum AgentCommand {
         count: u64,
         path: String,
         error: String,
+        /// Left out by the plan's cap, not unreadable.
+        over_cap: bool,
     },
     /// Internal: a server older than the owner's exception refused the whole
     /// folder as outside the share's list. The slot walks the world alone from
@@ -1156,7 +1158,7 @@ pub(crate) struct SaveSlot {
     /// What the last held push said (how many files, the first, why), queued
     /// with a `pending_op_result` of `WorldHeld` for the event the shell sends
     /// once the reducer has counted it.
-    last_world_held: Option<(u64, String, String)>,
+    last_world_held: Option<(u64, String, String, bool)>,
     /// Cloud version this slot is known to be synced to, advanced on a genuine
     /// upload commit and after a successful auto-restore. The reconciliation
     /// sweep passes it to `run_auto_restore`, which skips the download-to-diff
@@ -1914,7 +1916,7 @@ fn reconcile_all(
         if now_held.consecutive > was_held.consecutive
             || (now_held.needs_attention && !was_held.needs_attention)
         {
-            let (count, sample_path, sample_error) = world_held_why.unwrap_or_default();
+            let (count, sample_path, sample_error, over_cap) = world_held_why.unwrap_or_default();
             tracing::warn!(
                 save_id = %id,
                 game_slug = %slot.save.game_slug,
@@ -1933,6 +1935,7 @@ fn reconcile_all(
                 sample_error,
                 attempts: now_held.consecutive,
                 parked: now_held.needs_attention,
+                over_cap,
             });
         }
         if was_held.active() && !now_held.active() && !now_blocked {
@@ -2750,11 +2753,11 @@ async fn run_agent(
                             &cloud_heads, lease_task.as_ref(),
                         );
                     }
-                    Some(AgentCommand::ParkBackupPartialWorld { id, count, path, error }) => {
+                    Some(AgentCommand::ParkBackupPartialWorld { id, count, path, error, over_cap }) => {
                         if let Some(slot) = slots.get_mut(&id) {
                             slot.next_scheduled_backup_at = None;
                             slot.pending_op_result = Some(kernel::OpResult::WorldHeld);
-                            slot.last_world_held = Some((count, path, error));
+                            slot.last_world_held = Some((count, path, error, over_cap));
                             tracing::info!(
                                 save_id = %id,
                                 held = slot.world_held.consecutive,
@@ -5876,14 +5879,15 @@ async fn run_backup_with_retry(
                 let partial = e
                     .chain()
                     .find_map(|c| c.downcast_ref::<crate::backup::PartialWorld>())
-                    .map(|p| (p.count, p.first.clone(), p.reason.clone()));
-                if let Some((count, first, reason)) = partial {
+                    .map(|p| (p.count, p.first.clone(), p.reason.clone(), p.over_cap));
+                if let Some((count, first, reason, over_cap)) = partial {
                     let _ = cmd_tx
                         .send(AgentCommand::ParkBackupPartialWorld {
                             id: save.save_id.clone(),
                             count: count as u64,
                             path: first,
                             error: reason,
+                            over_cap,
                         })
                         .await;
                     return;
@@ -8980,7 +8984,7 @@ mod tests {
         {
             let slot = slots.get_mut("w1").unwrap();
             slot.world_held = held;
-            slot.last_world_held = Some((1, "a.db".into(), "denied".into()));
+            slot.last_world_held = Some((1, "a.db".into(), "denied".into(), false));
         }
         handle_reseat(&mut slots, owner_save(dir.path()), &fs_tx);
         let slot = slots.get_mut("w1").unwrap();
