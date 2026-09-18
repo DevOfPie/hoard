@@ -1111,6 +1111,9 @@ pub(crate) fn on_side_copied(
         tracing::info!(save_id = %slot.save.save_id, "agent: no file of the shared world is here; pulling the head");
         slot.has_pending = false;
         slot.local_only_pending = false;
+        // An owner's pending writes outside the world are still unversioned:
+        // marked again once the pull lands, as when the copy moved files.
+        slot.recheck_pending_after_pull = slot.save.owns_whole_folder();
         slot.pull_pending = true;
         end_session(slot);
     } else {
@@ -2494,6 +2497,35 @@ mod tests {
         std::fs::write(folder.join("worlds_local/Beta.db"), b"other world").unwrap();
         std::fs::write(folder.join("characters_local/me.fch"), b"me").unwrap();
         folder
+    }
+
+    /// L-A: an owner's side copy that finds no file of the world on disk
+    /// lets the pull through, and the owner's pending writes outside the
+    /// world (a character) are re-checked once it lands, not dropped.
+    #[tokio::test]
+    async fn a_side_copy_with_no_world_on_disk_keeps_the_owners_edits_for_after_the_pull() {
+        let (tx, _rx) = mpsc::channel(8);
+        let tmp = tempfile::tempdir().unwrap();
+        let folder = owner_folder(tmp.path());
+        std::fs::remove_file(folder.join("worlds_local/Alpha.db")).unwrap();
+        let now = Instant::now();
+        let mut s = slots(vec![owned_world(&folder)]);
+        {
+            let slot = s.get_mut("w1").unwrap();
+            slot.has_pending = true;
+            let mut session = WorldSession::new(now);
+            session.stopped = true;
+            session.side_copy_started = true;
+            slot.session = Some(session);
+        }
+        on_side_copied(&mut s, "w1", 0, now, &tx);
+        let slot = &s["w1"];
+        assert!(slot.session.is_none());
+        assert!(!slot.has_pending && slot.pull_pending);
+        assert!(
+            slot.recheck_pending_after_pull,
+            "the character is re-checked after the pull"
+        );
     }
 
     /// The owner's walk takes the whole folder; its side copy still takes
