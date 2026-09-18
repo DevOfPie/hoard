@@ -3506,6 +3506,12 @@ fn handle_reseat(
     };
     slot.in_flight = old.in_flight;
     slot.has_pending = old.has_pending;
+    // The process poll's word goes with the slot: a game running before the
+    // reseat is running after it, and a pull already under way keeps reading
+    // the same flag (`still_quiet` cloned it), which the poll goes on writing.
+    slot.is_running = old.is_running;
+    slot.last_running_seen = old.last_running_seen;
+    slot.running_now = old.running_now;
     mark_pending_if_diverged(slot);
 }
 
@@ -8735,6 +8741,37 @@ mod tests {
     fn owner_folder(root: &Path) {
         write_file(&root.join("worlds_local/Alpha.db"), b"alpha");
         write_file(&root.join("characters_local/Me.fch"), b"me");
+    }
+
+    /// L-B: a reseat (a share, a settings change) keeps the process poll's
+    /// word. A game running stays running, and a pull already under way reads
+    /// the flag the poll goes on writing, so a game that stops after the
+    /// reseat is seen stopping and one still up keeps the merge deferred.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_reseat_keeps_the_running_game() {
+        let dir = tempfile::tempdir().unwrap();
+        owner_folder(dir.path());
+        let mut slots = HashMap::new();
+        let (fs_tx, _fs_rx) = mpsc::channel(4);
+        handle_add(&mut slots, owner_save(dir.path()), &fs_tx);
+        let quiet = {
+            let slot = slots.get_mut("w1").unwrap();
+            slot.is_running = true;
+            slot.running_now
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+            still_quiet(slot)
+        };
+        assert!(!quiet());
+
+        handle_reseat(&mut slots, owner_save(dir.path()), &fs_tx);
+        let slot = slots.get_mut("w1").unwrap();
+        assert!(slot.is_running);
+        assert!(!still_quiet(slot)(), "still running after the reseat");
+        // The poll sees it stop, on the reseated slot.
+        slot.is_running = false;
+        slot.running_now
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+        assert!(quiet(), "the pull under way sees the game stop");
     }
 
     /// M-C: an owner whose side copy just landed has other writes to re-check
