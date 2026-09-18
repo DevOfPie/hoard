@@ -4450,9 +4450,31 @@ enum AutoRestorePull {
 /// Asked by a pull right before it writes.
 pub(crate) type StillQuiet = Arc<dyn Fn() -> bool + Send + Sync>;
 
-/// Where pulls and explicit restores stage the version they download.
+/// Where pulls and explicit restores stage the version they download: beside
+/// the conflicts tree, under the state folder the daemon, the CLI and the
+/// desktop all resolve the same way (`CliConfig::state_dir`), so on the same
+/// filesystem as the conflicts. Not the system temp folder: that is a tmpfs
+/// on many Linux systems (this VM's among them), where a staged version is a
+/// whole save held in RAM, and a small or quota'd one fails the pull (L-7).
+/// The unit tests stage under the temp folder, not the user's state.
 pub(crate) fn staging_root() -> PathBuf {
-    std::env::temp_dir()
+    #[cfg(test)]
+    {
+        std::env::temp_dir()
+    }
+    #[cfg(not(test))]
+    {
+        staging_root_in(crate::config::CliConfig::state_dir().ok())
+    }
+}
+
+/// [`staging_root`] for a state folder: its `staging`, or the temp folder when
+/// there is none to resolve.
+fn staging_root_in(state_dir: Option<PathBuf>) -> PathBuf {
+    match state_dir {
+        Some(dir) => dir.join("staging"),
+        None => std::env::temp_dir(),
+    }
 }
 
 /// The name every staging folder starts with ([`staging_dir_for`]).
@@ -9380,6 +9402,22 @@ mod tests {
             .await
             .unwrap();
         assert!(!folder.join("worlds_local/Alpha.db.old.hoard-restore.tmp").exists());
+    }
+
+    /// L-7: staging sits beside the conflicts tree, under the state folder, so
+    /// on the same filesystem, not in the system temp folder (a tmpfs here).
+    #[test]
+    fn staging_is_beside_the_conflicts_under_the_state_folder() {
+        let state = PathBuf::from("/home/u/.local/share/hoard");
+        let root = staging_root_in(Some(state.clone()));
+        assert_eq!(root, state.join("staging"));
+        assert_eq!(root.parent(), state.join("conflicts").parent());
+        assert_eq!(staging_root_in(None), std::env::temp_dir());
+        assert!(staging_dir_for("w/1")
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .starts_with("hoard-restore-w_1-"));
     }
 
     /// L-1: a staging folder whose process is gone is removed when the engine
