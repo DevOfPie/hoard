@@ -441,7 +441,7 @@ pub async fn put_back(dest: &Path, set_aside: &SetAside) {
     put_back_moved(dest, &set_aside.paths, &set_aside.dir).await;
 }
 
-async fn put_back_moved(dest: &Path, rels: &[String], dir: &Path) {
+pub(crate) async fn put_back_moved(dest: &Path, rels: &[String], dir: &Path) {
     for rel in rels.iter().rev() {
         if let Err(e) = move_aside(&dir.join(rel), &dest.join(rel)).await {
             tracing::warn!(

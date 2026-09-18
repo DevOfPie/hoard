@@ -4461,10 +4461,15 @@ pub(crate) async fn cleanup_old_conflicts(conflict_root: &Path, retention: Durat
 /// `world` is the share's list ([`WatchedSave::world`]), empty for an
 /// unshared save and for the reconcile of a refused push.
 ///
-/// Everything that moves (the files set aside, the local copies backed up)
-/// moves before anything is written. A move that fails puts the moved ones
-/// back and returns the error with nothing written, so a failed pull never
-/// leaves a half-replaced world behind for the next push to carry.
+/// All or nothing (M-A). Every file to write is first copied beside its
+/// destination as a `.hoard-restore.tmp` sibling (litter the backup never
+/// reads); a copy that fails removes the siblings and returns with nothing
+/// moved. Then everything that moves (the files set aside, the local copies
+/// backed up) moves, all or nothing. Only then does each sibling take its
+/// destination's name, a rename within one folder. A rename that fails takes
+/// back the ones already placed and puts every moved file back, so a failed
+/// pull never leaves a half-replaced world, or files in neither place, behind
+/// for the next push to carry.
 ///
 /// Errors propagate only for I/O failures we can't classify (e.g.
 /// permission denied reading a file we just listed).
@@ -4474,6 +4479,22 @@ pub(crate) async fn restore_files_into(
     conflict_backup_dir: Option<&Path>,
     scope: Scope<'_>,
     world: &[String],
+) -> Result<RestoreStats> {
+    restore_files_into_as(target, source, conflict_backup_dir, scope, world, false).await
+}
+
+/// [`restore_files_into`], and with `version_wins` the explicit restore's
+/// rule: every file the version carries replaces a different local copy,
+/// whatever the mtimes, and the local copy is backed up into
+/// `conflict_backup_dir` first (M-B). Without a backup dir nothing is
+/// replaced, as before.
+pub(crate) async fn restore_files_into_as(
+    target: &Path,
+    source: &Path,
+    conflict_backup_dir: Option<&Path>,
+    scope: Scope<'_>,
+    world: &[String],
+    version_wins: bool,
 ) -> Result<RestoreStats> {
     let mut stats = RestoreStats::default();
     // Relative paths seen in the remote snapshot. Used after the merge to spot
@@ -4519,7 +4540,7 @@ pub(crate) async fn restore_files_into(
             // generation's, and keeping it would mix two (HRD-Q-0027).
             let rel_str = rel.to_string_lossy().replace('\\', "/");
             if conflict_backup_dir.is_some()
-                && kernel::fileclass::in_mirrored_folder(world, &rel_str)
+                && (version_wins || kernel::fileclass::in_mirrored_folder(world, &rel_str))
             {
                 writes.push((rel, true));
                 continue;
@@ -4616,6 +4637,29 @@ pub(crate) async fn restore_files_into(
         }
     }
 
+    // Every write is copied beside its destination before anything moves: a
+    // copy that fails (a full disk, a staging file gone) leaves the folder as
+    // it was.
+    let mut staged: Vec<StagedWrite> = Vec::with_capacity(writes.len());
+    for (rel, replaced) in &writes {
+        let path = source.join(rel);
+        let dest = target.join(rel);
+        let tmp = restore_tmp_path(&dest);
+        match stage_write(&path, &tmp).await {
+            Ok(bytes) => staged.push(StagedWrite {
+                tmp,
+                dest,
+                replaced: *replaced,
+                bytes,
+            }),
+            Err(e) => {
+                let _ = tokio::fs::remove_file(&tmp).await;
+                discard_staged(&staged).await;
+                return Err(e);
+            }
+        }
+    }
+
     // Everything that leaves the folder leaves it before anything is written:
     // the files the version lacks, then the local copies it replaces. All or
     // nothing (`move_all_aside`).
@@ -4625,9 +4669,12 @@ pub(crate) async fn restore_files_into(
         .filter(|(_, backup)| *backup)
         .map(|(rel, _)| rel.to_string_lossy().replace('\\', "/"))
         .collect();
+    let moving: Vec<String> = stale.iter().chain(&backed_up).cloned().collect();
     if let Some(dir) = conflict_backup_dir {
-        let moving: Vec<String> = stale.iter().chain(&backed_up).cloned().collect();
-        crate::restore::move_all_aside(target, &moving, dir).await?;
+        if let Err(e) = crate::restore::move_all_aside(target, &moving, dir).await {
+            discard_staged(&staged).await;
+            return Err(e);
+        }
         for rel in &stale {
             crate::restore::prune_emptied(target, rel, world);
         }
@@ -4635,20 +4682,31 @@ pub(crate) async fn restore_files_into(
         stats.conflicts_backed_up = backed_up.len();
     }
 
-    for (rel, replaced) in &writes {
-        let path = source.join(rel);
-        let dest = target.join(rel);
-        if let Some(parent) = dest.parent() {
-            tokio::fs::create_dir_all(parent)
-                .await
-                .with_context(|| format!("creating parent dir {} for restore", parent.display()))?;
+    // Then each staged copy takes its destination's name. A rename that fails
+    // undoes the lot: the ones already placed come out, and everything moved
+    // aside goes back, so no file ends in neither place.
+    for (i, w) in staged.iter().enumerate() {
+        if let Err(e) = place_staged(i, &w.tmp, &w.dest).await {
+            for done in staged[..i].iter().rev() {
+                if let Err(e) = tokio::fs::remove_file(&done.dest).await {
+                    tracing::warn!(
+                        dest = %done.dest.display(),
+                        error = %e,
+                        "restore: couldn't take back a file this merge wrote"
+                    );
+                }
+            }
+            discard_staged(&staged[i..]).await;
+            if let Some(dir) = conflict_backup_dir {
+                crate::restore::put_back_moved(target, &moving, dir).await;
+            }
+            return Err(anyhow::Error::new(e).context(format!(
+                "placing {}; the merge was undone",
+                w.dest.display()
+            )));
         }
-        let copied = tokio::fs::copy(&path, &dest)
-            .await
-            .with_context(|| format!("copying {} → {}", path.display(), dest.display()))?;
-        preserve_staging_mtime(&path, &dest).await;
-        stats.bytes_restored += copied;
-        if *replaced {
+        stats.bytes_restored += w.bytes;
+        if w.replaced {
             stats.conflicts_resolved_remote += 1;
         } else {
             stats.restored += 1;
@@ -4656,6 +4714,62 @@ pub(crate) async fn restore_files_into(
     }
 
     Ok(stats)
+}
+
+/// One file [`restore_files_into`] writes: staged beside its destination,
+/// then renamed over it.
+struct StagedWrite {
+    tmp: PathBuf,
+    dest: PathBuf,
+    replaced: bool,
+    bytes: u64,
+}
+
+/// Where a file is staged beside `dest` before it takes `dest`'s name. The
+/// `.tmp` suffix is litter to the walk ([`kernel::fileclass::classify`]), so
+/// one left by a crash is never backed up.
+fn restore_tmp_path(dest: &Path) -> PathBuf {
+    let mut name = dest.file_name().unwrap_or_default().to_os_string();
+    name.push(".hoard-restore.tmp");
+    dest.with_file_name(name)
+}
+
+/// Copies `src` to `tmp`, creating its parents, with `src`'s mtime.
+async fn stage_write(src: &Path, tmp: &Path) -> Result<u64> {
+    if let Some(parent) = tmp.parent() {
+        tokio::fs::create_dir_all(parent)
+            .await
+            .with_context(|| format!("creating parent dir {} for restore", parent.display()))?;
+    }
+    let copied = tokio::fs::copy(src, tmp)
+        .await
+        .with_context(|| format!("copying {} → {}", src.display(), tmp.display()))?;
+    preserve_staging_mtime(src, tmp).await;
+    Ok(copied)
+}
+
+/// Removes staged copies that will not be placed. Best effort.
+async fn discard_staged(staged: &[StagedWrite]) {
+    for w in staged {
+        let _ = tokio::fs::remove_file(&w.tmp).await;
+    }
+}
+
+/// Renames a staged copy over its destination. `index` is the file's place in
+/// the merge, for the test hook that fails one mid-way.
+async fn place_staged(index: usize, tmp: &Path, dest: &Path) -> std::io::Result<()> {
+    #[cfg(test)]
+    if FAIL_PLACE_AT.with(|f| f.get()) == Some(index) {
+        return Err(std::io::Error::other("injected placement failure"));
+    }
+    let _ = index;
+    tokio::fs::rename(tmp, dest).await
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Makes [`place_staged`] fail at this index, on this thread.
+    static FAIL_PLACE_AT: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
 }
 
 /// Re-stamp `dest` with `src`'s mtime after a copy. `fs::copy` writes the
@@ -9298,6 +9412,55 @@ mod tests {
                 format!("{w} gen {n} {c}").as_bytes(),
             );
         }
+    }
+
+    /// M-A: a write that fails after the moves (here the second rename)
+    /// undoes the merge: the stale generation and the local copies backed up
+    /// come back, what was placed comes out, and no staged copy is left. The
+    /// folder is byte-for-byte what it was, and nothing is in neither place.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_write_failing_mid_merge_leaves_the_folder_as_it_was() {
+        let tmp = tempfile::tempdir().unwrap();
+        let target = &tmp.path().join("save");
+        let source = &tmp.path().join("staging");
+        let backup = &tmp.path().join("conflicts");
+        valheim_generation(target, "Alpha", 8, &["0_0.chunk", "1_0.chunk"]);
+        write_file(&target.join("characters_local/Me.fch"), b"me");
+        valheim_generation(source, "Alpha", 9, &["0_0.chunk", "1_0.chunk", "2_0.chunk"]);
+        let before = files_under(target);
+
+        FAIL_PLACE_AT.with(|f| f.set(Some(3)));
+        let result = restore_files_into(
+            target,
+            source,
+            Some(backup),
+            Scope::default(),
+            &alpha_world(),
+        )
+        .await;
+        FAIL_PLACE_AT.with(|f| f.set(None));
+
+        let err = result.expect_err("the injected failure");
+        assert!(format!("{err:#}").contains("undone"), "{err:#}");
+        assert_eq!(files_under(target), before);
+        assert!(files_under(backup).is_empty(), "{:?}", files_under(backup));
+
+        // And with nothing failing the same merge lands whole.
+        let stats = restore_files_into(
+            target,
+            source,
+            Some(backup),
+            Scope::default(),
+            &alpha_world(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(stats.world_files_set_aside, 4, "{stats:?}");
+        let after = files_under(target);
+        for (rel, bytes) in files_under(source) {
+            assert_eq!(after.get(&rel), Some(&bytes), "{rel}");
+        }
+        assert!(!after.keys().any(|k| k.ends_with(".tmp")), "{after:?}");
     }
 
     fn alpha_world() -> Vec<String> {
