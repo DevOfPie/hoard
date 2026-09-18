@@ -158,6 +158,16 @@ pub async fn apply(
     // restore overwrites outside it is copied aside before writing.
     let outside = hoard_agent::savefilter::owner_share_include(shared);
 
+    // The share's world, owner and member alike, when `dest` is (or is about to
+    // become) this save's folder: a restore there leaves the world's folders as
+    // the version has them. A restore into some other folder is a copy and keeps
+    // whatever it finds.
+    let is_home = home.is_some() || row.as_ref().is_some_and(|s| s.local_path == dest);
+    let world: Vec<String> = match shared {
+        Some(s) if is_home => s.world().to_vec(),
+        _ => Vec::new(),
+    };
+
     // What is going to happen to the folder. Nothing is downloaded: it crosses
     // the version's manifest with what is on disk. Always shown, because
     // restoring overwrites and that deserves saying beforehand; with `--dry-run`
@@ -266,16 +276,20 @@ pub async fn apply(
         None
     };
 
-    // The share's world, owner and member alike, when `dest` is (or is about to
-    // become) this save's folder: a restore there leaves the world's folders as
-    // the version has them. A restore into some other folder is a copy and keeps
-    // whatever it finds.
-    let is_home = home.is_some() || row.as_ref().is_some_and(|s| s.local_path == dest);
-    let world: Vec<String> = match shared {
-        Some(s) if is_home => s.world().to_vec(),
-        _ => Vec::new(),
-    };
     let shields = gate.shields.clone();
+    let root = CliConfig::state_dir()?.join("conflicts");
+    // Moved before anything is written, into the tree the side copies above
+    // use, and kept there for the retention period. Without `--force` the
+    // folder has to be empty and nothing is there to move.
+    let world_set_aside = if force {
+        hoard_agent::restore::set_aside_before_restore(
+            &client, &save_id, version, &dest, &shields, &world, &root,
+        )
+        .await
+        .context("couldn't move the world's files this version does not have aside; nothing was restored")?
+    } else {
+        None
+    };
 
     let options = RestoreOptions {
         skip_verify: no_verify,
@@ -285,23 +299,18 @@ pub async fn apply(
         reuse_from: Some(dest.clone()),
         gate,
     };
-    let outcome = download_snapshot(&client, &save_id, version, &dest, options, on_progress)
-        .await
-        .context("restore failed")?;
-    // Moved, never deleted, into the tree the side copies above use. Without
-    // `--force` the folder was empty and nothing is there to move.
-    let world_set_aside = hoard_agent::restore::set_aside_stale_world(
-        &dest,
-        &outcome.version_files,
-        &shields,
-        &world,
-        &CliConfig::state_dir()?.join("conflicts"),
-        &save_id,
-    )
-    .await
-    .with_context(|| {
-        format!("restored v{version}, but couldn't move the world's files it does not have aside")
-    })?;
+    let outcome =
+        match download_snapshot(&client, &save_id, version, &dest, options, on_progress).await {
+            Ok(outcome) => outcome,
+            Err(e) => {
+                // The version has none of those paths, so they go back where they
+                // were whatever the download managed to write.
+                if let Some(moved) = &world_set_aside {
+                    hoard_agent::restore::put_back(&dest, moved).await;
+                }
+                return Err(e).context("restore failed");
+            }
+        };
 
     {
         let bar = pb.lock().unwrap();

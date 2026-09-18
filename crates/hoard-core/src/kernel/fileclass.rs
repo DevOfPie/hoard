@@ -246,6 +246,31 @@ pub fn in_mirrored_folder(include: &[String], rel_path: &str) -> bool {
     })
 }
 
+/// Does a version with these files hold the share's world as a folder, a file
+/// beneath one of its [`mirrored_folders`]? A Valheim world converted to 1.0
+/// does; a legacy flat world's version does not.
+pub fn holds_mirrored_folder<'a>(
+    include: &[String],
+    mut version_files: impl Iterator<Item = &'a str>,
+) -> bool {
+    version_files.any(|rel| in_mirrored_folder(include, rel))
+}
+
+/// Is `rel_path`, a local file the version being written does not carry,
+/// replaced by that version, and so moved aside rather than kept
+/// (HRD-Q-0027)? Anything beneath a folder the share names whole
+/// ([`in_mirrored_folder`]). And once the version holds the world as a folder
+/// (`version_holds_folder`, [`holds_mirrored_folder`]), the files the list
+/// names outright too: a converted world's legacy `<W>.db` and `<W>.fwl`, and
+/// their `.old` twins, would otherwise stay beside the folder and go up again
+/// with the next push. Wildcard entries (`<W>_backup_*`, the game's own
+/// backups) never are.
+pub fn replaced_by_version(include: &[String], rel_path: &str, version_holds_folder: bool) -> bool {
+    in_mirrored_folder(include, rel_path)
+        || (version_holds_folder
+            && mirrored_folders(include).any(|entry| entry.trim_end_matches('/') == rel_path))
+}
+
 /// Can any file under the directory `rel_dir` be [`included`]? The walk asks
 /// before descending, so a shared save's fingerprint never reads the folders
 /// its list cannot name. A pattern reaches beneath when its leading segments
@@ -748,6 +773,51 @@ mod tests {
             mirrored_folders(&list).collect::<Vec<_>>(),
             vec!["worlds_local/Alpha", "worlds_local/Alpha.db"]
         );
+    }
+
+    /// HRD-Q-0027, a converted world: once the version holds the folder, the
+    /// flat files the list names outright are replaced too; a backup the
+    /// wildcard names, a character and another world never are. A legacy
+    /// version replaces only what is beneath the folder.
+    #[test]
+    fn a_version_holding_the_folder_replaces_the_flat_files_too() {
+        let list = inc(&[
+            "worlds_local/Alpha",
+            "worlds_local/Alpha.db",
+            "worlds_local/Alpha.fwl",
+            "worlds_local/Alpha.db.old",
+            "worlds_local/Alpha_backup_*",
+        ]);
+        assert!(holds_mirrored_folder(
+            &list,
+            ["characters_local/Me.fch", "worlds_local/Alpha/_main.2.db2"].into_iter()
+        ));
+        assert!(!holds_mirrored_folder(
+            &list,
+            ["worlds_local/Alpha.db", "worlds_local/Alpha.fwl"].into_iter()
+        ));
+        for flat in [
+            "worlds_local/Alpha.db",
+            "worlds_local/Alpha.fwl",
+            "worlds_local/Alpha.db.old",
+        ] {
+            assert!(replaced_by_version(&list, flat, true), "{flat}");
+            assert!(!replaced_by_version(&list, flat, false), "{flat}");
+        }
+        assert!(replaced_by_version(
+            &list,
+            "worlds_local/Alpha/_main.1.db2",
+            false
+        ));
+        for kept in [
+            "worlds_local/Alpha_backup_auto-1.db",
+            "worlds_local/Alpha_backup_auto-1/_main.1.db2",
+            "worlds_local/Alpha2.db",
+            "characters_local/Me.fch",
+        ] {
+            assert!(!replaced_by_version(&list, kept, true), "{kept}");
+        }
+        assert!(!replaced_by_version(&[], "worlds_local/Alpha.db", true));
     }
 
     /// `?` is one character of one segment, like everywhere else in the module.

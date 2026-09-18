@@ -530,13 +530,38 @@ pub async fn restore_snapshot(
         .map_err(pretty_error)?;
     }
 
-    // 2) Download + verify + extract. We pass `force = true` because the
+    // 2) The folder is this save's (or becomes it below), so the shared world's
+    //    folders end as the version has them: what it does not have is moved
+    //    into the conflicts tree before anything is written, and kept there for
+    //    the retention period (HRD-Q-0027). A move that fails stops the restore
+    //    with the folder as it was.
+    let conflicts = CliConfig::state_dir()
+        .map_err(|e| e.to_string())?
+        .join("conflicts");
+    let world_set_aside = restore::set_aside_before_restore(
+        &client,
+        &save_id,
+        version,
+        &local_path,
+        &shields,
+        shared.as_ref().map_or(&[][..], |s| s.world()),
+        &conflicts,
+    )
+    .await
+    .map_err(|e| {
+        format!(
+            "Couldn't move the world's files version {version} doesn't have aside, so nothing was restored: {}",
+            pretty_error(e)
+        )
+    })?;
+
+    // 3) Download + verify + extract. We pass `force = true` because the
     //    user has explicitly confirmed they want to overwrite; refusing on
     //    "destination not empty" here would defeat the whole point.
     let app_for_dl = app.clone();
     let save_id_for_dl = save_id.clone();
     emit_phase(&app, &save_id, version, RestorePhase::Downloading, 0, 0);
-    let outcome = restore::download_snapshot(
+    let downloaded = restore::download_snapshot(
         &client,
         &save_id,
         version,
@@ -563,30 +588,17 @@ pub async fn restore_snapshot(
             );
         },
     )
-    .await
-    .map_err(pretty_error)?;
-
-    // 3) The folder is this save's (or becomes it below), so the shared world's
-    //    folders end as the version has them: what it does not have is moved
-    //    into the conflicts tree, never deleted (HRD-Q-0027).
-    let conflicts = CliConfig::state_dir()
-        .map_err(|e| e.to_string())?
-        .join("conflicts");
-    let world_set_aside = restore::set_aside_stale_world(
-        &local_path,
-        &outcome.version_files,
-        &shields,
-        shared.as_ref().map_or(&[][..], |s| s.world()),
-        &conflicts,
-        &save_id,
-    )
-    .await
-    .map_err(|e| {
-        format!(
-            "Restored version {version}, but couldn't move the world's files it doesn't have aside: {}",
-            pretty_error(e)
-        )
-    })?;
+    .await;
+    let outcome = match downloaded {
+        Ok(outcome) => outcome,
+        Err(e) => {
+            // The version has none of those paths: they go back where they were.
+            if let Some(moved) = &world_set_aside {
+                restore::put_back(&local_path, moved).await;
+            }
+            return Err(pretty_error(e));
+        }
+    };
 
     emit_phase(&app, &save_id, version, RestorePhase::Done, 0, 0);
 
