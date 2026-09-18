@@ -9616,6 +9616,97 @@ mod tests {
         assert!(seen.lock().unwrap().is_empty(), "the server was not asked");
     }
 
+    /// H-1: the world was the synced one when the push was decided, and a
+    /// chunk the game rewrote in place (same size) since, before the attempt
+    /// walked, while the unreadable file stayed locked. The attempt's own walk
+    /// decides: the world changed, so nothing is carried and the push holds.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_world_that_changes_before_the_attempt_walks_is_held_not_carried() {
+        use sha2::Digest;
+        use std::os::unix::fs::PermissionsExt;
+        let lock = |p: &Path, mode: u32| {
+            std::fs::set_permissions(p, std::fs::Permissions::from_mode(mode)).unwrap()
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        owner_folder(root);
+        let alpha = root.join("worlds_local/Alpha.db");
+        let mut slot = test_slot(owner_save(root));
+        slot.known_version = Some(3);
+        test_sync_now(&mut slot);
+        write_file(&root.join("characters_local/Me.fch"), b"me, later");
+        lock(&alpha, 0o000);
+        if std::fs::read(&alpha).is_ok() {
+            lock(&alpha, 0o644);
+            return;
+        }
+        let sha = hex::encode(sha2::Sha256::digest(b"alpha"));
+        let detail: &'static str = Box::leak(
+            format!(
+                r#"{{"id":"s3","version_num":3,"total_size_bytes":7,"file_count":2,"is_pinned":false,"created_at":"2026-09-14T09:14:11Z","files":[{{"relative_path":"characters_local/Me.fch","size_bytes":2,"sha256":"{}"}},{{"relative_path":"worlds_local/Alpha.db","size_bytes":5,"sha256":"{sha}"}}]}}"#,
+                hex::encode(sha2::Sha256::digest(b"me"))
+            )
+            .into_boxed_str(),
+        );
+        // Between the push's walk and the attempt's: the same size, new bytes.
+        let hook_alpha = alpha.clone();
+        let fired = std::rc::Rc::new(std::cell::Cell::new(false));
+        let fired_in = fired.clone();
+        crate::backup::UPLOAD_HOOK.with(|h| {
+            *h.borrow_mut() = Some(Box::new(move |phase: &str| {
+                if phase != "walk" || fired_in.replace(true) {
+                    return;
+                }
+                let set = |mode| {
+                    std::fs::set_permissions(&hook_alpha, std::fs::Permissions::from_mode(mode))
+                        .unwrap()
+                };
+                set(0o644);
+                std::fs::write(&hook_alpha, b"ALPHA").unwrap();
+                filetime::set_file_mtime(
+                    &hook_alpha,
+                    filetime::FileTime::from_unix_time(2_000_000_000, 0),
+                )
+                .unwrap();
+                set(0o000);
+            }))
+        });
+        let (url, seen) =
+            refusing_server(vec![(200, detail), (200, INIT_V5), (201, COMMIT_V5)]).await;
+        let (events_tx, _events_rx) = mpsc::channel(64);
+        let (done_tx, mut done_rx) = mpsc::channel(8);
+        let (cmd_tx, mut cmd_rx) = mpsc::channel(8);
+        run_backup_with_retry(
+            ApiClient::new(&url, "fake").unwrap(),
+            slot.save.clone(),
+            None,
+            slot.known_version,
+            None,
+            slot.synced_world_fingerprint,
+            None,
+            VersionOrigin::Automatic,
+            false,
+            events_tx,
+            done_tx,
+            cmd_tx,
+            0,
+            false,
+            None,
+            14,
+        )
+        .await;
+        crate::backup::UPLOAD_HOOK.with(|h| *h.borrow_mut() = None);
+        lock(&alpha, 0o644);
+        assert!(fired.get(), "the hook ran");
+        assert!(done_rx.try_recv().is_err(), "nothing landed");
+        let cmd = cmd_rx.try_recv().ok();
+        assert!(
+            matches!(&cmd, Some(AgentCommand::ParkBackupPartialWorld { path, .. }) if path == "worlds_local/Alpha.db"),
+            "held for the world file"
+        );
+        assert!(seen.lock().unwrap().is_empty(), "nothing was carried");
+    }
+
     const INIT_V5: &str = r#"{"upload_id":"u1","version_num":5,"missing":[],"missing_bytes":0}"#;
     const COMMIT_V5: &str = r#"{"id":"s5","version_num":5,"parent_version":4,"total_size_bytes":30,"file_count":3,"is_pinned":false,"created_at":"2026-09-14T09:14:11Z"}"#;
 

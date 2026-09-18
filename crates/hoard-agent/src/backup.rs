@@ -385,9 +385,9 @@ fn refuse_trimmed_world(
 /// needed either.
 ///
 /// Carried only when all of this holds, and refused otherwise:
-/// - the caller vouches that the folder's world is `world_from`'s (the cheap
-///   signature, paths, sizes and mtimes, equals the synced one; bytes that
-///   cannot be read cannot be compared);
+/// - the attempt's own walk, the one whose files go up, finds the folder's
+///   world is `world_from`'s (the cheap signature, paths, sizes and mtimes,
+///   equals the synced one; bytes that cannot be read cannot be compared);
 /// - the server speaks the content-addressed protocol (self-hosted 1.1.3 and
 ///   later: the multipart paths need the bytes, and Cloud has no shares);
 /// - `world_from` lists the file with a sha and the size the walk saw.
@@ -466,6 +466,26 @@ async fn carry_unreadable_world(
         "upload: the world is unchanged but some of its files can't be read; carrying the synced version's entries for them"
     );
     Ok((carried, rest))
+}
+
+/// The shared world as last synced: the fingerprint of its signature
+/// (`crate::agent::fingerprint_of` of [`world_signature`]) and the version it
+/// is. An upload whose walk finds the world still that one, file for file, may
+/// carry the version's entries for world files it cannot read (M-2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SyncedWorld {
+    pub fingerprint: u64,
+    pub version: i64,
+}
+
+impl SyncedWorld {
+    /// The version to carry from when `files` (a walk) hold this world, paths,
+    /// sizes and mtimes; `None` when the world changed or there is none.
+    fn version_for(&self, files: &[UploadFile], world: &[String]) -> Option<i64> {
+        (!world.is_empty()
+            && crate::agent::fingerprint_of(&world_signature(files, world)) == self.fingerprint)
+            .then_some(self.version)
+    }
 }
 
 /// One file enumerated from the source directory.
@@ -1055,7 +1075,7 @@ pub async fn upload_directory<F>(
     source: &Path,
     base_version: Option<i64>,
     world_base_version: Option<i64>,
-    world_from: Option<i64>,
+    synced_world: Option<SyncedWorld>,
     head: Option<&ServerHead>,
     origin: VersionOrigin,
     progress: F,
@@ -1082,7 +1102,7 @@ where
             source,
             base_version,
             world_base_version,
-            world_from,
+            synced_world,
             head,
             origin,
             &progress,
@@ -1119,11 +1139,11 @@ async fn upload_directory_attempt<F>(
     // The version the folder's shared world came from, sent only when it is
     // not the base (HRD-D-0019). Self-hosted only; Cloud has no shares.
     world_base_version: Option<i64>,
-    // The version whose world the folder's still is, file for file (its cheap
-    // signature is the one synced with that version), when the caller knows it
-    // is: a world file whose bytes cannot be read takes that version's entry
-    // instead of holding the push ([`carry_unreadable_world`], M-2).
-    world_from: Option<i64>,
+    // The world as last synced, when known: if THIS attempt's walk finds the
+    // folder's world still equal to it, file for file, a world file whose bytes
+    // cannot be read takes that version's entry instead of holding the push
+    // ([`carry_unreadable_world`], M-2).
+    synced_world: Option<SyncedWorld>,
     head: Option<&ServerHead>,
     origin: VersionOrigin,
     progress: F,
@@ -1154,6 +1174,10 @@ where
     if files.is_empty() {
         return Err(EmptySource { path: source }.into());
     }
+    // Decided from this walk, the one whose files go up, and again on every
+    // re-walk: a world that changed since the caller's walk (a game rewriting
+    // chunks while one is locked) is not carried, it is held (H-1).
+    let world_from = synced_world.and_then(|synced| synced.version_for(&files, world));
     // A file that will not be read leaves the list here, at the ONE point all four
     // upload paths (cloud, CAS, pack, multipart) pass through, so none of them
     // meets it mid-transfer. Whatever is left out travels in the `UploadOutcome`
@@ -2482,12 +2506,17 @@ where
     // its files out.
     let world_list = world;
     let world = world_signature(&files, world);
-    // The folder's world is the synced one, file for file (paths, sizes and
-    // mtimes): its version is where an unreadable world file's entry comes
-    // from, the world base when the world was carried forward, else the base.
-    let world_from = synced_world
-        .filter(|synced| !world_list.is_empty() && crate::agent::fingerprint_of(&world) == *synced)
-        .and(world_base_version.or(base_version));
+    // The world as synced, and the version an unreadable world file's entry
+    // comes from: the world base when the world was carried forward, else the
+    // base. Whether the folder's world still IS it is decided by each upload
+    // attempt over its own walk ([`SyncedWorld::version_for`]).
+    let synced_world = synced_world
+        .filter(|_| !world_list.is_empty())
+        .zip(world_base_version.or(base_version))
+        .map(|(fingerprint, version)| SyncedWorld {
+            fingerprint,
+            version,
+        });
     // `is_deliberate` rather than `== Manual`: the safety net taken before a
     // restore counts too, and skipping it there is worse, since it is the copy that
     // lets a wrong restore be undone.
@@ -2521,7 +2550,7 @@ where
         &canonical,
         base_version,
         world_base_version,
-        world_from,
+        synced_world,
         head,
         origin,
         progress,
