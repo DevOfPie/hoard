@@ -983,6 +983,12 @@ pub(crate) struct SaveSlot {
     /// ([`StillQuiet`]). Written wherever the process poll moves
     /// `is_running`.
     running_now: Arc<std::sync::atomic::AtomicBool>,
+    /// Watcher hits on the save's folder so far ([`mark_fs_hit`]), readable
+    /// from a restore task under way: a pull snapshots it at launch and
+    /// defers the merge if it moved ([`still_quiet`]). The game-running check
+    /// cannot see a game the process poll missed, and on Linux no file lock
+    /// shows it either; its writes do.
+    fs_writes: Arc<std::sync::atomic::AtomicU64>,
     /// The session in progress started on a weak signal alone (folder-to-process
     /// correlation) and no strong signal has corroborated it since. If it also ends
     /// without a single write to the folder, it was a phantom session: the
@@ -2257,11 +2263,20 @@ fn execute_backup(
 /// time and a game can start meanwhile: this is asked again right before the
 /// merge. Running (the process poll's word, as it stands then), or a save file
 /// held open, and the pull waits.
+///
+/// And a write to the save's folder after the pull started means somebody is
+/// writing it: a game the poll does not see (undetected on Linux, where
+/// locks never show), and the merge waits for the folder to go quiet (L-C).
 pub(crate) fn still_quiet(slot: &SaveSlot) -> StillQuiet {
+    use std::sync::atomic::Ordering;
     let running = slot.running_now.clone();
+    let writes = slot.fs_writes.clone();
+    let at_start = writes.load(Ordering::Relaxed);
     let path = slot.save.local_path.clone();
     Arc::new(move || {
-        !running.load(std::sync::atomic::Ordering::Relaxed) && !crate::locks::any_file_locked(&path)
+        !running.load(Ordering::Relaxed)
+            && writes.load(Ordering::Relaxed) == at_start
+            && !crate::locks::any_file_locked(&path)
     })
 }
 
@@ -3402,6 +3417,7 @@ fn handle_add(
         manual_requested: false,
         is_running: false,
         running_now: Default::default(),
+        fs_writes: Default::default(),
         weak_session: false,
         last_running_seen: None,
         has_pending: false,
@@ -3512,6 +3528,7 @@ fn handle_reseat(
     slot.is_running = old.is_running;
     slot.last_running_seen = old.last_running_seen;
     slot.running_now = old.running_now;
+    slot.fs_writes = old.fs_writes;
     mark_pending_if_diverged(slot);
 }
 
@@ -4998,6 +5015,8 @@ fn mark_fs_hit(slot: &mut SaveSlot, now: OffsetDateTime) {
     slot.last_fs_event_at = Some(now);
     slot.needs_l1 = true;
     slot.observed_world_fingerprint = None;
+    slot.fs_writes
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     if kernel::reconcile::retry_held_world(&mut slot.world_held, &mut slot.next_backup_at) {
         tracing::info!(save_id = %slot.save.save_id, "agent: the save changed while its world push was held; trying again");
     }
@@ -7005,6 +7024,7 @@ pub(crate) fn test_slot(save: WatchedSave) -> SaveSlot {
         burst_backups: 0,
         is_running: false,
         running_now: Default::default(),
+        fs_writes: Default::default(),
         weak_session: false,
         last_running_seen: None,
         has_pending: false,
@@ -8741,6 +8761,22 @@ mod tests {
     fn owner_folder(root: &Path) {
         write_file(&root.join("worlds_local/Alpha.db"), b"alpha");
         write_file(&root.join("characters_local/Me.fch"), b"me");
+    }
+
+    /// L-C: a write to the save's folder after the pull started (a game the
+    /// poll does not see) defers the merge; one before it does not.
+    #[test]
+    fn a_write_after_the_pull_started_defers_the_merge() {
+        let dir = tempfile::tempdir().unwrap();
+        owner_folder(dir.path());
+        let mut slot = test_slot(owner_save(dir.path()));
+        let now = OffsetDateTime::now_utc();
+        mark_fs_hit(&mut slot, now);
+        let quiet = still_quiet(&slot);
+        assert!(quiet(), "a write before the pull is not a reason");
+        mark_fs_hit(&mut slot, now);
+        assert!(!quiet(), "a write during the download defers the merge");
+        assert!(still_quiet(&slot)(), "the next pull starts from here");
     }
 
     /// L-B: a reseat (a share, a settings change) keeps the process poll's
