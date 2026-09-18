@@ -514,7 +514,7 @@ pub async fn restore_snapshot(
                 },
             )
             .await
-            .map_err(pretty_error)?;
+            .map_err(safety_copy_error)?;
             safety_version = Some(outcome.snapshot.version_num);
         }
     }
@@ -629,6 +629,25 @@ pub async fn restore_snapshot(
             .as_ref()
             .map(|d| d.to_string_lossy().into_owned()),
     })
+}
+
+/// Sentinel prefix of the error a restore returns when its safety copy is
+/// held because a file of the shared world can't be read
+/// ([`backup::PartialWorld`]): `SAFETY_COPY_HELD\n<path>\n<reason>`. The UI
+/// offers the restore again without the safety copy (`backup_first: false`),
+/// which is the user's call: a copy without that file is never made (M-D).
+pub const SAFETY_COPY_HELD: &str = "SAFETY_COPY_HELD";
+
+/// The safety copy's error for the UI: the sentinel for a held world, the
+/// usual text for anything else.
+fn safety_copy_error(e: anyhow::Error) -> String {
+    match e
+        .chain()
+        .find_map(|c| c.downcast_ref::<backup::PartialWorld>())
+    {
+        Some(p) => format!("{SAFETY_COPY_HELD}\n{}\n{}", p.first, p.reason),
+        None => pretty_error(e),
+    }
 }
 
 fn emit_phase(
@@ -813,4 +832,28 @@ fn parse_log_line(raw: &str) -> LogLine {
 pub fn logs_path() -> Result<String, String> {
     let dir = CliConfig::logs_dir().map_err(|e| e.to_string())?;
     Ok(dir.join("agent.log").to_string_lossy().into_owned())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// M-D: a safety copy held because a world file can't be read comes back
+    /// as the sentinel with the file and why, which the UI turns into "restore
+    /// without the safety copy?", not as "holding the push: ...".
+    #[test]
+    fn a_held_safety_copy_is_its_own_error() {
+        let held = anyhow::Error::new(backup::PartialWorld {
+            count: 1,
+            first: "worlds_local/Alpha/0_0.chunk".into(),
+            reason: "Permission denied".into(),
+        })
+        .context("uploading the safety copy");
+        assert_eq!(
+            safety_copy_error(held),
+            "SAFETY_COPY_HELD\nworlds_local/Alpha/0_0.chunk\nPermission denied"
+        );
+        let other = safety_copy_error(anyhow::anyhow!("network down"));
+        assert!(!other.starts_with(SAFETY_COPY_HELD), "{other}");
+    }
 }

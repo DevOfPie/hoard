@@ -48,7 +48,7 @@
   import Input from "../lib/components/Input.svelte";
   import Cover from "../lib/components/Cover.svelte";
   import * as api from "../lib/api";
-  import { NEEDS_DESTINATION } from "../lib/api";
+  import { NEEDS_DESTINATION, SAFETY_COPY_HELD } from "../lib/api";
   import type {
     SnapshotEntry,
     SnapshotDetail,
@@ -198,6 +198,14 @@
   // Pending-destination modal: shown when restore_snapshot returns
   // NEEDS_DESTINATION because there's no local mapping for this save yet.
   let pickingDestination = $state<SnapshotEntry | null>(null);
+  // The safety copy was held: a file of the shared world can't be read. The
+  // user may restore without it; nothing else changes.
+  let safetyHeld = $state<{
+    target: SnapshotEntry;
+    destinationOverride: string | null;
+    path: string;
+    error: string;
+  } | null>(null);
 
   let togglingPause = $state(false);
   let backingUp = $state(false);
@@ -416,6 +424,7 @@
   async function performRestore(
     target: SnapshotEntry,
     destinationOverride: string | null,
+    withoutSafety = false,
   ) {
     restoring = true;
     restoreProgress = null;
@@ -423,7 +432,7 @@
       const out = await api.restoreSnapshot({
         save_id: saveId,
         version: target.version_num,
-        backup_first: backupFirst,
+        backup_first: backupFirst && !withoutSafety,
         destination_override: destinationOverride,
         allow_config: allowConfig,
       });
@@ -465,6 +474,10 @@
       // the user.
       if (msg === NEEDS_DESTINATION) {
         pickingDestination = target;
+        restoreTarget = null;
+      } else if (msg.startsWith(`${SAFETY_COPY_HELD}\n`)) {
+        const [, path = "", error = ""] = msg.split("\n");
+        safetyHeld = { target, destinationOverride, path, error };
         restoreTarget = null;
       } else {
         toastError(msg);
@@ -1459,6 +1472,43 @@
     >
       <FolderOpen size={14} />
       {$_("history.browse")}
+    </Button>
+  {/snippet}
+</Modal>
+
+<!-- The safety copy was held: offer the restore without it. -->
+<Modal
+  open={!!safetyHeld}
+  title={$_("history.safety_held_title")}
+  dismissible={!restoring}
+  onClose={() => {
+    if (!restoring) safetyHeld = null;
+  }}
+>
+  <p class="text-sm text-zinc-300" title={safetyHeld?.error ?? ""}>
+    {$_("history.safety_held_body", {
+      values: { path: safetyHeld?.path ?? "" },
+    })}
+  </p>
+  {#snippet footer()}
+    <Button
+      variant="secondary"
+      onclick={() => (safetyHeld = null)}
+      disabled={restoring}
+    >
+      {$_("common.cancel")}
+    </Button>
+    <Button
+      variant="primary"
+      loading={restoring}
+      onclick={async () => {
+        if (!safetyHeld) return;
+        const held = safetyHeld;
+        await performRestore(held.target, held.destinationOverride, true);
+        safetyHeld = null;
+      }}
+    >
+      {$_("history.restore_without_safety")}
     </Button>
   {/snippet}
 </Modal>

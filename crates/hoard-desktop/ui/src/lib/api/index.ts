@@ -1385,6 +1385,9 @@ export function restoreSnapshot(args: {
  *  for this save, prompt the user to pick one and retry with
  *  `destination_override`". */
 export const NEEDS_DESTINATION = "NEEDS_DESTINATION";
+/** Prefix of the restore error when the safety copy is held because a file of
+ *  the shared world can't be read: `SAFETY_COPY_HELD\n<path>\n<reason>`. */
+export const SAFETY_COPY_HELD = "SAFETY_COPY_HELD";
 
 export function setSavePaused(saveId: string, paused: boolean): Promise<void> {
   return invoke<void>("set_save_paused", { saveId, paused });
