@@ -190,7 +190,8 @@ enum Commands {
         #[arg(long)]
         group: String,
         /// The world to share, for a game that keeps several in one folder
-        /// (Valheim: the name of `worlds_local/<name>.fwl`)
+        /// (Valheim: `<name>` of the `worlds_local/<name>/` folder, or of
+        /// `worlds_local/<name>.fwl` before 1.0)
         #[arg(long)]
         world: Option<String>,
     },

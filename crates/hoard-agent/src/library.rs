@@ -4337,6 +4337,7 @@ mod sharing_tests {
         assert_eq!(
             include_for_share("valheim", Some("Alpha"), None).unwrap(),
             vec![
+                "worlds_local/Alpha",
                 "worlds_local/Alpha.db",
                 "worlds_local/Alpha.fwl",
                 "worlds_local/Alpha.db.old",
