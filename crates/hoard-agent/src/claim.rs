@@ -500,13 +500,21 @@ fn catch_up(slot: &mut SaveSlot, lease: Option<&LeaseHandle>) {
 /// still have it open, and a later pass sets the writes aside once the folder
 /// is quiet.
 ///
-/// A world whose push is held for a file that cannot be read counts as the
-/// owner's does: once somebody else hosts, its writes can never go up, and
-/// they would hold the pull back for as long as the file stays unreadable.
+/// A world whose push is held for a file that cannot be read goes further:
+/// once the head moved past the version it came from, it is set aside whatever
+/// the lease reads, `Other` or `Free` (somebody hosted, pushed and gave the
+/// world back), and parked or on its ladder. Its writes can never go up over
+/// that head, and waiting for its own next attempt to be refused as stale
+/// held the pull for minutes, and for good once parked, since a parked push
+/// makes no attempt of its own. Never under this machine's own lease.
 fn set_aside_behind(slot: &mut SaveSlot, now: Instant) -> bool {
     let hosted_elsewhere = (slot.save.owns_whole_folder() || slot.world_held.active())
         && slot.lease == LeaseObs::Other;
-    if (slot.stale_base.is_none() && !hosted_elsewhere)
+    let held_behind = slot.world_held.active()
+        && slot
+            .cloud_head
+            .is_some_and(|head| slot.known_version.is_none_or(|known| head > known));
+    if (slot.stale_base.is_none() && !hosted_elsewhere && !held_behind)
         || slot.session.is_some()
         || !slot.has_pending
         || slot.is_running
@@ -2221,6 +2229,114 @@ mod tests {
                 let slot = &s["w1"];
                 assert_eq!(slot.world_held, kernel::WorldHeld::default());
             }
+        }
+    }
+
+    /// The third end-to-end run: a member's world push is held (and parks);
+    /// the owner hosts, pushes and gives the world back. The member reads the
+    /// lease `Free` and the head past its version: its held writes go to the
+    /// side copy and the head comes down now, not at its own next attempt, and
+    /// not never, which is when a parked push attempts. Not under its own
+    /// lease, and not for a world that is not held.
+    #[tokio::test(start_paused = true)]
+    async fn a_held_world_behind_the_head_is_set_aside_and_pulled_whatever_the_lease() {
+        let now = Instant::now();
+        let tmp = tempfile::tempdir().unwrap();
+        let folder = tmp.path().join("save");
+        std::fs::create_dir_all(folder.join("worlds_local")).unwrap();
+        std::fs::write(folder.join("worlds_local/Alpha.db"), b"mine").unwrap();
+        let member = || {
+            let mut save = world("w1", "valheim");
+            save.local_path = folder.clone();
+            save.include = vec!["worlds_local/Alpha.db".into()];
+            if let Some(shared) = save.shared.as_mut() {
+                shared.include = save.include.clone();
+            }
+            save
+        };
+        for parked in [true, false] {
+            let (tx, mut rx) = mpsc::channel(16);
+            let (lease, mut seen) = LeaseHandle::probe();
+            let mut s = slots(vec![member()]);
+            let slot = s.get_mut("w1").unwrap();
+            slot.has_pending = true;
+            slot.lease = LeaseObs::Mine;
+            slot.cloud_head = Some(3);
+            slot.world_held = kernel::WorldHeld {
+                consecutive: if parked {
+                    kernel::reconcile::WORLD_HELD_GIVE_UP_AFTER
+                } else {
+                    2
+                },
+                needs_attention: parked,
+                retry_at: (!parked)
+                    .then(|| OffsetDateTime::now_utc() + time::Duration::minutes(5)),
+                by_change: false,
+            };
+            // Held under its own lease, on the head: nothing to set aside.
+            assert_eq!(
+                on_reconciled(slot, now, &tx, Some(&lease)),
+                Followup::Nothing,
+                "parked={parked}"
+            );
+            if parked {
+                // Parked: the lease goes back.
+                tokio::task::yield_now().await;
+                assert_eq!(seen.try_recv().unwrap(), "release w1");
+                on_lease(slot, LeaseObs::Free, None, false, &tx, Some(&lease));
+            } else {
+                // On its ladder the lease stays (H-B-1); the owner forces it.
+                on_lease(slot, LeaseObs::Other, Some("owner".into()), false, &tx, Some(&lease));
+            }
+            // The owner hosts, pushes v4 and gives the world back.
+            on_lease(slot, LeaseObs::Other, Some("owner".into()), false, &tx, Some(&lease));
+            on_lease(slot, LeaseObs::Free, None, false, &tx, Some(&lease));
+            slot.cloud_head = Some(4);
+            assert_eq!(
+                on_reconciled(slot, now, &tx, Some(&lease)),
+                Followup::SideCopy,
+                "parked={parked}: the held writes wait on nothing"
+            );
+            let dir = side_copy_dir(
+                &tmp.path().join("conflicts"),
+                if parked { "p" } else { "l" },
+                OffsetDateTime::UNIX_EPOCH,
+            );
+            let moved = move_world_aside(&s["w1"].save, &dir).await.unwrap();
+            assert_eq!(moved, 1);
+            drain(&mut rx);
+            on_side_copied(&mut s, "w1", moved, now, &tx);
+            let slot = &s["w1"];
+            assert!(slot.pull_pending, "parked={parked}: the head comes down");
+            assert!(!slot.has_pending);
+            assert_eq!(slot.world_held, kernel::WorldHeld::default());
+            assert_eq!(
+                std::fs::read(dir.join("worlds_local/Alpha.db")).unwrap(),
+                b"mine"
+            );
+            std::fs::write(folder.join("worlds_local/Alpha.db"), b"mine").unwrap();
+        }
+
+        // Not under its own lease, and not a world that is not held.
+        for case in ["own lease", "not held"] {
+            let (tx, _rx) = mpsc::channel(16);
+            let mut s = slots(vec![member()]);
+            let slot = s.get_mut("w1").unwrap();
+            slot.has_pending = true;
+            slot.cloud_head = Some(4);
+            if case == "own lease" {
+                slot.lease = LeaseObs::Mine;
+                slot.world_held.consecutive = 2;
+                slot.world_held.retry_at =
+                    Some(OffsetDateTime::now_utc() + time::Duration::minutes(5));
+            } else {
+                slot.lease = LeaseObs::Free;
+            }
+            assert_eq!(
+                on_reconciled(slot, now, &tx, None),
+                Followup::Nothing,
+                "{case}"
+            );
         }
     }
 

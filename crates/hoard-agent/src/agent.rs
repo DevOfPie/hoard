@@ -1225,6 +1225,10 @@ pub(crate) struct SaveSlot {
     /// ahead of the folder. The head comes down first, and once `known_version`
     /// moves past it a claim asks again (`claim::catch_up`).
     pub(crate) stale_base: Option<i64>,
+    /// The server's head for this save as of the last reconcile pass
+    /// (`Observation::cloud_version`), for the claim flow: a held world behind
+    /// it is set aside before the pull (`claim::set_aside_behind`).
+    pub(crate) cloud_head: Option<i64>,
     /// `WorldHostedElsewhere` has gone out for the current hold. Cleared when
     /// the lease stops being somebody else's.
     pub(crate) hosted_elsewhere_notified: bool,
@@ -1846,6 +1850,7 @@ fn reconcile_all(
         let obs = observe_slot(slot, cloud);
         let state = state_from_slot(slot, config, now);
         let (next, decisions) = kernel::reconcile::reconcile(&state, &obs, world);
+        slot.cloud_head = obs.cloud_version;
         // Read before the state is moved into the slot: it is when the copy can
         // next go out, and the shell owes the user that number (see the
         // `Hold` arm below).
@@ -3458,6 +3463,7 @@ fn handle_add(
         lease_requested: false,
         release_requested: false,
         stale_base: None,
+        cloud_head: None,
         hosted_elsewhere_notified: false,
         session: None,
     };
@@ -7080,6 +7086,7 @@ pub(crate) fn test_slot(save: WatchedSave) -> SaveSlot {
         lease_requested: false,
         release_requested: false,
         stale_base: None,
+        cloud_head: None,
         hosted_elsewhere_notified: false,
         session: None,
     }
