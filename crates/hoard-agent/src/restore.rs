@@ -230,67 +230,13 @@ fn extraction_root(dest: &Path, snapshot_names: &[&str]) -> PathBuf {
     dest.to_path_buf()
 }
 
-/// Where [`keep_outside_share`] put the files it copied, or
-/// [`set_aside_stale_world`] the ones it moved.
+/// Where [`set_aside_stale_world`] put the files it moved.
 #[derive(Debug, Clone)]
 pub struct SetAside {
     pub dir: PathBuf,
     pub files: usize,
     /// The files, relative to the save's folder and to `dir` alike.
     pub paths: Vec<String>,
-}
-
-/// Before an owner's restore of a shared save writes: copies the files on disk
-/// outside the share's list that it would overwrite into a side-copy folder
-/// under `root`, the tree a session's side copies use, so one retention sweep
-/// covers both.
-///
-/// A file outside the share written since the owner's last upload (a
-/// character played while a member hosted, say) and overwritten by an older
-/// version would otherwise be in no version and in no copy. `share_include`
-/// comes from [`crate::savefilter::owner_share_include`]; empty, and `None`
-/// back, for any other restore. Files are copied, never moved: the restore decides what
-/// changes in the folder. `None` when nothing needed keeping.
-pub async fn keep_outside_share(
-    client: &ApiClient,
-    save_id: &str,
-    version: i64,
-    dest: &Path,
-    gate: &RestoreGate,
-    share_include: &[String],
-    root: &Path,
-) -> Result<Option<SetAside>> {
-    if share_include.is_empty() {
-        return Ok(None);
-    }
-    let remote = crate::preview::remote_files(client, save_id, version).await?;
-    let files = crate::preview::overwritten_outside_share(&remote, dest, gate, share_include).await;
-    if files.is_empty() {
-        return Ok(None);
-    }
-    let dir = crate::claim::side_copy_dir(root, save_id, time::OffsetDateTime::now_utc());
-    copy_aside(dest, &files, &dir).await?;
-    Ok(Some(SetAside {
-        dir,
-        files: files.len(),
-        paths: files,
-    }))
-}
-
-/// Copies each of `files` (relative to `dest`) to the same path under `dir`.
-async fn copy_aside(dest: &Path, files: &[String], dir: &Path) -> Result<()> {
-    for rel in files {
-        let to = dir.join(rel);
-        if let Some(parent) = to.parent() {
-            tokio::fs::create_dir_all(parent)
-                .await
-                .with_context(|| format!("creating {}", parent.display()))?;
-        }
-        tokio::fs::copy(dest.join(rel), &to)
-            .await
-            .with_context(|| format!("copying {rel} aside to {}", to.display()))?;
-    }
-    Ok(())
 }
 
 /// The files in a shared save's own folder `dest` that a version made of
@@ -1761,12 +1707,11 @@ mod tests {
     }
 
     /// The owner shared world One and kept playing a character, not yet in a
-    /// version. Restoring an older version writes the
-    /// character over: its current bytes land in the side-copy folder first,
-    /// and the world's files, which later versions hold, and a file the
-    /// version brings back unchanged, are not copied.
+    /// version. Restoring an older version writes the character over, which
+    /// the preview announces; the world's files, which later versions hold,
+    /// and a file the version brings back unchanged, are not named.
     #[tokio::test]
-    async fn an_owners_restore_keeps_what_it_overwrites_outside_the_share() {
+    async fn an_owners_restore_names_what_it_overwrites_outside_the_share() {
         let tmp = tempfile::tempdir().unwrap();
         let save = tmp.path().join("save");
         std::fs::create_dir_all(save.join("worlds_local")).unwrap();
@@ -1802,17 +1747,6 @@ mod tests {
 
         let files = crate::preview::overwritten_outside_share(&remote, &save, &gate, &share).await;
         assert_eq!(files, vec!["characters_local/Bob.fch".to_string()]);
-
-        let dir = tmp.path().join("conflicts").join("save-1").join("ts");
-        copy_aside(&save, &files, &dir).await.unwrap();
-        assert_eq!(
-            std::fs::read(dir.join("characters_local/Bob.fch")).unwrap(),
-            b"bob, level 40"
-        );
-        assert!(!dir.join("worlds_local/One.db").exists());
-        assert!(!dir.join("characters_local/Ann.fch").exists());
-        // Copied, not moved.
-        assert!(save.join("characters_local/Bob.fch").exists());
 
         // Nobody but the owner has a list here, so nothing is kept.
         assert!(
