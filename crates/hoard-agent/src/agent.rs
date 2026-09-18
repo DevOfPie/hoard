@@ -2726,7 +2726,7 @@ async fn run_agent(
                         }
                     }
                     Some(AgentCommand::ReseatSave(save)) => {
-                        handle_reseat(&mut slots, *save, &fs_tx);
+                        handle_reseat(&mut slots, *save, &fs_tx, &events_tx);
                         reconcile_all(
                             &mut slots, &api, &events_tx, &cmd_tx, &config, &done_tx,
                             &cloud_heads, lease_task.as_ref(),
@@ -3588,6 +3588,7 @@ fn handle_reseat(
     slots: &mut HashMap<String, SaveSlot>,
     save: WatchedSave,
     fs_tx: &mpsc::Sender<FsHit>,
+    events_tx: &mpsc::Sender<AgentEvent>,
 ) {
     let id = save.save_id.clone();
     let mut old = slots.remove(&id);
@@ -3630,9 +3631,20 @@ fn handle_reseat(
     slot.fs_writes = old.fs_writes;
     // A held world push stays held, ladder and all: its file is no more
     // readable for the reseat, and a push dropped to "not held" would go
-    // again at once and start the budget over (L-5).
-    slot.world_held = old.world_held;
-    slot.last_world_held = old.last_world_held;
+    // again at once and start the budget over (L-5). Unless the world's list
+    // changed: the hold was for the old world's files, which the new one may
+    // not have, and the push it held is not the one that goes next (L-8). Its
+    // warning goes with it.
+    if old.save.world() == slot.save.world() {
+        slot.world_held = old.world_held;
+        slot.last_world_held = old.last_world_held;
+    } else if old.world_held.active() {
+        tracing::info!(save_id = %id, "agent: the shared world's list changed; its held push starts over");
+        let _ = events_tx.try_send(AgentEvent::BackupAttentionCleared {
+            save_id: id.clone(),
+            game_slug: slot.save.game_slug.clone(),
+        });
+    }
     mark_pending_if_diverged(slot);
 }
 
@@ -9152,7 +9164,12 @@ mod tests {
         };
         assert!(!quiet());
 
-        handle_reseat(&mut slots, owner_save(dir.path()), &fs_tx);
+        handle_reseat(
+            &mut slots,
+            owner_save(dir.path()),
+            &fs_tx,
+            &mpsc::channel(8).0,
+        );
         let slot = slots.get_mut("w1").unwrap();
         assert!(slot.is_running);
         assert!(!still_quiet(slot)(), "still running after the reseat");
@@ -9282,10 +9299,29 @@ mod tests {
             slot.world_held = held;
             slot.last_world_held = Some((1, "a.db".into(), "denied".into(), false));
         }
-        handle_reseat(&mut slots, owner_save(dir.path()), &fs_tx);
+        handle_reseat(
+            &mut slots,
+            owner_save(dir.path()),
+            &fs_tx,
+            &mpsc::channel(8).0,
+        );
         let slot = slots.get_mut("w1").unwrap();
         assert_eq!(slot.world_held, held);
         assert!(slot.last_world_held.is_some());
+
+        // L-8: a reseat whose world list changed drops the hold, and says so.
+        let mut other = owner_save(dir.path());
+        other.shared.as_mut().unwrap().include = vec!["worlds_local/Beta.db".into()];
+        assert_ne!(other.world(), slots["w1"].save.world());
+        let (events_tx, mut events_rx) = mpsc::channel(8);
+        handle_reseat(&mut slots, other, &fs_tx, &events_tx);
+        let slot = &slots["w1"];
+        assert_eq!(slot.world_held, kernel::WorldHeld::default());
+        assert!(slot.last_world_held.is_none());
+        assert!(matches!(
+            events_rx.try_recv(),
+            Ok(AgentEvent::BackupAttentionCleared { .. })
+        ));
     }
 
     /// C7 of HRD-D-0019: the owner's whole-folder push refused 409
@@ -10226,7 +10262,7 @@ mod tests {
             );
         }
 
-        handle_reseat(&mut slots, owner_save(root), &fs_tx);
+        handle_reseat(&mut slots, owner_save(root), &fs_tx, &mpsc::channel(8).0);
         let slot = slots.get_mut("w1").unwrap();
         assert!(slot.save.owns_whole_folder());
         assert!(!slot.has_pending);
