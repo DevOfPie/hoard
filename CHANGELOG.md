@@ -81,7 +81,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   retry, or after the next change once the push has stopped. An owner whose world is unchanged is not held for a world file that
   cannot be read: the characters go up and the version keeps the synced copy
   of that file (self-hosted 1.1.3 or later). A file deleted while the push
-  reads the folder makes it read the folder again rather than fail. A restore
+  reads the folder makes it read the folder again rather than fail, up to
+  twenty times within three minutes, without reading unchanged files twice. A restore
   whose safety copy is held this way offers to go ahead without it, and
   replaces the unreadable file too.
 - **A restore downloads before it touches the folder.** `hoard restore` and

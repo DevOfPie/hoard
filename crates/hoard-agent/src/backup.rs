@@ -594,6 +594,11 @@ pub struct UploadOutcome {
     /// `snapshot` describes the version that already had it (ADR 0021 D.8.3). See
     /// [`ServerHead`].
     pub landed: bool,
+    /// The cheap signature and the world signature of the walk whose files
+    /// went up: the last one, when a file vanishing made the upload walk the
+    /// folder again ([`upload_directory`]). `None` from a path that does not
+    /// walk.
+    pub walk: Option<(String, String)>,
 }
 
 /// The head the server publishes for a save: which version it is and what content
@@ -1088,9 +1093,17 @@ where
     // attempt it is in, not the push: the folder is walked again at once, and
     // that does not count against the caller's retries. Dropping the file and
     // going on is not enough, because the walk may predate the generation that
-    // replaced it. Bounded: past `MAX_REWALKS` it is an ordinary failure.
-    const MAX_REWALKS: u32 = 5;
+    // replaced it. Bounded: past `MAX_REWALKS` walks, or `MAX_REWALK_TIME`
+    // since the first, it is an ordinary failure. Generous enough for a game
+    // saving every few seconds (the fourth end-to-end run's 45 s save loop spent
+    // five), since a re-walk only hashes the files that changed.
+    const MAX_REWALKS: u32 = 20;
+    const MAX_REWALK_TIME: std::time::Duration = std::time::Duration::from_secs(180);
+    let started = std::time::Instant::now();
     let mut rewalks = 0u32;
+    // Hashes by path, size and mtime from this upload's earlier walks: a
+    // re-walk does not read an unchanged file again.
+    let mut hashes = HashCache::new();
     loop {
         let attempt = upload_directory_attempt(
             client,
@@ -1106,10 +1119,15 @@ where
             head,
             origin,
             &progress,
+            &mut hashes,
         )
         .await;
         match attempt {
-            Err(e) if rewalks < MAX_REWALKS && vanished_after_walk(&e) => {
+            Err(e)
+                if rewalks < MAX_REWALKS
+                    && started.elapsed() < MAX_REWALK_TIME
+                    && vanished_after_walk(&e) =>
+            {
                 rewalks += 1;
                 tracing::info!(
                     save_id,
@@ -1147,6 +1165,8 @@ async fn upload_directory_attempt<F>(
     head: Option<&ServerHead>,
     origin: VersionOrigin,
     progress: F,
+    // Hashes from the upload's earlier walks ([`hash_manifest`]).
+    hashes: &mut HashCache,
 ) -> Result<UploadOutcome>
 where
     // `Sync` because the cloud path shares the callback by reference across
@@ -1178,6 +1198,11 @@ where
     // re-walk: a world that changed since the caller's walk (a game rewriting
     // chunks while one is locked) is not carried, it is held (H-1).
     let world_from = synced_world.and_then(|synced| synced.version_for(&files, world));
+    // What the caller persists once this walk's files are up (L-1).
+    let walk = Some((
+        compute_set_signature(&files),
+        world_signature(&files, world),
+    ));
     // A file that will not be read leaves the list here, at the ONE point all four
     // upload paths (cloud, CAS, pack, multipart) pass through, so none of them
     // meets it mid-transfer. Whatever is left out travels in the `UploadOutcome`
@@ -1260,9 +1285,11 @@ where
             head,
             origin,
             progress,
+            hashes,
         )
         .await?;
         outcome.unreadable = unreadable;
+        outcome.walk = walk;
         return Ok(outcome);
     }
 
@@ -1285,9 +1312,11 @@ where
             world_base_version,
             origin,
             progress,
+            hashes,
         )
         .await?;
         outcome.unreadable = unreadable;
+        outcome.walk = walk;
         return Ok(outcome);
     }
 
@@ -1385,34 +1414,76 @@ where
         // The self-hosted multipart path has no per-save cap trim.
         trimmed: None,
         landed: false,
+        walk,
     })
 }
 
+/// Hashes an upload already took, by relative path: the size and mtime the
+/// walk saw, and the SHA-256 ([`hash_manifest`]).
+pub(crate) type HashCache = HashMap<String, (u64, SystemTime, String)>;
+
 /// Whole-file SHA-256 of every file in the manifest, a few in flight at once so
 /// per-file open/read latency overlaps instead of adding up.
+///
+/// A file `cache` holds at the size and mtime this walk saw is not read
+/// again: the upload's earlier walk hashed it, moments ago (a re-walk after a
+/// file vanished, whose other files are mostly unchanged; the fourth
+/// end-to-end run re-read a 200 MB file on each). What is hashed goes into
+/// `cache`, a failed pass's too, so the re-walk it causes reuses it.
 ///
 /// (The futures are built eagerly into a Vec of `BoxFuture`s rather than through
 /// `iter().map(closure)`: a closure over borrowed items retained inside the
 /// stream trips rustc's "Send/FnOnce is not general enough" false positive when
 /// the whole upload future crosses a `tokio::spawn`. One small allocation per
 /// file, all of them IO-bound.)
-async fn hash_manifest(files: &[UploadFile]) -> Result<HashMap<&str, String>> {
+async fn hash_manifest<'a>(
+    files: &'a [UploadFile],
+    cache: &mut HashCache,
+) -> Result<HashMap<&'a str, String>> {
+    let mut out = HashMap::with_capacity(files.len());
     let mut hash_futs = Vec::with_capacity(files.len());
     for f in files {
+        let known = f.modified.and_then(|m| {
+            cache
+                .get(&f.relative_path)
+                .filter(|(size, mtime, _)| *size == f.size_bytes && *mtime == m)
+        });
+        if let Some((_, _, sha)) = known {
+            out.insert(f.relative_path.as_str(), sha.clone());
+            continue;
+        }
         hash_futs.push(
             async move {
                 let sha = hash_file(&f.absolute_path)
                     .await
                     .map_err(|e| vanished_or(e, &f.relative_path))?;
-                Ok::<_, anyhow::Error>((f.relative_path.as_str(), sha))
+                Ok::<_, anyhow::Error>((f, sha))
             }
             .boxed(),
         );
     }
-    stream::iter(hash_futs)
+    let hashed: Vec<Result<(&UploadFile, String)>> = stream::iter(hash_futs)
         .buffer_unordered(TRANSFER_CONCURRENCY)
-        .try_collect()
-        .await
+        .collect()
+        .await;
+    let mut failed = None;
+    for r in hashed {
+        match r {
+            Ok((f, sha)) => {
+                if let Some(m) = f.modified {
+                    cache.insert(f.relative_path.clone(), (f.size_bytes, m, sha.clone()));
+                }
+                out.insert(f.relative_path.as_str(), sha);
+            }
+            Err(e) => {
+                failed.get_or_insert(e);
+            }
+        }
+    }
+    match failed {
+        Some(e) => Err(e),
+        None => Ok(out),
+    }
 }
 
 /// Self-hosted content-addressed upload: hash, declare the manifest, upload only
@@ -1445,6 +1516,7 @@ async fn upload_directory_cas<F>(
     world_base_version: Option<i64>,
     origin: VersionOrigin,
     progress: F,
+    hashes: &mut HashCache,
 ) -> Result<UploadOutcome>
 where
     F: Fn(u64, u64) + Send + Sync,
@@ -1452,7 +1524,7 @@ where
     use hoard_core::ids::Sha256 as Sha256Hex;
 
     progress(0, total_bytes);
-    let sha_by_path = hash_manifest(files).await?;
+    let sha_by_path = hash_manifest(files, hashes).await?;
 
     let mut manifest: Vec<CasFile> = Vec::with_capacity(files.len());
     for f in files {
@@ -1666,6 +1738,7 @@ where
         // With no plan there is no per-save cap to trim against.
         trimmed: None,
         landed: false,
+        walk: None,
     })
 }
 
@@ -1689,6 +1762,7 @@ async fn upload_directory_cloud<F>(
     head: Option<&ServerHead>,
     origin: VersionOrigin,
     progress: F,
+    hashes: &mut HashCache,
 ) -> Result<UploadOutcome>
 where
     F: Fn(u64, u64) + Send + Sync,
@@ -1698,7 +1772,7 @@ where
     // 1. Whole-file SHA-256 of every file, the dedup key. Hashed once up front and
     //    cached by path so a per-save-cap trim-and-retry (below) does not re-read
     //    the files.
-    let sha_by_path = hash_manifest(files).await?;
+    let sha_by_path = hash_manifest(files, hashes).await?;
 
     // 1b. Is it already up there? (ADR 0021 D.8.3.) With the hashes already
     // computed, asking the server's truth whether this exact content is its head
@@ -1728,6 +1802,7 @@ where
                 unreadable: Vec::new(),
                 trimmed: None,
                 landed: true,
+                walk: None,
             });
         }
     }
@@ -2048,6 +2123,7 @@ where
         unreadable: Vec::new(),
         trimmed,
         landed: false,
+        walk: None,
     })
 }
 
@@ -2556,6 +2632,16 @@ where
         progress,
     )
     .await?;
+    // What is persisted is the signature of the walk whose files went up (L-1):
+    // after a re-walk, or a change between the walk above and the upload's own,
+    // this walk's would read as a change on the next tick. Its content half is
+    // left out, since those bytes were not read as a whole: the cheap half
+    // alone skips an unchanged folder, and a changed one is uploaded rather than
+    // matched against content of a walk that did not go up.
+    let (signature, world) = match outcome.walk.clone() {
+        Some((walked, walked_world)) if walked != cheap => (walked, walked_world),
+        _ => (join_signature(&cheap, &content), world),
+    };
     // The content was already up there (D.8.3): there was no upload, but there is a
     // version we are now synced to. It is kept apart from `Uploaded` because the
     // caller must NOT count it as a committing backup: moving the min-interval
@@ -2563,13 +2649,13 @@ where
     if outcome.landed {
         return Ok(BackupResult::AlreadyLanded {
             version_num: outcome.snapshot.version_num,
-            signature: join_signature(&cheap, &content),
+            signature,
             world,
         });
     }
     Ok(BackupResult::Uploaded {
         outcome,
-        signature: join_signature(&cheap, &content),
+        signature,
         world,
     })
 }
@@ -2697,6 +2783,44 @@ mod trim_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A re-walk does not read an unchanged file again: a file at the size and
+    /// mtime an earlier walk of the same upload hashed takes that hash, and
+    /// one whose mtime moved is read.
+    #[tokio::test]
+    async fn a_rewalk_reuses_the_hashes_of_unchanged_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(root.join("a.sav"), b"aaaa").unwrap();
+        std::fs::write(root.join("b.sav"), b"bbbb").unwrap();
+        let mut cache = HashCache::new();
+        let walk = || walk_source(root, Scope::default()).unwrap();
+        let first = walk();
+        let before: HashMap<String, String> = hash_manifest(&first, &mut cache)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|(k, v)| (k.to_string(), v))
+            .collect();
+        assert_eq!(cache.len(), 2);
+        // Same size and mtime, other bytes: taken from the cache, not read.
+        let mtime = |p: &Path| {
+            filetime::FileTime::from_last_modification_time(&std::fs::metadata(p).unwrap())
+        };
+        let a = root.join("a.sav");
+        let kept = mtime(&a);
+        std::fs::write(&a, b"AAAA").unwrap();
+        filetime::set_file_mtime(&a, kept).unwrap();
+        // A moved mtime: read again.
+        let b = root.join("b.sav");
+        std::fs::write(&b, b"BBBB").unwrap();
+        filetime::set_file_mtime(&b, filetime::FileTime::from_unix_time(2_000_000_000, 0)).unwrap();
+        let second = walk();
+        let after = hash_manifest(&second, &mut cache).await.unwrap();
+        assert_eq!(after["a.sav"], before["a.sav"]);
+        assert_ne!(after["b.sav"], before["b.sav"]);
+        assert_eq!(after["b.sav"], hash_file(&b).await.unwrap());
+    }
 
     fn uf(rel: &str, size: u64, mtime_secs: u64) -> UploadFile {
         UploadFile {

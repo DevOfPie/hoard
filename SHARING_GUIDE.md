@@ -179,8 +179,9 @@ last synced and only a file of it cannot be read, the owner's other files
 file; this needs a self-hosted server of 1.1.3 or later.
 
 A file deleted while the push reads the folder (1.0 deletes the previous
-save's files) does not fail the push: the folder is read again, a few times
-at most. If a restore's safety copy is held, the desktop offers to restore
+save's files) does not fail the push: the folder is read again, up to
+twenty times within three minutes, and files that did not change are not
+read twice. If a restore's safety copy is held, the desktop offers to restore
 without it, and that restore replaces the file that could not be read too,
 moving it to the conflicts folder first.
 

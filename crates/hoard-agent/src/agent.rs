@@ -9438,8 +9438,56 @@ mod tests {
                 .is_some(),
             "{err:#}"
         );
-        assert_eq!(walks.get(), 6, "one walk and five more");
+        assert_eq!(walks.get(), 21, "one walk and twenty more");
         assert!(seen.lock().unwrap().is_empty(), "nothing was sent");
+    }
+
+    /// L-1: after a re-walk, what the push persists is the signature of the
+    /// walk whose files went up, not the first walk's: the next tick sees the
+    /// folder unchanged. Its content half is left out, the bytes of that walk
+    /// not having been read as a whole.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_rewalked_push_persists_the_last_walks_signature() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        write_file(&root.join("worlds_local/Alpha.db"), b"alpha");
+        let old = root.join("worlds_local/Alpha.db.old");
+        write_file(&old, b"previous generation");
+        let removed = old.clone();
+        crate::backup::UPLOAD_HOOK.with(|h| {
+            *h.borrow_mut() = Some(Box::new(move |phase: &str| {
+                if phase == "probed" {
+                    let _ = std::fs::remove_file(&removed);
+                }
+            }))
+        });
+        let (url, _seen) = refusing_server(vec![(200, INIT_V5), (201, COMMIT_V5)]).await;
+        let result = upload_directory_checked(
+            &ApiClient::new(&url, "fake").unwrap(),
+            "w1",
+            "valheim",
+            &[],
+            &[],
+            "main",
+            &root,
+            None,
+            Some(3),
+            None,
+            None,
+            None,
+            VersionOrigin::Automatic,
+            |_, _| {},
+            || {},
+        )
+        .await;
+        crate::backup::UPLOAD_HOOK.with(|h| *h.borrow_mut() = None);
+        let Ok(BackupResult::Uploaded { signature, .. }) = result else {
+            panic!("went up after a re-walk");
+        };
+        assert!(!old.exists());
+        let (on_disk, _) = observe_local_fingerprint(&root, "valheim", &[], &[]).unwrap();
+        assert_eq!(fingerprint_from_set_hash(&signature), on_disk);
+        assert!(!signature.contains(':'), "{signature}");
     }
 
     /// L-1: staged copies an interrupted merge left behind are swept, at any
