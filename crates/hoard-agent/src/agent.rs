@@ -9383,7 +9383,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let root = &tmp.path().join("save");
         let staging = &tmp.path().join("staging");
-        let conflicts = &tmp.path().join("conflicts/w1/ts");
+        let conflict_root = &tmp.path().join("conflicts");
         valheim_generation(root, "Alpha", 6, &["0_0.chunk"]);
         write_file(&root.join("characters_local/Me.fch"), b"me");
         write_file(&root.join("characters_local/Alt.fch"), b"alt, never pushed");
@@ -9409,27 +9409,42 @@ mod tests {
             vec![Decision::Act(Action::Restore)]
         );
 
-        // The restore's merge, over the staged v4, and its result handed back
-        // the way `AutoRestoreFinished` does.
-        let gate = slot.save.gate(false);
-        let world = slot.save.world().to_vec();
-        let outcome = merge_staged(
+        // The restore the reducer asked for, as the engine runs it: v4 served
+        // by a server, downloaded, merged; its result handed back the way
+        // `AutoRestoreFinished` does.
+        let v4 = files_under(staging);
+        let v4: Vec<(&str, &[u8])> = v4.iter().map(|(k, v)| (k.as_str(), v.as_slice())).collect();
+        let routes = crate::testserver::selfhosted_version("w1", 4, &v4).await;
+        let (url, _) = crate::testserver::serve(move |_| routes).await;
+        let api = ApiClient::new(url, "t").unwrap();
+        let pulled = run_auto_restore(
+            &api,
             &slot.save,
-            staging,
-            Some(conflicts.clone()),
-            &gate,
-            &world,
-            4,
+            Some(conflict_root),
+            Duration::from_secs(14 * 86_400),
+            slot.known_version,
+            None,
+            None,
+            true,
+            None,
         )
         .await
         .unwrap();
+        let AutoRestorePull::Merged(outcome) = pulled else {
+            panic!("v4 is ahead of v3: it is merged");
+        };
         assert_eq!(
             outcome.world_files_set_aside, 4,
             "0_0.chunk is replaced, not stale"
         );
+        assert_eq!(outcome.conflicts_backed_up, 1);
         assert!(outcome.local_diverged, "Alt.fch is the owner's alone");
-        assert_eq!(outcome.conflict_dir.as_deref(), Some(conflicts.as_path()));
+        let conflicts = outcome.conflict_dir.clone().expect("the moves' folder");
+        assert!(conflicts.starts_with(conflict_root.join("w1")));
         assert!(conflicts.join("worlds_local/Alpha/_main.6.db2").exists());
+        for (rel, bytes) in &v4 {
+            assert_eq!(&std::fs::read(root.join(rel)).unwrap(), bytes, "{rel}");
+        }
         let world_hash = outcome.disk_world_hash.clone();
         assert!(world_hash.is_some(), "the world on disk is the head's");
         slot.pending_op_result = Some(kernel::OpResult::Ok {
@@ -9442,7 +9457,8 @@ mod tests {
         tick(&mut slot, &cloud, later + time::Duration::seconds(1));
         assert_eq!(slot.known_version, Some(4));
         assert_ne!(slot.synced_world_fingerprint, synced_world);
-        let (_, on_disk) = observe_local_fingerprint(root, "valheim", &[], &world).unwrap();
+        let (_, on_disk) =
+            observe_local_fingerprint(root, "valheim", &[], slot.save.world()).unwrap();
         assert_eq!(slot.synced_world_fingerprint, Some(on_disk));
 
         // A character-only change goes up without the lease.
@@ -9597,6 +9613,75 @@ mod tests {
         }
         assert_eq!(notice, Some(2), "the two files moved aside");
         assert_eq!(files_under(root), v4);
+    }
+
+    /// The reconcile of a refused push merges with no world: the folder holds
+    /// the very writes that push carried, so the local generation the head
+    /// lacks stays, a chunk newer here stays, and nothing goes to the
+    /// conflicts folder. Driven through `run_backup_with_retry` against a
+    /// server that keeps refusing the push as behind.
+    #[tokio::test(flavor = "current_thread")]
+    async fn the_reconcile_of_a_refused_push_keeps_the_local_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = &tmp.path().join("save");
+        let staging = &tmp.path().join("v5");
+        let conflict_root = &tmp.path().join("conflicts");
+        valheim_generation(root, "Alpha", 9, &["0_0.chunk"]);
+        let local = files_under(root);
+        valheim_generation(staging, "Alpha", 8, &["0_0.chunk"]);
+        let v5 = files_under(staging);
+        let mut routes = vec![
+            crate::testserver::ok(
+                "GET /v1/health",
+                r#"{"status":"ok","version":"test","cas":true,"groups":true}"#,
+            ),
+            (
+                "POST /v1/saves/w1/cas/init".to_string(),
+                409,
+                NON_FAST_FORWARD.as_bytes().to_vec(),
+            ),
+        ];
+        routes.extend(crate::testserver::selfhosted_version("w1", 5, &as_routes_files(&v5)).await);
+        let (url, seen) = crate::testserver::serve(move |_| routes).await;
+        let api = ApiClient::new(url, "t").unwrap();
+        let (events_tx, _events_rx) = mpsc::channel(64);
+        let (done_tx, _done_rx) = mpsc::channel(8);
+        let (cmd_tx, _cmd_rx) = mpsc::channel(8);
+        let mut save = member_world(root);
+        save.known_version = Some(3);
+
+        run_backup_with_retry(
+            api,
+            save,
+            None,
+            Some(3),
+            None,
+            None,
+            VersionOrigin::Automatic,
+            false,
+            events_tx,
+            done_tx,
+            cmd_tx,
+            0,
+            false,
+            Some(conflict_root.clone()),
+            14,
+        )
+        .await;
+
+        assert!(
+            seen.lock()
+                .unwrap()
+                .iter()
+                .any(|l| l.starts_with("GET /v1/saves/w1/snapshots/5/download")),
+            "the refusal was reconciled with a pull"
+        );
+        let after = files_under(root);
+        for (rel, bytes) in &local {
+            assert_eq!(after.get(rel), Some(bytes), "{rel} is kept");
+        }
+        assert!(after.contains_key("worlds_local/Alpha/_main.8.db2"));
+        assert!(files_under(conflict_root).is_empty());
     }
 
     /// Mirror image: when the target is a strict subset of the snapshot
