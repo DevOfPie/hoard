@@ -78,9 +78,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   host. Once the shared version moves past a held push, the held changes go
   to the conflicts folder and the new version comes down, whoever holds the
   lease; a move to the conflicts folder that fails is tried again at the next
-  retry, or after the next change once the push has stopped. An owner whose world is unchanged is not held for a world file that
+  retry, or after the next change once the push has stopped; putting back
+  what the failed move had moved is not such a change. An owner whose world is unchanged is not held for a world file that
   cannot be read: the characters go up and the version keeps the synced copy
-  of that file (self-hosted 1.1.3 or later). A file deleted while the push
+  of that file (self-hosted 1.1.3 or later). A world file written while such
+  a push reads the folder makes it read the folder again, so a world that
+  changed meanwhile is held rather than sent half old, half new. A file deleted while the push
   reads the folder makes it read the folder again rather than fail, up to
   twenty times within three minutes, without reading unchanged files twice. A restore
   whose safety copy is held this way offers to go ahead without it, and
@@ -119,7 +122,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   keep their modification time. Staged `.hoard-restore.tmp` files and staging
   folders an interrupted merge or a killed restore left behind are removed
   when the save is next watched, before the next merge, and when the sync
-  service starts, and are never taken for save data. Both carry the id of
+  service starts, and are never taken for save data or for a write to the
+  folder, so creating or removing one neither defers a pull nor asks for the
+  lease. Both carry the id of
   the process that made them, so a merge still running in another process
   (a restore from the command line during a pull) keeps its own.
 - **An owner's restore keeps each replaced file once.** A file outside the

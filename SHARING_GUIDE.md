@@ -143,7 +143,8 @@ in Hoard's data folder, not in the system's temporary folder (a RAM-backed
 `/tmp` would hold the whole version in memory); one a killed restore left
 behind is removed when the sync service next starts, and so are the
 half-written `.hoard-restore.tmp` files an interrupted merge leaves in a save
-folder. Only those of a process that is gone: a restore running while the
+folder. Creating or removing one is not a write to the save: it neither
+defers a pull nor asks for the lease. Only those of a process that is gone: a restore running while the
 service pulls into the same folder keeps its own. Then the version's files replace yours, each replaced file going to
 the conflicts folder first, once, and the command prints (the desktop's
 notice shows) the folder they went to. Files already identical are not
@@ -171,12 +172,15 @@ push is held (somebody hosted and pushed), your held changes go to the
 conflicts folder and their version comes down, whoever holds the lease by
 then. If they cannot be moved there (the file that held the push will not
 move either), that is tried again at the push's next retry, or after the next
-change once it has stopped.
+change once it has stopped; the move putting back what it had moved does not
+count as a change.
 
 The owner is held only when the world changed. When the world is the one
 last synced and only a file of it cannot be read, the owner's other files
 (the characters) still go up, the version keeping the synced copy of that
-file; this needs a self-hosted server of 1.1.3 or later.
+file; this needs a self-hosted server of 1.1.3 or later. A world file the
+game writes while that push reads the folder makes it read the folder again,
+and a world that changed is held, never sent half old, half new.
 
 A file deleted while the push reads the folder (1.0 deletes the previous
 save's files) does not fail the push: the folder is read again, up to
