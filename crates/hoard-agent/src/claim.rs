@@ -1036,14 +1036,40 @@ pub(crate) fn on_side_copied(
         slot.last_restore_at = Some(OffsetDateTime::now_utc());
         slot.side_copy_landed_at = Some(now);
         end_session(slot);
-    } else if slot.has_pending {
+    } else if slot.has_pending && world_on_disk(&slot.save) {
         // Nothing moved and something is pending: the include list missed
         // what the game wrote, and it stays where it is.
         end_session_local_only(slot);
+    } else if slot.has_pending {
+        // Nothing moved because nothing of the world is here: the pending
+        // mark was about files outside it, which never go up with the world
+        // and which the pull does not touch. Nothing is left to lose, so the
+        // head comes down, rather than the slot waiting as a viewer on
+        // writes that do not exist.
+        tracing::info!(save_id = %slot.save.save_id, "agent: no file of the shared world is here; pulling the head");
+        slot.has_pending = false;
+        slot.local_only_pending = false;
+        slot.pull_pending = true;
+        end_session(slot);
     } else {
         end_session(slot);
     }
     after_side_copy(slots, save_id, now, events_tx);
+}
+
+/// Is any file of the shared world in the save's folder? What
+/// [`move_world_aside`] would move; a folder that cannot be walked counts as
+/// holding some, the side that keeps a slot from pushing.
+fn world_on_disk(save: &WatchedSave) -> bool {
+    let shields = crate::savefilter::shields_for_slug(&save.game_slug);
+    crate::backup::walk_source(
+        &save.local_path,
+        Scope {
+            shields: &shields,
+            include: save.world(),
+        },
+    )
+    .map_or(true, |files| !files.is_empty())
 }
 
 /// The side copy could not be made: the bytes stay where they are, pending,
@@ -1529,6 +1555,49 @@ mod tests {
             !hit_is_side_copy(slot, landed + SIDE_COPY_TAIL),
             "after the tail a write is a write"
         );
+    }
+
+    /// Behind the head with a pending mark and nothing of the world in the
+    /// folder (a member's own character beside it): the set-aside before the
+    /// pull moves nothing, and that is not a write left local-only. The slot
+    /// stays a host, nothing is pending, and the head comes down.
+    #[tokio::test(start_paused = true)]
+    async fn a_side_copy_with_no_world_on_disk_lets_the_pull_through() {
+        let (tx, _rx) = mpsc::channel(8);
+        let tmp = tempfile::tempdir().unwrap();
+        let character = tmp.path().join("characters_local/Friend.fch");
+        std::fs::create_dir_all(character.parent().unwrap()).unwrap();
+        std::fs::write(&character, b"friend").unwrap();
+        let mut save = world("w1", "valheim");
+        save.local_path = tmp.path().to_path_buf();
+        let list = crate::worldfiles::template("valheim", "Alpha")
+            .unwrap()
+            .unwrap();
+        save.include = list.clone();
+        save.shared.as_mut().unwrap().include = list;
+        let mut s = slots(vec![save.clone()]);
+        let now = Instant::now();
+        {
+            let slot = s.get_mut("w1").unwrap();
+            slot.lease = LeaseObs::Free;
+            slot.has_pending = true;
+            on_stale(slot, 3);
+            assert!(!slot.pull_pending, "held back by the pending mark");
+            assert_eq!(on_reconciled(slot, now, &tx, None), Followup::SideCopy);
+        }
+        let moved = move_world_aside(&save, &tmp.path().join("aside"))
+            .await
+            .unwrap();
+        assert_eq!(moved, 0);
+        on_side_copied(&mut s, "w1", moved, now, &tx);
+        let slot = &s["w1"];
+        assert!(slot.session.is_none());
+        assert!(!slot.has_pending);
+        assert!(!slot.local_only_pending);
+        assert!(slot.pull_pending);
+        assert_eq!(slot.role, WorldRole::Host);
+        assert!(!may_request_lease(slot));
+        assert_eq!(std::fs::read(&character).unwrap(), b"friend");
     }
 
     /// The side copy is skipped or fails with writes still in the folder: the

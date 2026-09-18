@@ -2880,11 +2880,13 @@ async fn run_agent(
 
             // ----- Filesystem debounce hits -----
             Some(hit) = fs_rx.recv() => {
-                // A side copy's own renames are not writes (`claim::hit_is_side_copy`).
+                // A side copy's own renames are not writes (`claim::hit_is_side_copy`),
+                // and nor, for this save, is a write its walk never reads.
                 let save_id = match_save_for_path(&slots, &hit.root).filter(|id| {
-                    !slots
-                        .get(id)
-                        .is_some_and(|s| crate::claim::hit_is_side_copy(s, TokioInstant::now()))
+                    !slots.get(id).is_some_and(|s| {
+                        crate::claim::hit_is_side_copy(s, TokioInstant::now())
+                            || !hit_reaches_walk(s, &hit.paths)
+                    })
                 });
                 if let Some(save_id) = save_id {
                     let now = OffsetDateTime::now_utc();
@@ -3122,18 +3124,31 @@ async fn run_agent(
 /// reads `has_pending`, stays honest (marking it spuriously would veto pulls
 /// forever). An empty folder or a track-only slot is not marked (there is nothing to
 /// upload; an empty one is resolved by the reducer through the restore branch).
+///
+/// Nor is a folder the backup's walk finds nothing in: a member's folder that
+/// holds only their own characters, say, when their save walks the shared
+/// world alone. There is nothing to push, and marked pending it vetoed the
+/// first pull and asked for the lease to push nothing, which the server
+/// refused as behind, forever.
 pub(crate) fn mark_pending_if_diverged(slot: &mut SaveSlot) {
     if slot.save.track_only || is_path_empty_or_missing(&slot.save.local_path) {
         return;
     }
-    let fp = observe_local_fingerprint(
+    let shields = crate::savefilter::shields_for_slug(&slot.save.game_slug);
+    let Ok(files) = crate::backup::walk_source(
         &slot.save.local_path,
-        &slot.save.game_slug,
-        &slot.save.include,
-        slot.save.world(),
-    )
-    .map(|(whole, _)| whole);
-    if fp.is_some() && fp != slot.synced_fingerprint {
+        Scope {
+            shields: &shields,
+            include: &slot.save.include,
+        },
+    ) else {
+        return;
+    };
+    if files.is_empty() {
+        return;
+    }
+    let fp = fingerprint_of(&crate::backup::compute_set_signature(&files));
+    if Some(fp) != slot.synced_fingerprint {
         slot.has_pending = true;
         slot.needs_l1 = true;
     }
@@ -4712,6 +4727,28 @@ fn build_watcher(
     };
     debouncer.watcher().watch(&watch_target, mode)?;
     Ok(debouncer)
+}
+
+/// Can a watcher hit on `paths` change what this save's backup walks? Always
+/// when the walk takes the whole folder. When it takes a list (a member's
+/// shared world), only a path the list names, a folder it reaches beneath, or
+/// the folder itself: a member's own character written beside the world is
+/// nothing to push, and marking it pending held the pull back and asked for
+/// the lease for nothing. A path that cannot be placed under the folder counts.
+fn hit_reaches_walk(slot: &SaveSlot, paths: &[PathBuf]) -> bool {
+    let include = &slot.save.include;
+    if include.is_empty() || paths.is_empty() {
+        return true;
+    }
+    paths.iter().any(|path| {
+        let rel = path
+            .strip_prefix(&slot.save.local_path)
+            .map(|r| r.to_string_lossy().replace('\\', "/"))
+            .unwrap_or_default();
+        rel.is_empty()
+            || kernel::fileclass::included(include, &rel)
+            || kernel::fileclass::reaches_beneath(include, &rel)
+    })
 }
 
 /// What a watcher hit marks on its slot: pending, the event's time, a fresh L1
@@ -9789,6 +9826,123 @@ mod tests {
             "nothing was uploaded: {:?}",
             seen.lock().unwrap()
         );
+    }
+
+    /// A member adopts the shared world into a folder that already holds their
+    /// own character, and nothing of the world. Nothing is pending (the walk,
+    /// the world alone, finds nothing to push), so the first pull comes down
+    /// through the engine's own loop, the character stays as it was, and the
+    /// lease is never asked for. Marked pending, as it used to be, the
+    /// adoption asked for the lease, was refused as behind, set aside nothing
+    /// and held on "un-flushed local changes" forever.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_member_adopting_beside_their_own_character_pulls_the_world() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = &tmp.path().join("save");
+        let staging = &tmp.path().join("v4");
+        write_file(&root.join("characters_local/Friend.fch"), b"friend");
+        valheim_generation(staging, "Alpha", 4, &["0_0.chunk"]);
+        let v4 = files_under(staging);
+        let routes = crate::testserver::selfhosted_version("w1", 4, &as_routes_files(&v4)).await;
+        let (url, seen) = crate::testserver::serve(move |_| routes).await;
+        let mut save = member_world(root);
+        save.known_version = None;
+        save.policy.auto_restore = Some(true);
+        let config = AgentConfig {
+            debounce_secs: 1,
+            poll_secs: 1,
+            max_retries: 0,
+            auto_restore: true,
+            global_sync: false,
+            conflict_root: Some(tmp.path().join("conflicts")),
+            conflict_retention_days: 14,
+            min_snapshot_interval_secs: 0,
+        };
+        let (events_tx, mut events_rx) = mpsc::channel::<AgentEvent>(256);
+        let (handle, task) = spawn(
+            ApiClient::new(url, "t").unwrap(),
+            config,
+            vec![save],
+            events_tx,
+        );
+        let (lease, mut lease_seen) = crate::lease::LeaseHandle::probe();
+        handle.attach_lease(lease).await.unwrap();
+        handle.force_restore_at("w1".into(), Some(4)).await.unwrap();
+
+        let pulled = tokio::time::timeout(Duration::from_secs(15), async {
+            loop {
+                match events_rx.recv().await {
+                    Some(AgentEvent::SaveAutoRestored { version_num, .. }) => {
+                        return Some(version_num)
+                    }
+                    Some(_) => {}
+                    None => return None,
+                }
+            }
+        })
+        .await;
+        // Let the watcher hits of the pull's own writes settle through a tick.
+        tokio::time::sleep(Duration::from_millis(2500)).await;
+        let _ = handle.shutdown().await;
+        let _ = tokio::time::timeout(Duration::from_secs(2), task).await;
+
+        assert_eq!(pulled.ok().flatten(), Some(4), "the first pull came down");
+        let mut expected = v4.clone();
+        expected.insert("characters_local/Friend.fch".into(), b"friend".to_vec());
+        assert_eq!(files_under(root), expected);
+        let mut asked = Vec::new();
+        while let Ok(line) = lease_seen.try_recv() {
+            asked.push(line);
+        }
+        assert!(
+            !asked.iter().any(|l| l.starts_with("acquire")),
+            "no lease was asked for: {asked:?}"
+        );
+        assert!(
+            !seen.lock().unwrap().iter().any(|l| l.starts_with("POST")),
+            "nothing was pushed: {:?}",
+            seen.lock().unwrap()
+        );
+    }
+
+    /// A member's walk is the shared world, so a write beside it (their own
+    /// character) is not one the backup could carry; a write inside it, a
+    /// folder above it, the folder itself, and anything on a save that walks
+    /// the whole folder are.
+    #[test]
+    fn a_write_outside_a_members_world_is_not_a_hit() {
+        let root = Path::new("/saves/valheim");
+        let member = test_slot(member_world(root));
+        let at = |rel: &str| vec![root.join(rel)];
+        assert!(!hit_reaches_walk(
+            &member,
+            &at("characters_local/Friend.fch")
+        ));
+        assert!(!hit_reaches_walk(
+            &member,
+            &at("worlds_local/Beta/_main.1.db2")
+        ));
+        assert!(hit_reaches_walk(
+            &member,
+            &at("worlds_local/Alpha/_main.2.db2")
+        ));
+        assert!(hit_reaches_walk(&member, &at("worlds_local/Alpha.fwl")));
+        assert!(hit_reaches_walk(&member, &at("worlds_local")));
+        assert!(hit_reaches_walk(&member, &[root.to_path_buf()]));
+        assert!(hit_reaches_walk(&member, &[]));
+        assert!(hit_reaches_walk(
+            &member,
+            &[
+                root.join("characters_local/Friend.fch"),
+                root.join("worlds_local/Alpha/0_0.chunk")
+            ]
+        ));
+        let mut owner = owner_save(root);
+        owner.shared.as_mut().unwrap().include = alpha_world();
+        assert!(hit_reaches_walk(
+            &test_slot(owner),
+            &at("characters_local/Me.fch")
+        ));
     }
 
     /// Mirror image: when the target is a strict subset of the snapshot
