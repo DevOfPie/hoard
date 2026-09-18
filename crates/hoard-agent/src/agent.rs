@@ -959,6 +959,11 @@ pub(crate) struct SaveSlot {
     /// Currently-running guess from the last process poll. Drives
     /// GameStarted/Stopped transitions.
     pub(crate) is_running: bool,
+    /// `is_running`, readable from a restore task already under way: the pull
+    /// asks it once more right before the merge touches the folder
+    /// ([`StillQuiet`]). Written wherever the process poll moves
+    /// `is_running`.
+    running_now: Arc<std::sync::atomic::AtomicBool>,
     /// The session in progress started on a weak signal alone (folder-to-process
     /// correlation) and no strong signal has corroborated it since. If it also ends
     /// without a single write to the folder, it was a phantom session: the
@@ -2185,6 +2190,18 @@ fn execute_backup(
     });
 }
 
+/// The reducer let a pull through on a quiet folder, but the download takes
+/// time and a game can start meanwhile: this is asked again right before the
+/// merge. Running (the process poll's word, as it stands then), or a save file
+/// held open, and the pull waits.
+pub(crate) fn still_quiet(slot: &SaveSlot) -> StillQuiet {
+    let running = slot.running_now.clone();
+    let path = slot.save.local_path.clone();
+    Arc::new(move || {
+        !running.load(std::sync::atomic::Ordering::Relaxed) && !crate::locks::any_file_locked(&path)
+    })
+}
+
 /// Launches the restore (cloud to local, conflict-aware) the reducer asked for.
 /// `in_flight` was already set to `Some(Restore)` and `next_restore_at` armed the
 /// cooldown, both by the reducer; the result comes back as `AutoRestoreFinished`
@@ -2199,6 +2216,10 @@ fn execute_restore(
 ) {
     let (save, known_version) = match slots.get(id) {
         Some(s) => (s.save.clone(), s.known_version),
+        None => return,
+    };
+    let still_quiet = match slots.get(id) {
+        Some(slot) => still_quiet(slot),
         None => return,
     };
     tracing::info!(save_id = %id, "agent: reconcile → restore");
@@ -2216,6 +2237,7 @@ fn execute_restore(
         // when we are already up to date.
         None,
         None,
+        Some(still_quiet),
     );
 }
 
@@ -3252,6 +3274,7 @@ fn handle_add(
         burst_backups: 0,
         manual_requested: false,
         is_running: false,
+        running_now: Default::default(),
         weak_session: false,
         last_running_seen: None,
         has_pending: false,
@@ -3469,6 +3492,7 @@ fn spawn_auto_restore(
     // reuse it, instead of N tasks fetching the identical manifest (the
     // startup burst that tripped the server's poll guard).
     shared_manifest: Option<Arc<tokio::sync::OnceCell<crate::api::CloudManifest>>>,
+    still_quiet: Option<StillQuiet>,
 ) {
     tokio::spawn(async move {
         tracing::debug!(
@@ -3499,6 +3523,7 @@ fn spawn_auto_restore(
             cached_latest,
             shared_manifest,
             true,
+            still_quiet.as_ref(),
         )
         .await
         {
@@ -3574,6 +3599,16 @@ fn spawn_auto_restore(
             // our own cursor backwards.
             Ok(AutoRestorePull::AlreadyAtHead { .. }) => {}
             Ok(AutoRestorePull::NothingRemote) => {}
+            // Nothing was written and the version is not adopted: the head is
+            // still ahead of `known_version`, so the reducer asks again, and
+            // with the game up that is a deferred pull, landing when it closes.
+            Ok(AutoRestorePull::Deferred { version_num }) => {
+                tracing::info!(
+                    save_id = %save.save_id,
+                    version_num,
+                    "agent: auto-restore: the game started or holds a save file open during the download; the pull waits for it to close"
+                );
+            }
             Err(e) => {
                 // A 404 means the save has no record/snapshot on the backend
                 // (carried over from another account, stale state, or the
@@ -3860,6 +3895,10 @@ async fn run_auto_restore(
     // generation among them, and moving it aside would settle on the head
     // over them. That merge keeps local-only files, as before.
     set_aside_world: bool,
+    // Asked once the version is staged, right before the merge: `false` (a
+    // game started, or holds a save file open) and nothing is written. `None`
+    // for the reconcile of a refused push, which runs where the push did.
+    still_quiet: Option<&StillQuiet>,
 ) -> Result<AutoRestorePull> {
     // Prefer the version the cloud_pull poller already learned this tick: it
     // fetched the whole manifest once, so reusing it spares us a per-save
@@ -4014,6 +4053,19 @@ async fn run_auto_restore(
         root.join(&save.save_id).join(ts)
     });
 
+    // The download took time the veto did not see. A game that started
+    // meanwhile has the folder open: moving its world aside, or writing the
+    // version over it, is the mid-session write the kernel never makes. So
+    // the whole merge waits, not just the moves: the version's files are as
+    // much a write as the moves are, and a half-merged folder is worse than
+    // an untouched one.
+    if still_quiet.is_some_and(|quiet| !quiet()) {
+        cleanup_staging(&staging).await;
+        return Ok(AutoRestorePull::Deferred {
+            version_num: version,
+        });
+    }
+
     let world: &[String] = if set_aside_world { save.world() } else { &[] };
     let merged = merge_staged(save, &staging, conflict_backup_dir, &gate, world, version).await;
     cleanup_staging(&staging).await;
@@ -4130,7 +4182,14 @@ enum AutoRestorePull {
     AlreadyAtHead { version_num: i64 },
     /// The server has no snapshot for this save: purged, or a row we can't resolve.
     NothingRemote,
+    /// Staged, but not merged: the game started, or took a save file, during
+    /// the download ([`StillQuiet`]). Nothing was written.
+    Deferred { version_num: i64 },
 }
+
+/// Is the save's folder still quiet (no game running, no save file held open)?
+/// Asked by a pull right before it writes.
+pub(crate) type StillQuiet = Arc<dyn Fn() -> bool + Send + Sync>;
 
 /// Build a unique staging directory under the system temp dir. We embed
 /// the save_id (sanitised to alphanumeric+dash) and a monotonic nanosecond
@@ -5124,6 +5183,7 @@ async fn run_backup_with_retry(
                         None,
                         None,
                         false,
+                        None,
                     )
                     .await
                     {
@@ -5295,6 +5355,14 @@ async fn run_backup_with_retry(
                                     id: save.save_id.clone(),
                                     error: chain,
                                 })
+                                .await;
+                            return;
+                        }
+                        // Never without a `still_quiet`, which this call does not
+                        // pass; were it to come, the push goes round again later.
+                        Ok(AutoRestorePull::Deferred { .. }) => {
+                            let _ = cmd_tx
+                                .send(AgentCommand::RetryBackupAfterFailure(save.save_id.clone()))
                                 .await;
                             return;
                         }
@@ -6501,6 +6569,8 @@ fn process_poll(
             let weak_start = !strong_now.contains(id.as_str());
             if let Some(slot) = slots.get_mut(&id) {
                 slot.is_running = true;
+                slot.running_now
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
                 slot.weak_session = weak_start;
                 // A new session earns a new "update waiting" notice if a pull
                 // gets deferred again. `pull_pending` itself survives: an
@@ -6545,6 +6615,8 @@ fn process_poll(
             let was_weak_session = slots.get(&id).map(|s| s.weak_session).unwrap_or(false);
             if let Some(slot) = slots.get_mut(&id) {
                 slot.is_running = false;
+                slot.running_now
+                    .store(false, std::sync::atomic::Ordering::Relaxed);
                 slot.weak_session = false;
             }
             // A phantom session: it started on correlation alone and died without ONE
@@ -6626,6 +6698,7 @@ pub(crate) fn test_slot(save: WatchedSave) -> SaveSlot {
         burst_since: None,
         burst_backups: 0,
         is_running: false,
+        running_now: Default::default(),
         weak_session: false,
         last_running_seen: None,
         has_pending: false,
@@ -9373,6 +9446,93 @@ mod tests {
         let ds = tick(&mut slot, &cloud, t + time::Duration::seconds(1));
         assert!(ds.contains(&Decision::Act(Action::Backup)), "{ds:?}");
         assert!(no_lease_hold(&ds), "{ds:?}");
+    }
+
+    /// A member's save of the Valheim world `Alpha`: what it walks and pushes
+    /// is the share's list.
+    fn member_world(root: &Path) -> WatchedSave {
+        let mut save = shared_world("w1", root);
+        save.include = alpha_world();
+        save.shared.as_mut().unwrap().include = alpha_world();
+        save
+    }
+
+    /// `files`, borrowed the way `testserver` takes them.
+    fn as_routes_files(files: &std::collections::BTreeMap<String, Vec<u8>>) -> Vec<(&str, &[u8])> {
+        files
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_slice()))
+            .collect()
+    }
+
+    /// A game started during the download: the version is staged but not
+    /// merged, so nothing is moved aside and nothing is written, and the pull
+    /// comes back `Deferred` for the reducer to ask again. Once the folder is
+    /// quiet the same pull merges.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_game_started_during_the_download_defers_the_whole_merge() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = &tmp.path().join("save");
+        let staging = &tmp.path().join("v4");
+        let conflict_root = &tmp.path().join("conflicts");
+        valheim_generation(root, "Alpha", 6, &["0_0.chunk"]);
+        write_file(&root.join("characters_local/Me.fch"), b"mine");
+        valheim_generation(staging, "Alpha", 8, &["0_0.chunk"]);
+        let v4 = files_under(staging);
+        let routes = crate::testserver::selfhosted_version("w1", 4, &as_routes_files(&v4)).await;
+        let (url, _) = crate::testserver::serve(move |_| routes).await;
+        let api = ApiClient::new(url, "t").unwrap();
+        let save = member_world(root);
+        let before = files_under(root);
+        let retention = Duration::from_secs(14 * 86_400);
+
+        let slot = test_slot(save.clone());
+        slot.running_now
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let running = still_quiet(&slot);
+        let pulled = run_auto_restore(
+            &api,
+            &save,
+            Some(conflict_root),
+            retention,
+            Some(1),
+            None,
+            None,
+            true,
+            Some(&running),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            pulled,
+            AutoRestorePull::Deferred { version_num: 4 }
+        ));
+        assert_eq!(files_under(root), before);
+        assert!(files_under(conflict_root).is_empty());
+
+        slot.running_now
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+        let quiet = still_quiet(&slot);
+        let pulled = run_auto_restore(
+            &api,
+            &save,
+            Some(conflict_root),
+            retention,
+            Some(1),
+            None,
+            None,
+            true,
+            Some(&quiet),
+        )
+        .await
+        .unwrap();
+        let AutoRestorePull::Merged(outcome) = pulled else {
+            panic!("a quiet folder is merged");
+        };
+        let mut expected = v4.clone();
+        expected.insert("characters_local/Me.fch".into(), b"mine".to_vec());
+        assert_eq!(files_under(root), expected);
+        assert_eq!(outcome.world_files_set_aside, 4);
     }
 
     /// Mirror image: when the target is a strict subset of the snapshot
