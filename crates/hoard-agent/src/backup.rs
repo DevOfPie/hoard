@@ -757,6 +757,28 @@ pub fn manifest_digest<'a>(files: impl Iterator<Item = (&'a str, &'a str, i64)>)
 /// "unreadable" and "empty" never give the same digest.
 const UNREADABLE_MARKER: &[u8] = b"\x01hoard:unreadable\x01";
 
+/// The files [`compute_content_signature`] warned it could not read, until one
+/// is read again: the warning is once per stretch of unreadability, not once
+/// per pass (a held push hashes the folder on every attempt and every save).
+static UNREADABLE_WARNED: std::sync::LazyLock<std::sync::Mutex<HashSet<PathBuf>>> =
+    std::sync::LazyLock::new(Default::default);
+
+/// Records `path` as unreadable; `true` the first time since it last read.
+fn unreadable_first_seen(path: &Path) -> bool {
+    UNREADABLE_WARNED
+        .lock()
+        .map_or(true, |mut warned| warned.insert(path.to_path_buf()))
+}
+
+/// `path` read: its next failure warns again.
+fn unreadable_read_again(path: &Path) {
+    if let Ok(mut warned) = UNREADABLE_WARNED.lock() {
+        if !warned.is_empty() {
+            warned.remove(path);
+        }
+    }
+}
+
 /// A content signature over the sorted `(relative_path, bytes)` set.
 ///
 /// Unlike [`compute_set_signature`] this *reads every file*, so it is only used as
@@ -818,14 +840,23 @@ async fn compute_content_signature(files: &[UploadFile]) -> String {
             });
             if gone {
                 tracing::debug!(path = %f.relative_path, "hashing: a file left the folder after the walk");
-            } else {
+            } else if unreadable_first_seen(&f.absolute_path) {
                 tracing::warn!(
                     path = %f.relative_path,
                     error = %format!("{e:#}"),
                     "hashing: skipping unreadable file"
                 );
+            } else {
+                // Said already, and a held push says so on every attempt.
+                tracing::debug!(
+                    path = %f.relative_path,
+                    error = %format!("{e:#}"),
+                    "hashing: skipping unreadable file, still"
+                );
             }
             h.update(UNREADABLE_MARKER);
+        } else {
+            unreadable_read_again(&f.absolute_path);
         }
         h.update([0u8]);
     }
@@ -2803,6 +2834,51 @@ mod trim_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A file that stays unreadable is warned about once, not on every pass
+    /// (every held attempt hashes the folder); read again and lost again, it
+    /// warns again.
+    #[tokio::test(flavor = "current_thread")]
+    async fn an_unreadable_file_warns_once_while_it_stays_unreadable() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::sync::{Arc, Mutex};
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let locked = root.join("a.sav");
+        std::fs::write(&locked, b"aaaa").unwrap();
+        let set = |mode| {
+            std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(mode)).unwrap()
+        };
+        set(0o000);
+        if std::fs::read(&locked).is_ok() {
+            set(0o644);
+            return; // root reads it anyway
+        }
+        let files = walk_source(root, Scope::default()).unwrap();
+        let log: Arc<Mutex<Vec<u8>>> = Arc::default();
+        let sink = log.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::WARN)
+            .with_writer(move || LockedLog(sink.clone()))
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+        let warnings = || {
+            String::from_utf8(log.lock().unwrap().clone())
+                .unwrap()
+                .matches("skipping unreadable file")
+                .count()
+        };
+        for _ in 0..3 {
+            compute_content_signature(&files).await;
+        }
+        assert_eq!(warnings(), 1, "three passes, one warning");
+        set(0o644);
+        compute_content_signature(&files).await;
+        set(0o000);
+        compute_content_signature(&files).await;
+        set(0o644);
+        assert_eq!(warnings(), 2, "unreadable again after a read");
+    }
 
     /// A re-walk does not read an unchanged file again: a file at the size and
     /// mtime an earlier walk of the same upload hashed takes that hash, and
