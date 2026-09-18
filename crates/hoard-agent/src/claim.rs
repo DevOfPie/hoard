@@ -955,8 +955,10 @@ fn maybe_release_after_push(slot: &mut SaveSlot, lease: Option<&LeaseHandle>) {
 /// not running and no session is live, and nothing is in flight or already
 /// asked of the lease task. It does not wait for `has_pending` to clear, which
 /// is what the other two releases wait for and what a held push never does.
-/// A role pinned for the next launch does not keep it either: a pin is a wish
-/// to host, and a host that cannot push is not hosting.
+/// A role pinned for the next launch does not keep it, and is cleared with
+/// it: a pin is a wish to host, a host that cannot push is not hosting, and a
+/// pin left standing would take the lease at the next launch without asking
+/// (the same invariant as HRD-F-0028).
 ///
 /// The writes stay pending. A parked push retries only on a change to the
 /// save or the user's word, so this is not a loop of acquires. If the head
@@ -984,6 +986,7 @@ fn maybe_release_held_world(
         parked = slot.world_held.needs_attention,
         "agent: the world's push is held and no game is running; releasing the hosting lease so another member can host"
     );
+    slot.role_pinned = false;
     give_back(slot, lease, true);
     let _ = events_tx.try_send(AgentEvent::WorldReleased {
         save_id: slot.save.save_id.clone(),
@@ -2145,6 +2148,9 @@ mod tests {
             tokio::task::yield_now().await;
             assert_eq!(seen.try_recv().unwrap(), "release w1", "{case}");
             assert!(slot.has_pending, "{case}: the writes stay pending");
+            // M-1: the pin goes with the lease, or the next launch hosts
+            // without asking.
+            assert!(!slot.role_pinned, "{case}: the pin outlived the release");
             assert!(
                 drain(&mut rx)
                     .iter()
