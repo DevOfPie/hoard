@@ -940,20 +940,27 @@ fn maybe_release_after_push(slot: &mut SaveSlot, lease: Option<&LeaseHandle>) {
 }
 
 /// A world this machine hosts whose push is held for a file that cannot go up
-/// (`kernel::WorldHeld`), with no game running here: the lease goes back, so
-/// another member can host rather than wait on a push that may never come.
+/// (`kernel::WorldHeld`) and has parked, with no game running here: the lease
+/// goes back, so another member can host rather than wait on a push that may
+/// never come.
 ///
-/// The rule: held (on the backoff or parked), the lease reads `Mine`, the game
-/// is not running and no session is live, and nothing is in flight or already
+/// Parked, not merely held. A file locked for a few seconds (an antivirus
+/// scan, an indexer) holds the first attempts too, and a lease given back then
+/// lets a member host from the old head: the next attempt reads `Other` and
+/// the whole last session goes to the side copy. While the push climbs its
+/// ladder the lease stays here; the reducer holds on `HOLD_WORLD_HELD` ahead
+/// of the lease, so nothing is asked of it meanwhile.
+///
+/// The rule: parked (`needs_attention`), the lease reads `Mine`, the game is
+/// not running and no session is live, and nothing is in flight or already
 /// asked of the lease task. It does not wait for `has_pending` to clear, which
 /// is what the other two releases wait for and what a held push never does.
 /// A role pinned for the next launch does not keep it either: a pin is a wish
 /// to host, and a host that cannot push is not hosting.
 ///
-/// The writes stay pending. The next retry asks for the lease again only when
-/// its backoff is up (the reducer holds on `HOLD_WORLD_HELD` ahead of the
-/// lease), so this is not a loop of acquires. If somebody else hosts
-/// meanwhile, the held writes are set aside before the pull
+/// The writes stay pending. A parked push retries only on a change to the
+/// save or the user's word, so this is not a loop of acquires. If the head
+/// moves meanwhile, the held writes are set aside before the pull
 /// (`set_aside_behind`), as an owner's are, and the head comes down.
 /// `true` when it released.
 fn maybe_release_held_world(
@@ -961,7 +968,7 @@ fn maybe_release_held_world(
     events_tx: &mpsc::Sender<AgentEvent>,
     lease: Option<&LeaseHandle>,
 ) -> bool {
-    if !slot.world_held.active()
+    if !slot.world_held.needs_attention
         || slot.lease != LeaseObs::Mine
         || slot.is_running
         || slot.session.as_ref().is_some_and(|w| w.live())
@@ -2101,9 +2108,10 @@ mod tests {
     }
 
     /// H-B: a world whose push is held for a file that cannot be read gives
-    /// its lease back once no game runs here, with the writes still pending:
-    /// another member can host. Not while the game runs, and not with a
-    /// session live.
+    /// its lease back once it parks and no game runs here, with the writes
+    /// still pending: another member can host. Not while the game runs, not
+    /// with a session live, and not while the push is still on its ladder
+    /// (H-B-1).
     #[tokio::test(start_paused = true)]
     async fn a_held_world_gives_the_lease_back_with_no_game_running() {
         let (tx, mut rx) = mpsc::channel(8);
@@ -2114,8 +2122,8 @@ mod tests {
             slot.lease = LeaseObs::Mine;
             slot.has_pending = true;
             slot.world_held = kernel::WorldHeld {
-                consecutive: 1,
-                needs_attention: false,
+                consecutive: kernel::reconcile::WORLD_HELD_GIVE_UP_AFTER,
+                needs_attention: true,
             };
         };
         for case in ["no session", "session stopped", "parked, pinned"] {
@@ -2126,9 +2134,7 @@ mod tests {
                 on_game_stopped(s.get_mut("w1").unwrap());
             }
             if case == "parked, pinned" {
-                let slot = s.get_mut("w1").unwrap();
-                slot.world_held.needs_attention = true;
-                slot.role_pinned = true;
+                s.get_mut("w1").unwrap().role_pinned = true;
             }
             drain(&mut rx);
             let slot = s.get_mut("w1").unwrap();
@@ -2146,12 +2152,30 @@ mod tests {
                 "{case}"
             );
         }
-        for case in ["running", "session live", "not held"] {
+        // Held but still on its ladder (H-B-1): a file locked for seconds must
+        // not hand the world to a member who would host from the old head.
+        for case in [
+            "running",
+            "session live",
+            "not held",
+            "held once",
+            "held, session stopped",
+        ] {
             let mut s = slots(vec![world("w1", "valheim")]);
             held(&mut s);
+            let on_ladder = kernel::WorldHeld {
+                consecutive: 1,
+                needs_attention: false,
+            };
             match case {
                 "running" => s.get_mut("w1").unwrap().is_running = true,
                 "session live" => on_game_started(&mut s, "w1", now, &tx),
+                "held once" => s.get_mut("w1").unwrap().world_held = on_ladder,
+                "held, session stopped" => {
+                    s.get_mut("w1").unwrap().world_held = on_ladder;
+                    on_game_started(&mut s, "w1", now, &tx);
+                    on_game_stopped(s.get_mut("w1").unwrap());
+                }
                 _ => s.get_mut("w1").unwrap().world_held = kernel::WorldHeld::default(),
             }
             let slot = s.get_mut("w1").unwrap();
