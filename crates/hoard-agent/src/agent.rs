@@ -2279,17 +2279,89 @@ fn execute_backup(
 /// And a write to the save's folder after the pull started means somebody is
 /// writing it: a game the poll does not see (undetected on Linux, where
 /// locks never show), and the merge waits for the folder to go quiet (L-C).
+///
+/// The poll's word alone is not enough: while no game runs it samples every
+/// 8 s, and a game started in between is a game the merge lands under (M3 of
+/// the third end-to-end run). So the process table is also read afresh, with
+/// the poll's own strong signals ([`save_process_running`]).
 pub(crate) fn still_quiet(slot: &SaveSlot) -> StillQuiet {
     use std::sync::atomic::Ordering;
     let running = slot.running_now.clone();
     let writes = slot.fs_writes.clone();
     let at_start = writes.load(Ordering::Relaxed);
     let path = slot.save.local_path.clone();
+    let save = slot.save.clone();
     Arc::new(move || {
         !running.load(Ordering::Relaxed)
             && writes.load(Ordering::Relaxed) == at_start
             && !crate::locks::any_file_locked(&path)
+            && !save_process_running_now(&save)
     })
+}
+
+/// [`save_process_running`] over a process table read now.
+fn save_process_running_now(save: &WatchedSave) -> bool {
+    let mut sys = System::new();
+    sys.refresh_processes_specifics(ProcessesToUpdate::All, true, proc_refresh_kind());
+    save_process_running(&sys, save)
+}
+
+/// Is `save`'s game in `sys`'s process table, by the process poll's strong
+/// signals ([`process_poll`]): a configured process name, the game's identity
+/// in the process name or path, a file of the save's folder held open, or,
+/// with no names configured, an executable under the install folder. Never a
+/// defunct process.
+///
+/// Not the two signals that need the poll's history: a process shared by
+/// several saves counts in the poll only with recent writes to this one's
+/// folder, and a correlation match only when its PID is born between ticks.
+/// The caller reads the poll's own word for those.
+fn save_process_running(sys: &System, save: &WatchedSave) -> bool {
+    if save.track_only {
+        return false;
+    }
+    let names: HashSet<String> = if save.shared_processes {
+        HashSet::new()
+    } else {
+        save.processes.iter().map(|p| p.to_lowercase()).collect()
+    };
+    let tokens = if save.shared_processes {
+        Vec::new()
+    } else {
+        game_identity_tokens(&save.game_slug, &save.display_name)
+    };
+    let folder = [(save.save_id.as_str(), save.local_path.as_path())];
+    let install_dir = save
+        .steam_install_dir
+        .as_deref()
+        .filter(|_| save.processes.is_empty());
+    for (pid, proc) in sys.processes() {
+        if is_defunct(proc.status()) {
+            continue;
+        }
+        let name = proc.name().to_string_lossy().to_lowercase();
+        if names.contains(&name) {
+            return true;
+        }
+        if crate::correlation::is_game_like(&name, proc.exe()) {
+            if !tokens.is_empty()
+                && process_identity_candidates(&name, proc.exe())
+                    .iter()
+                    .any(|c| tokens.contains(c))
+            {
+                return true;
+            }
+            if !open_paths_matching(*pid, &folder).is_empty() {
+                return true;
+            }
+        }
+        if let (Some(dir), Some(exe)) = (install_dir, proc.exe()) {
+            if exe.starts_with(dir) {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 /// Launches the restore (cloud to local, conflict-aware) the reducer asked for.
@@ -8818,6 +8890,33 @@ mod tests {
     fn owner_folder(root: &Path) {
         write_file(&root.join("worlds_local/Alpha.db"), b"alpha");
         write_file(&root.join("characters_local/Me.fch"), b"me");
+    }
+
+    /// M3 of the third end-to-end run: a game started less than one idle
+    /// poll before the merge is seen by the merge's own look at the process
+    /// table, not only by the poll's cached word.
+    #[test]
+    fn still_quiet_reads_the_process_table_afresh() {
+        let dir = tempfile::tempdir().unwrap();
+        owner_folder(dir.path());
+        // This test's own process stands in for the game just started: its
+        // name, as the process table gives it, is the save's process.
+        let mut sys = System::new();
+        sys.refresh_processes_specifics(ProcessesToUpdate::All, true, proc_refresh_kind());
+        let me = sysinfo::get_current_pid().unwrap();
+        let name = sys.process(me).unwrap().name().to_string_lossy().into_owned();
+        let mut save = owner_save(dir.path());
+        save.processes = vec![name];
+        let slot = test_slot(save);
+        assert!(
+            !slot.running_now.load(std::sync::atomic::Ordering::Relaxed),
+            "the poll has not seen it"
+        );
+        assert!(!still_quiet(&slot)(), "the merge sees it");
+
+        let mut save = owner_save(dir.path());
+        save.processes = vec!["no-such-game-7f3a".into()];
+        assert!(still_quiet(&test_slot(save))(), "nothing running: quiet");
     }
 
     /// L-C: a write to the save's folder after the pull started (a game the
