@@ -69,6 +69,7 @@
   import {
     backupBlocked,
     filesUnreadable,
+    worldHeld,
     wrongPathSuspected,
   } from "../lib/stores/agent";
   import CardResizeHandle from "../lib/components/CardResizeHandle.svelte";
@@ -1597,6 +1598,27 @@
                           {$_("library.backup_blocked_hint", {
                             values: { count: blocked.conflicts },
                           })}
+                        </span>
+                      </p>
+                    {/if}
+
+                    <!-- A shared world's push held for a file that can't be
+                         read: nothing went up, on purpose, because a version
+                         without it would move it out of every member's folder. -->
+                    {#if $worldHeld[save.save_id]}
+                      {@const held = $worldHeld[save.save_id]}
+                      <p
+                        class="flex items-start gap-1 text-[10px] text-red-400/90"
+                        title={`${$_("library.world_held_help")}\n\n${held.path} — ${held.error}`}
+                      >
+                        <AlertTriangle size={10} class="mt-px shrink-0" />
+                        <span>
+                          {$_(
+                            held.parked
+                              ? "library.world_parked_hint"
+                              : "library.world_held_hint",
+                            { values: { path: held.path } },
+                          )}
                         </span>
                       </p>
                     {/if}

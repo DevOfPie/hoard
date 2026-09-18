@@ -903,6 +903,7 @@ fn emit_event(app: &AppHandle, ev: &AgentEvent) {
         AgentEvent::BackupTrimmed { .. } => "agent://backup-trimmed",
         AgentEvent::BackupFilesUnreadable { .. } => "agent://backup-files-unreadable",
         AgentEvent::BackupNeedsAttention { .. } => "agent://backup-needs-attention",
+        AgentEvent::BackupWorldHeld { .. } => "agent://backup-world-held",
         AgentEvent::BackupAttentionCleared { .. } => "agent://backup-attention-cleared",
         AgentEvent::SaveAutoRestored { .. } => "agent://save-auto-restored",
         AgentEvent::SaveAutoRestoreFailed { .. } => "agent://save-auto-restore-failed",

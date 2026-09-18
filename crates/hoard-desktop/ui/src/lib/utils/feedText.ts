@@ -130,6 +130,11 @@ export function feedSummary(e: FeedEntry, $_: Translate): string {
       return $_("activity.backup_files_unreadable", {
         values: { name, count: e.count ?? 0, error: e.error ?? "" },
       });
+    case "backup_world_held":
+      return $_(
+        e.parked ? "activity.backup_world_parked" : "activity.backup_world_held",
+        { values: { name, path: e.path ?? "", error: e.error ?? "" } },
+      );
     case "auto_restore_failed":
       return $_("activity.auto_restore_failed", {
         values: { name, error: e.error ?? "" },

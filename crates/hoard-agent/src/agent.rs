@@ -475,6 +475,20 @@ enum AgentCommand {
     /// world fingerprint is forgotten, so the owner's next tick holds for the
     /// lease instead of backing off (HRD-D-0019).
     ParkBackupLeaseRequired(String),
+    /// Internal: a shared world's push was held because one of its files
+    /// cannot go up ([`crate::backup::PartialWorld`]). Same wedge-avoidance
+    /// contract as the parks above (no `BackupDone`, `has_pending` survives),
+    /// fed to the reducer as [`kernel::OpResult::WorldHeld`] so it escalates on
+    /// [`kernel::reconcile::WORLD_HELD_BACKOFF_SECS`] and parks after
+    /// [`kernel::reconcile::WORLD_HELD_GIVE_UP_AFTER`], rather than the flat,
+    /// uncounted retry `RetryBackupAfterFailure` gives (the 14-day incident
+    /// above). A watcher hit on the save retries it at once.
+    ParkBackupPartialWorld {
+        id: String,
+        count: u64,
+        path: String,
+        error: String,
+    },
     /// Internal: a server older than the owner's exception refused the whole
     /// folder as outside the share's list. The slot walks the world alone from
     /// here on, for this run of the engine, as a member's does (HRD-D-0019).
@@ -1123,6 +1137,15 @@ pub(crate) struct SaveSlot {
     /// `ConflictStalled`. As with [`Self::last_restore_error`]: the reducer carries
     /// no text, and the `BackupNeedsAttention` event has to say why.
     last_conflict_error: Option<String>,
+    /// A shared world's push held for a file that cannot go up
+    /// ([`kernel::State::world_held`]). The reducer escalates and parks it; a
+    /// watcher hit on the save or "back up now" retries it
+    /// ([`kernel::reconcile::retry_held_world`]); a push that goes up clears it.
+    pub(crate) world_held: kernel::WorldHeld,
+    /// What the last held push said (how many files, the first, why), queued
+    /// with a `pending_op_result` of `WorldHeld` for the event the shell sends
+    /// once the reducer has counted it.
+    last_world_held: Option<(u64, String, String)>,
     /// Cloud version this slot is known to be synced to, advanced on a genuine
     /// upload commit and after a successful auto-restore. The reconciliation
     /// sweep passes it to `run_auto_restore`, which skips the download-to-diff
@@ -1305,6 +1328,7 @@ fn state_from_slot(slot: &SaveSlot, config: &AgentConfig, now: OffsetDateTime) -
         deferred_notified: slot.deferred_notified,
         restore_failures: slot.restore_failures,
         backup_conflict: slot.backup_conflict,
+        world_held: slot.world_held,
     }
 }
 
@@ -1338,6 +1362,7 @@ fn apply_state_to_slot(slot: &mut SaveSlot, next: kernel::State) {
     slot.deferred_notified = next.deferred_notified;
     slot.restore_failures = next.restore_failures;
     slot.backup_conflict = next.backup_conflict;
+    slot.world_held = next.world_held;
 }
 
 /// The cloud-head cache, with the stamp of when it arrived. The pair travels
@@ -1800,6 +1825,8 @@ fn reconcile_all(
         let err_for_stuck = slot.last_restore_error.take();
         let was_blocked = slot.backup_conflict.needs_attention;
         let err_for_conflict = slot.last_conflict_error.take();
+        let was_held = slot.world_held;
+        let world_held_why = slot.last_world_held.take();
 
         let world = kernel::World {
             now,
@@ -1863,6 +1890,37 @@ fn reconcile_all(
                 label: slot.save.label.clone(),
                 conflicts: slot.backup_conflict.consecutive,
                 error: err_for_conflict.unwrap_or_default(),
+            });
+        }
+        // A held world push: said on every attempt the reducer counts, with
+        // whether it parked; cleared when a push goes up.
+        let now_held = slot.world_held;
+        if now_held.consecutive > was_held.consecutive {
+            let (count, sample_path, sample_error) = world_held_why.unwrap_or_default();
+            tracing::warn!(
+                save_id = %id,
+                game_slug = %slot.save.game_slug,
+                attempts = now_held.consecutive,
+                parked = now_held.needs_attention,
+                path = %sample_path,
+                error = %sample_error,
+                "agent: holding the push, the shared world would go up without some of its files"
+            );
+            let _ = events_tx.try_send(AgentEvent::BackupWorldHeld {
+                save_id: id.clone(),
+                game_slug: slot.save.game_slug.clone(),
+                label: slot.save.label.clone(),
+                count,
+                sample_path,
+                sample_error,
+                attempts: now_held.consecutive,
+                parked: now_held.needs_attention,
+            });
+        }
+        if was_held.active() && !now_held.active() && !now_blocked {
+            let _ = events_tx.try_send(AgentEvent::BackupAttentionCleared {
+                save_id: id.clone(),
+                game_slug: slot.save.game_slug.clone(),
             });
         }
         if was_blocked && !now_blocked {
@@ -2601,6 +2659,11 @@ async fn run_agent(
                                 slot.backup_conflict = kernel::ConflictStall::default();
                                 slot.next_backup_at = None;
                             }
+                            // And a held world is tried again now, parked or not.
+                            kernel::reconcile::retry_held_world(
+                                &mut slot.world_held,
+                                &mut slot.next_backup_at,
+                            );
                             mark_pending_if_diverged(slot);
                         }
                         reconcile_all(
@@ -2681,6 +2744,23 @@ async fn run_agent(
                         if let Some(slot) = slots.get_mut(&id) {
                             slot.next_scheduled_backup_at = None;
                             slot.pending_op_result = Some(kernel::OpResult::LeaseRequired);
+                        }
+                        reconcile_all(
+                            &mut slots, &api, &events_tx, &cmd_tx, &config, &done_tx,
+                            &cloud_heads, lease_task.as_ref(),
+                        );
+                    }
+                    Some(AgentCommand::ParkBackupPartialWorld { id, count, path, error }) => {
+                        if let Some(slot) = slots.get_mut(&id) {
+                            slot.next_scheduled_backup_at = None;
+                            slot.pending_op_result = Some(kernel::OpResult::WorldHeld);
+                            slot.last_world_held = Some((count, path, error));
+                            tracing::info!(
+                                save_id = %id,
+                                held = slot.world_held.consecutive + 1,
+                                give_up_after = kernel::reconcile::WORLD_HELD_GIVE_UP_AFTER,
+                                "agent: shared world push held, escalating the backoff"
+                            );
                         }
                         reconcile_all(
                             &mut slots, &api, &events_tx, &cmd_tx, &config, &done_tx,
@@ -3314,6 +3394,8 @@ fn handle_add(
         pending_upload_landed: None,
         last_restore_error: None,
         last_conflict_error: None,
+        world_held: kernel::WorldHeld::default(),
+        last_world_held: None,
         known_version,
         version_base: None,
         pull_pending: false,
@@ -4754,11 +4836,18 @@ fn hit_reaches_walk(slot: &SaveSlot, paths: &[PathBuf]) -> bool {
 /// What a watcher hit marks on its slot: pending, the event's time, a fresh L1
 /// on the next tick, and the world's fingerprint dropped, since the write may
 /// have moved it.
+///
+/// A world push held for a file that cannot be read is retried at once: the
+/// write may be the fix (a chmod, the game letting go of the file), and waiting
+/// out the backoff for it is what held the H1 recovery for ten minutes.
 fn mark_fs_hit(slot: &mut SaveSlot, now: OffsetDateTime) {
     slot.has_pending = true;
     slot.last_fs_event_at = Some(now);
     slot.needs_l1 = true;
     slot.observed_world_fingerprint = None;
+    if kernel::reconcile::retry_held_world(&mut slot.world_held, &mut slot.next_backup_at) {
+        tracing::info!(save_id = %slot.save.save_id, "agent: the save changed while its world push was held; trying again");
+    }
 }
 
 /// Find which save a path event belongs to. The fs watcher emits the root
@@ -5559,37 +5648,22 @@ async fn run_backup_with_retry(
                 }
                 // A shared world one of whose files is unreadable, or over the
                 // plan's cap: published, it would move good copies out of every
-                // puller's world folder (HRD-Q-0027). Held like the unreadable
-                // folder below: no `BackupDone` (the changes stay pending), the
-                // warning on the game's card, and the failure backoff to try
-                // again, by when the game has usually let go of the file.
+                // puller's world folder (HRD-Q-0027). Held: no `BackupDone` (the
+                // changes stay pending), and its own escalation in the reducer,
+                // which parks it once the budget is spent. The shell sends the
+                // `BackupWorldHeld` warning once the reducer has counted it.
                 let partial = e
                     .chain()
                     .find_map(|c| c.downcast_ref::<crate::backup::PartialWorld>())
                     .map(|p| (p.count, p.first.clone(), p.reason.clone()));
                 if let Some((count, first, reason)) = partial {
-                    tracing::warn!(
-                        save_id = %save.save_id,
-                        game_slug = %save.game_slug,
-                        count,
-                        path = %first,
-                        error = %reason,
-                        "agent: holding the push, the shared world would go up without some of its files"
-                    );
-                    let _ = events_tx
-                        .send(AgentEvent::BackupFilesUnreadable {
-                            save_id: save.save_id.clone(),
-                            game_slug: save.game_slug.clone(),
-                            label: save.label.clone(),
-                            count: count as u64,
-                            kept_files: 0,
-                            sample_path: first,
-                            sample_error: reason,
-                            uploaded: false,
-                        })
-                        .await;
                     let _ = cmd_tx
-                        .send(AgentCommand::RetryBackupAfterFailure(save.save_id.clone()))
+                        .send(AgentCommand::ParkBackupPartialWorld {
+                            id: save.save_id.clone(),
+                            count: count as u64,
+                            path: first,
+                            error: reason,
+                        })
                         .await;
                     return;
                 }
@@ -6803,6 +6877,8 @@ pub(crate) fn test_slot(save: WatchedSave) -> SaveSlot {
         pending_upload_landed: None,
         last_restore_error: None,
         last_conflict_error: None,
+        world_held: kernel::WorldHeld::default(),
+        last_world_held: None,
         known_version: None,
         version_base: None,
         pull_pending: false,
@@ -8514,6 +8590,55 @@ mod tests {
         write_file(&root.join("characters_local/Me.fch"), b"me");
     }
 
+    /// H-B recovery: a write to the save while its world push is held (the
+    /// chmod that makes the file readable is one) retries the push at once,
+    /// parked or on the backoff. An ordinary failure's backoff is not the
+    /// watcher's to cut.
+    #[test]
+    fn a_write_to_a_held_world_retries_its_push_at_once() {
+        use kernel::reconcile::{HOLD_WORLD_NEEDS_ATTENTION, WORLD_HELD_GIVE_UP_AFTER};
+        use kernel::{Action, Decision};
+        let now = OffsetDateTime::now_utc();
+        let dir = tempfile::tempdir().unwrap();
+        owner_folder(dir.path());
+        let mut slot = test_slot(owner_save(dir.path()));
+        slot.lease = kernel::LeaseObs::Mine;
+        slot.has_pending = true;
+        slot.synced_fingerprint = Some(1);
+        slot.world_held = kernel::WorldHeld {
+            consecutive: WORLD_HELD_GIVE_UP_AFTER,
+            needs_attention: true,
+        };
+        let tick = |slot: &mut SaveSlot| {
+            slot.needs_l1 = true;
+            let obs = observe_slot(slot, &CloudHeads::new(now));
+            let state = state_from_slot(slot, &AgentConfig::default(), now);
+            kernel::reconcile::reconcile(&state, &obs, kernel::World { now, seed: 0 }).1
+        };
+        assert_eq!(
+            tick(&mut slot).last(),
+            Some(&Decision::Hold {
+                reason: HOLD_WORLD_NEEDS_ATTENTION
+            })
+        );
+        mark_fs_hit(&mut slot, now - time::Duration::seconds(120));
+        assert!(!slot.world_held.needs_attention);
+        assert_eq!(slot.world_held.consecutive, WORLD_HELD_GIVE_UP_AFTER);
+        assert!(slot.next_backup_at.is_none());
+        assert!(
+            tick(&mut slot)
+                .iter()
+                .any(|d| d == &Decision::Act(Action::Backup)),
+            "the push goes again now"
+        );
+
+        let mut failed = test_slot(owner_save(dir.path()));
+        let backoff = now + time::Duration::seconds(600);
+        failed.next_backup_at = Some(backoff);
+        mark_fs_hit(&mut failed, now);
+        assert_eq!(failed.next_backup_at, Some(backoff));
+    }
+
     /// C7 of HRD-D-0019: the owner's whole-folder push refused 409
     /// `lease_required` goes back to the reducer as a hold for the lease, not
     /// through the retries and the failure backoff.
@@ -9759,8 +9884,10 @@ mod tests {
 
     /// A member's push whose world holds a file that cannot be read is held,
     /// not published without it: nothing reaches the server, the changes stay
-    /// pending (no `BackupDone`), the card is warned, and the failure backoff
-    /// tries again.
+    /// pending (no `BackupDone`), and it goes back to the loop as its own park
+    /// (`WorldHeld`, H-B), not the flat, uncounted `RetryBackupAfterFailure`.
+    /// The task sends no warning of its own: "not one file could be read" was
+    /// the wrong one, and the shell says it once the reducer has counted it.
     #[cfg(unix)]
     #[tokio::test(flavor = "current_thread")]
     async fn a_shared_world_with_an_unreadable_file_holds_the_push() {
@@ -9804,23 +9931,15 @@ mod tests {
         assert!(done_rx.try_recv().is_err(), "still pending");
         assert!(matches!(
             cmd_rx.try_recv(),
-            Ok(AgentCommand::RetryBackupAfterFailure(id)) if id == "w1"
+            Ok(AgentCommand::ParkBackupPartialWorld { id, count: 1, path, .. })
+                if id == "w1" && path == "worlds_local/Alpha/0_0.chunk"
         ));
-        let mut warned = None;
         while let Ok(evt) = events_rx.try_recv() {
-            if let AgentEvent::BackupFilesUnreadable {
-                sample_path,
-                uploaded,
-                ..
-            } = evt
-            {
-                warned = Some((sample_path, uploaded));
-            }
+            assert!(
+                !matches!(evt, AgentEvent::BackupFilesUnreadable { .. }),
+                "{evt:?}"
+            );
         }
-        assert_eq!(
-            warned,
-            Some(("worlds_local/Alpha/0_0.chunk".to_string(), false))
-        );
         assert!(
             !seen.lock().unwrap().iter().any(|l| l.starts_with("POST")),
             "nothing was uploaded: {:?}",

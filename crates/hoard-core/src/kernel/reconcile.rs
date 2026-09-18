@@ -30,7 +30,7 @@ use time::{Duration, OffsetDateTime};
 
 use super::{
     session, Action, ConflictStall, Decision, LeaseObs, Observation, Op, OpResult, RestoreFailures,
-    State, World,
+    State, World, WorldHeld,
 };
 
 // ---- pacing constants (sans-IO twins of the ones in `agent.rs`)
@@ -86,6 +86,20 @@ pub const CONFLICT_STALL_GIVE_UP_AFTER: u32 = 5;
 /// it as "this needs you to look at it", so it is a constant rather than a
 /// literal, same as [`HOLD_BACKUP_MIN_INTERVAL`].
 pub const HOLD_BACKUP_NEEDS_ATTENTION: &str = "backup conflict needs the user";
+/// Escalation for a shared world's push held because one of its files cannot
+/// go up ([`OpResult::WorldHeld`]): 1, 5, 15, 30 minutes. It starts short
+/// because the usual cause, a game still holding a chunk open on Windows, lets
+/// go within a minute; it does not stay flat because a root-owned file or a
+/// broken ACL never does.
+pub const WORLD_HELD_BACKOFF_SECS: [i64; 4] = [60, 5 * 60, 15 * 60, 30 * 60];
+/// Held pushes after which the clock stops retrying and the save asks for the
+/// user. A change to the save's files still retries (a chmod is one).
+pub const WORLD_HELD_GIVE_UP_AFTER: u32 = 5;
+/// The `Hold` reason while a held world waits out its backoff. Ahead of the
+/// lease check, so a push that cannot go up does not ask for the lease.
+pub const HOLD_WORLD_HELD: &str = "shared world push held: a file can't be read";
+/// The `Hold` reason once a held world's budget is spent.
+pub const HOLD_WORLD_NEEDS_ATTENTION: &str = "shared world push held: needs the user";
 /// A shared save whose lease another member holds: the push is theirs. The
 /// shell announces the holder off this reason.
 pub const HOLD_LEASE_OTHER: &str = "world is hosted by another member";
@@ -332,6 +346,15 @@ fn decide_backup(
     // successful backup, or a new cloud head.
     if next.backup_conflict.needs_attention {
         return Some(hold(HOLD_BACKUP_NEEDS_ATTENTION));
+    }
+    // A shared world whose push is held for a file that cannot go up: parked,
+    // or waiting out its backoff. Both ahead of the lease, so a push that is
+    // going to be held again does not take the world from anybody.
+    if next.world_held.needs_attention {
+        return Some(hold(HOLD_WORLD_NEEDS_ATTENTION));
+    }
+    if next.world_held.active() && next.next_backup_at.is_some_and(|t| now < t) {
+        return Some(hold(HOLD_WORLD_HELD));
     }
     // The game is writing the save right now, so uploading would capture a
     // half-written file. This is a pacing brake, not an error: as soon as it lets
@@ -620,6 +643,7 @@ fn ingest_op_result(
                     // unresolvable 409 resolved. The whole escalation is released,
                     // which is also what turns the warning off in the UI.
                     next.backup_conflict = ConflictStall::default();
+                    next.world_held = WorldHeld::default();
                     if wrote {
                         // A real commit moves the min-interval anchor (ADR 0018).
                         // The floor derives from it ([`backup_floor`]); there is
@@ -712,6 +736,13 @@ fn ingest_op_result(
                 next.next_backup_at = Some(now + Duration::seconds(delay));
             }
         }
+        // A shared world's push held for a file that cannot go up: its own
+        // ladder, then parked. `has_pending` stays, nothing went up.
+        OpResult::WorldHeld => {
+            if let Some(delay) = record_world_held(&mut next.world_held) {
+                next.next_backup_at = Some(now + Duration::seconds(delay));
+            }
+        }
         // 409 `lease_required` (HRD-D-0019): the server wanted the lease for this
         // push, because the world it holds is not the one this owner synced, or
         // because it predates the owner's exception. Forgetting the world's
@@ -786,6 +817,31 @@ fn record_conflict(c: &mut ConflictStall, latest: Option<i64>) -> Option<i64> {
     }
     let idx = (c.consecutive as usize - 1).min(CONFLICT_STALL_BACKOFF_SECS.len() - 1);
     Some(CONFLICT_STALL_BACKOFF_SECS[idx])
+}
+
+/// Records a held world push and returns the backoff, or `None` once the
+/// budget is spent and the push parks.
+fn record_world_held(h: &mut WorldHeld) -> Option<i64> {
+    h.consecutive = h.consecutive.saturating_add(1);
+    if h.consecutive >= WORLD_HELD_GIVE_UP_AFTER {
+        h.needs_attention = true;
+        return None;
+    }
+    let idx = (h.consecutive as usize - 1).min(WORLD_HELD_BACKOFF_SECS.len() - 1);
+    Some(WORLD_HELD_BACKOFF_SECS[idx])
+}
+
+/// The save's files changed while its world push was held: the file may read
+/// now, so the push is tried again at once, parked or not. The counter stays,
+/// so a change that fixes nothing parks again on the next hold rather than
+/// climbing the ladder from the bottom. `false` when nothing was held.
+pub fn retry_held_world(held: &mut WorldHeld, next_backup_at: &mut Option<OffsetDateTime>) -> bool {
+    if !held.active() {
+        return false;
+    }
+    held.needs_attention = false;
+    *next_backup_at = None;
+    true
 }
 
 /// Releases the conflict escalation when the cloud publishes a head different
@@ -1432,6 +1488,87 @@ mod tests {
         };
         let (_n, ds_after) = reconcile(&next, &obs_after, world(BACKUP_FAILURE_BACKOFF_SECS + 1));
         assert_eq!(acts(&ds_after), vec![&Action::Backup]);
+    }
+
+    /// H-B: a shared world's push held for a file that cannot be read climbs
+    /// its own ladder and parks, instead of the flat, uncounted retry. While it
+    /// waits it holds ahead of the lease, so it does not ask for a world it
+    /// cannot push. A change to the save (`retry_held_world`) unparks it at
+    /// once, and a push that goes up clears it.
+    #[test]
+    fn a_held_world_escalates_parks_and_a_change_retries_it() {
+        let mut state = State {
+            shared: true,
+            has_pending: true,
+            synced_fingerprint: Some(1),
+            ..base_state()
+        };
+        let pending = |lease| Observation {
+            local_fingerprint: Some(2),
+            lease,
+            ..quiet_obs()
+        };
+        let mut clock = 0i64;
+        for (attempt, backoff) in WORLD_HELD_BACKOFF_SECS.iter().enumerate() {
+            state.in_flight = Some(Op::Backup);
+            let obs = Observation {
+                op_result: Some(OpResult::WorldHeld),
+                ..pending(LeaseObs::Mine)
+            };
+            let (next, ds) = reconcile(&state, &obs, world(clock));
+            assert_eq!(next.world_held.consecutive, attempt as u32 + 1);
+            assert!(!next.world_held.needs_attention);
+            assert!(next.has_pending, "nothing went up");
+            assert_eq!(next.next_backup_at, Some(at(clock + backoff)));
+            assert_eq!(ds.last(), Some(&hold(HOLD_WORLD_HELD)), "{ds:?}");
+            // With the lease given back meanwhile it still holds on the
+            // backoff, not on the lease: no acquire for a push that waits.
+            let (_m, mid) = reconcile(&next, &pending(LeaseObs::Free), world(clock + 1));
+            assert_eq!(mid.last(), Some(&hold(HOLD_WORLD_HELD)), "{mid:?}");
+            clock += backoff + 1;
+            let (after, retried) = reconcile(&next, &pending(LeaseObs::Mine), world(clock));
+            assert_eq!(acts(&retried), vec![&Action::Backup], "{retried:?}");
+            state = after;
+        }
+        let obs = Observation {
+            op_result: Some(OpResult::WorldHeld),
+            ..pending(LeaseObs::Mine)
+        };
+        let (parked, ds) = reconcile(&state, &obs, world(clock));
+        assert_eq!(parked.world_held.consecutive, WORLD_HELD_GIVE_UP_AFTER);
+        assert!(parked.world_held.needs_attention);
+        assert_eq!(ds.last(), Some(&hold(HOLD_WORLD_NEEDS_ATTENTION)), "{ds:?}");
+        // Parked: no clock brings it back.
+        let (_n, later) = reconcile(&parked, &pending(LeaseObs::Mine), world(clock + 86_400));
+        assert!(acts(&later).is_empty(), "{later:?}");
+
+        // The file changed: tried again at once, the counter kept.
+        let mut retried = parked.clone();
+        assert!(retry_held_world(
+            &mut retried.world_held,
+            &mut retried.next_backup_at
+        ));
+        assert_eq!(retried.world_held.consecutive, WORLD_HELD_GIVE_UP_AFTER);
+        let (flying, ds) = reconcile(&retried, &pending(LeaseObs::Mine), world(clock + 1));
+        assert_eq!(acts(&ds), vec![&Action::Backup], "{ds:?}");
+        // And it went up: nothing held any more.
+        let landed = Observation {
+            op_result: Some(OpResult::Ok {
+                version: Some(4),
+                fingerprint: Some(2),
+                wrote: true,
+                world_fingerprint: None,
+            }),
+            ..pending(LeaseObs::Mine)
+        };
+        let (done, _ds) = reconcile(&flying, &landed, world(clock + 2));
+        assert_eq!(done.world_held, WorldHeld::default());
+        // Nothing held: a change retries nothing.
+        let mut idle = done.clone();
+        assert!(!retry_held_world(
+            &mut idle.world_held,
+            &mut idle.next_backup_at
+        ));
     }
 
     /// The 409-with-no-way-out bug: the shell answered "you are behind, but there
@@ -2396,6 +2533,8 @@ mod tests {
             burst_backups in 0u32..8,
             failures in arb_failures(),
             conflicts in arb_conflicts(),
+            held in 0u32..7,
+            held_parked in any::<bool>(),
         ) -> State {
             State {
                 track_only,
@@ -2421,6 +2560,7 @@ mod tests {
                 burst_backups,
                 restore_failures: failures,
                 backup_conflict: conflicts,
+                world_held: WorldHeld { consecutive: held, needs_attention: held_parked },
             }
         }
     }
@@ -2452,7 +2592,7 @@ mod tests {
             fs_event in any::<bool>(),
             retry in 0u32..600,
             has_op in any::<bool>(),
-            op_kind in 0u8..6,
+            op_kind in 0u8..7,
             ok_ver in prop::option::of(0i64..20),
             ok_fp in prop::option::of(0u64..8),
             ok_wrote in any::<bool>(),
@@ -2472,6 +2612,7 @@ mod tests {
                     2 => OpResult::Unauthorized,
                     3 => OpResult::Throttled { retry_after_secs: retry },
                     4 => OpResult::LeaseRequired,
+                    5 => OpResult::WorldHeld,
                     _ => OpResult::Failed,
                 })
             };
@@ -2576,6 +2717,7 @@ mod tests {
                 && state.in_flight.is_none()
                 && obs.op_result.is_none()
                 && !state.backup_conflict.needs_attention
+                && !state.world_held.needs_attention
                 && !(state.shared && obs.lease != LeaseObs::Mine && !world_unchanged(&state, &obs))
                 && (state.has_pending || obs.fs_event)
                 && local_diverged(&state, &obs)

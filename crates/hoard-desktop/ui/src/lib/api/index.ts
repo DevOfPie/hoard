@@ -715,6 +715,22 @@ export type AgentEvent =
       uploaded: boolean;
     }
   | {
+      /** A shared world's push is held: one of its files can't be read, and
+       *  a version without it would move it out of every member's folder.
+       *  Nothing went up. `parked`: retrying on a clock has stopped; it tries
+       *  again when the save's files change or on "back up now". Cleared by
+       *  `backup_success` or `backup_attention_cleared`. */
+      type: "backup_world_held";
+      save_id: string;
+      game_slug: string;
+      label: string;
+      count: number;
+      sample_path: string;
+      sample_error: string;
+      attempts: number;
+      parked: boolean;
+    }
+  | {
       type: "save_auto_restored";
       save_id: string;
       game_slug: string;

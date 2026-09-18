@@ -63,6 +63,9 @@ export type FeedEntry = {
     // The backup went up without the files that would not read (or uploaded
     // nothing at all because none of them would). Partial, said out loud.
     | "backup_files_unreadable"
+    // A shared world's push held: one of its files can't be read, and nothing
+    // went up. `parked` once retrying on a clock has stopped.
+    | "backup_world_held"
     | "auto_restore_failed"
     // Auto-restore has failed repeatedly on the same cloud version. Distinct
     // from `auto_restore_failed` (one row per attempt): this is the "it's been
@@ -117,6 +120,10 @@ export type FeedEntry = {
   role?: "host" | "view";
   /** The engine chose (the unanswered prompt, or a write), not the user. */
   auto?: boolean;
+  /** The file a `backup_world_held` row is about, relative to the save. */
+  path?: string;
+  /** A `backup_world_held` row whose retries stopped. */
+  parked?: boolean;
 };
 
 const MAX_FEED_ENTRIES = 80;
@@ -289,6 +296,16 @@ function feedRowFor(p: AgentEvent): Omit<FeedEntry, "id" | "at"> | null {
         save_id: p.save_id,
         game_slug: p.game_slug,
         count: p.count,
+        error: p.sample_error,
+      };
+    case "backup_world_held":
+      return {
+        kind: "backup_world_held",
+        save_id: p.save_id,
+        game_slug: p.game_slug,
+        count: p.count,
+        path: p.sample_path,
+        parked: p.parked,
         error: p.sample_error,
       };
     case "save_auto_restore_failed":
@@ -644,6 +661,22 @@ export async function subscribeLive() {
         save_id: p.save_id,
         game_slug: p.game_slug,
         count: p.count,
+        error: p.sample_error,
+      });
+    }),
+  );
+
+  unlisteners.push(
+    await listen<AgentEvent>("agent://backup-world-held", (e) => {
+      const p = e.payload;
+      if (p.type !== "backup_world_held") return;
+      pushEntry({
+        kind: "backup_world_held",
+        save_id: p.save_id,
+        game_slug: p.game_slug,
+        count: p.count,
+        path: p.sample_path,
+        parked: p.parked,
         error: p.sample_error,
       });
     }),

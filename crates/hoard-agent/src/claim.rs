@@ -495,8 +495,13 @@ fn catch_up(slot: &mut SaveSlot, lease: Option<&LeaseHandle>) {
 /// kernel's recent-save grace either: a game `is_running` does not see may
 /// still have it open, and a later pass sets the writes aside once the folder
 /// is quiet.
+///
+/// A world whose push is held for a file that cannot be read counts as the
+/// owner's does: once somebody else hosts, its writes can never go up, and
+/// they would hold the pull back for as long as the file stays unreadable.
 fn set_aside_behind(slot: &mut SaveSlot, now: Instant) -> bool {
-    let hosted_elsewhere = slot.save.owns_whole_folder() && slot.lease == LeaseObs::Other;
+    let hosted_elsewhere = (slot.save.owns_whole_folder() || slot.world_held.active())
+        && slot.lease == LeaseObs::Other;
     if (slot.stale_base.is_none() && !hosted_elsewhere)
         || slot.session.is_some()
         || !slot.has_pending
@@ -774,6 +779,9 @@ pub(crate) fn on_reconciled(
     lease: Option<&LeaseHandle>,
 ) -> Followup {
     catch_up(slot, lease);
+    if maybe_release_held_world(slot, events_tx, lease) {
+        return Followup::Nothing;
+    }
     let Some(session) = slot.session.as_mut() else {
         if set_aside_behind(slot, now) {
             return Followup::SideCopy;
@@ -927,6 +935,52 @@ fn maybe_release_after_push(slot: &mut SaveSlot, lease: Option<&LeaseHandle>) {
     give_back(slot, lease, true);
 }
 
+/// A world this machine hosts whose push is held for a file that cannot go up
+/// (`kernel::WorldHeld`), with no game running here: the lease goes back, so
+/// another member can host rather than wait on a push that may never come.
+///
+/// The rule: held (on the backoff or parked), the lease reads `Mine`, the game
+/// is not running and no session is live, and nothing is in flight or already
+/// asked of the lease task. It does not wait for `has_pending` to clear, which
+/// is what the other two releases wait for and what a held push never does.
+/// A role pinned for the next launch does not keep it either: a pin is a wish
+/// to host, and a host that cannot push is not hosting.
+///
+/// The writes stay pending. The next retry asks for the lease again only when
+/// its backoff is up (the reducer holds on `HOLD_WORLD_HELD` ahead of the
+/// lease), so this is not a loop of acquires. If somebody else hosts
+/// meanwhile, the held writes are set aside before the pull
+/// (`set_aside_behind`), as an owner's are, and the head comes down.
+/// `true` when it released.
+fn maybe_release_held_world(
+    slot: &mut SaveSlot,
+    events_tx: &mpsc::Sender<AgentEvent>,
+    lease: Option<&LeaseHandle>,
+) -> bool {
+    if !slot.world_held.active()
+        || slot.lease != LeaseObs::Mine
+        || slot.is_running
+        || slot.session.as_ref().is_some_and(|w| w.live())
+        || slot.in_flight.is_some()
+        || slot.lease_requested
+        || slot.release_requested
+    {
+        return false;
+    }
+    tracing::info!(
+        save_id = %slot.save.save_id,
+        held = slot.world_held.consecutive,
+        parked = slot.world_held.needs_attention,
+        "agent: the world's push is held and no game is running; releasing the hosting lease so another member can host"
+    );
+    give_back(slot, lease, true);
+    let _ = events_tx.try_send(AgentEvent::WorldReleased {
+        save_id: slot.save.save_id.clone(),
+        game_slug: slot.save.game_slug.clone(),
+    });
+    true
+}
+
 /// After GameStopped on a world this machine hosts: give the lease back once
 /// the final flush is up, and not while anything is pending or in flight.
 /// `true` when the session ended here.
@@ -1026,6 +1080,14 @@ pub(crate) fn on_side_copied(
         // unversioned any more, and the head has to come back.
         slot.has_pending = false;
         slot.local_only_pending = false;
+        // A held world push is moot: the files it could not push are in the
+        // side copy.
+        if std::mem::take(&mut slot.world_held).active() {
+            let _ = events_tx.try_send(AgentEvent::BackupAttentionCleared {
+                save_id: slot.save.save_id.clone(),
+                game_slug: slot.save.game_slug.clone(),
+            });
+        }
         // The owner's writes outside the world are still unversioned. Marked
         // now they would veto the very pull that refills the world, so they
         // are marked again once it lands (HRD-D-0019).
@@ -2029,6 +2091,90 @@ mod tests {
             on_lease(slot, LeaseObs::Free, None, false, &tx, Some(&lease));
             assert!(!slot.release_requested, "{path}");
             assert!(drain(&mut rx).is_empty(), "{path}: told as a lost lease");
+        }
+    }
+
+    /// H-B: a world whose push is held for a file that cannot be read gives
+    /// its lease back once no game runs here, with the writes still pending:
+    /// another member can host. Not while the game runs, and not with a
+    /// session live.
+    #[tokio::test(start_paused = true)]
+    async fn a_held_world_gives_the_lease_back_with_no_game_running() {
+        let (tx, mut rx) = mpsc::channel(8);
+        let (lease, mut seen) = LeaseHandle::probe();
+        let now = Instant::now();
+        let held = |s: &mut HashMap<String, SaveSlot>| {
+            let slot = s.get_mut("w1").unwrap();
+            slot.lease = LeaseObs::Mine;
+            slot.has_pending = true;
+            slot.world_held = kernel::WorldHeld {
+                consecutive: 1,
+                needs_attention: false,
+            };
+        };
+        for case in ["no session", "session stopped", "parked, pinned"] {
+            let mut s = slots(vec![world("w1", "valheim")]);
+            held(&mut s);
+            if case == "session stopped" {
+                on_game_started(&mut s, "w1", now, &tx);
+                on_game_stopped(s.get_mut("w1").unwrap());
+            }
+            if case == "parked, pinned" {
+                let slot = s.get_mut("w1").unwrap();
+                slot.world_held.needs_attention = true;
+                slot.role_pinned = true;
+            }
+            drain(&mut rx);
+            let slot = s.get_mut("w1").unwrap();
+            assert_eq!(
+                on_reconciled(slot, now, &tx, Some(&lease)),
+                Followup::Nothing
+            );
+            tokio::task::yield_now().await;
+            assert_eq!(seen.try_recv().unwrap(), "release w1", "{case}");
+            assert!(slot.has_pending, "{case}: the writes stay pending");
+            assert!(
+                drain(&mut rx)
+                    .iter()
+                    .any(|e| matches!(e, AgentEvent::WorldReleased { .. })),
+                "{case}"
+            );
+        }
+        for case in ["running", "session live", "not held"] {
+            let mut s = slots(vec![world("w1", "valheim")]);
+            held(&mut s);
+            match case {
+                "running" => s.get_mut("w1").unwrap().is_running = true,
+                "session live" => on_game_started(&mut s, "w1", now, &tx),
+                _ => s.get_mut("w1").unwrap().world_held = kernel::WorldHeld::default(),
+            }
+            let slot = s.get_mut("w1").unwrap();
+            on_reconciled(slot, now, &tx, Some(&lease));
+            tokio::task::yield_now().await;
+            assert!(seen.try_recv().is_err(), "{case}");
+        }
+    }
+
+    /// H-B: once somebody else hosts, a held world's writes can never go up,
+    /// so they are set aside before the pull, as an owner's are.
+    #[tokio::test(start_paused = true)]
+    async fn a_held_world_hosted_elsewhere_is_set_aside() {
+        let now = Instant::now();
+        for held in [true, false] {
+            let (tx, _rx) = mpsc::channel(8);
+            let mut s = slots(vec![world("w1", "valheim")]);
+            let slot = s.get_mut("w1").unwrap();
+            slot.lease = LeaseObs::Other;
+            slot.has_pending = true;
+            if held {
+                slot.world_held.consecutive = 2;
+            }
+            let expected = if held {
+                Followup::SideCopy
+            } else {
+                Followup::Nothing
+            };
+            assert_eq!(on_reconciled(slot, now, &tx, None), expected, "held={held}");
         }
     }
 
