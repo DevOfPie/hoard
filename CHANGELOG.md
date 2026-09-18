@@ -45,6 +45,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   rows say who hosts each world, their menu releases it or takes over a lease
   nobody has pushed under, and a session that could not push ends in a side
   copy with a notice that opens it.
+- **Sharing a Valheim world understands Valheim 1.0.** The world picker lists
+  worlds kept in 1.0's folder layout (`worlds_local/<name>/`) beside the flat
+  ones, and a shared world names its folder too, so every file 1.0 writes in
+  it travels and a world shared before 1.0 converted it stays covered after.
 
 ## [1.1.7] - 2026-09-13
 

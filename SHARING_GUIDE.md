@@ -92,12 +92,21 @@ but cannot list its worlds, so name one with `--world`.
 else:
 
 ```
+worlds_local/<World>/
 worlds_local/<World>.db
 worlds_local/<World>.fwl
 worlds_local/<World>.db.old
 worlds_local/<World>.fwl.old
 worlds_local/<World>_backup_*
 ```
+
+Valheim 1.0 keeps a world as a folder, `worlds_local/<World>/`, whose files
+(`_main.<N>.fwl2`, `_main.<N>.db2`, the `*.chunk` files) take new names on
+every save; the share names the folder, so everything in it travels. The flat
+`.db` and `.fwl` are the layout before 1.0, which 1.0 converts the first time
+it loads the world, leaving the `.old` twins and a `_backup_` copy behind.
+The share names both layouts, so a world shared before the conversion is
+still covered after it. The world picker lists worlds in either layout.
 
 Nothing under `characters_local/` ever travels: a character is the player's,
 not the world's. Every member keeps their own. For any other game the whole
