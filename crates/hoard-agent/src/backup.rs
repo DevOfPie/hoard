@@ -629,14 +629,27 @@ async fn compute_content_signature(files: &[UploadFile]) -> String {
 /// It preserves the input order (`buffered`, not `buffer_unordered`): the list
 /// arrives sorted by path from [`walk_source`] and the manifest's digest depends
 /// on that order.
+///
+/// A file that is gone by the time it is probed is neither: it left the folder
+/// between the walk and the probe (Valheim 1.0 deletes the previous generation
+/// on every save), so it is dropped from the list like a file the walk never
+/// saw. Counting it as unreadable would hold a shared world's push
+/// ([`refuse_partial_world`]) on every save the game makes mid-walk.
 async fn split_unreadable(files: Vec<UploadFile>) -> (Vec<UploadFile>, Vec<UnreadableFile>) {
     let probes = files.into_iter().map(|f| {
         async move {
             match probe_readable(&f.absolute_path).await {
-                Ok(()) => Ok(f),
-                Err(e) => Err(UnreadableFile {
+                Ok(()) => Probe::Readable(f),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    tracing::debug!(
+                        path = %f.relative_path,
+                        "upload: a file left the folder after the walk; dropping it"
+                    );
+                    Probe::Vanished
+                }
+                Err(e) => Probe::Unreadable(UnreadableFile {
                     relative_path: f.relative_path.clone(),
-                    error: format!("{e:#}"),
+                    error: format!("{e}"),
                 }),
             }
         }
@@ -650,8 +663,9 @@ async fn split_unreadable(files: Vec<UploadFile>) -> (Vec<UploadFile>, Vec<Unrea
     let mut unreadable = Vec::new();
     for outcome in probed {
         match outcome {
-            Ok(f) => readable.push(f),
-            Err(u) => {
+            Probe::Readable(f) => readable.push(f),
+            Probe::Vanished => {}
+            Probe::Unreadable(u) => {
                 tracing::warn!(
                     path = %u.relative_path,
                     error = %u.error,
@@ -664,15 +678,27 @@ async fn split_unreadable(files: Vec<UploadFile>) -> (Vec<UploadFile>, Vec<Unrea
     (readable, unreadable)
 }
 
-/// Can this file's bytes be read? It opens and reads one byte.
-async fn probe_readable(path: &Path) -> Result<()> {
+/// What [`split_unreadable`] found for one file.
+enum Probe {
+    Readable(UploadFile),
+    /// Gone since the walk: not part of this version, and not a fault.
+    Vanished,
+    Unreadable(UnreadableFile),
+}
+
+/// Can this file's bytes be read? It opens and reads one byte. The error keeps
+/// its [`std::io::ErrorKind`], so a vanished file can be told from a denied one.
+async fn probe_readable(path: &Path) -> std::io::Result<()> {
+    let with_path = |what: &str, e: std::io::Error| {
+        std::io::Error::new(e.kind(), format!("{what} {}: {e}", path.display()))
+    };
     let mut file = tokio::fs::File::open(path)
         .await
-        .with_context(|| format!("opening {}", path.display()))?;
+        .map_err(|e| with_path("opening", e))?;
     let mut byte = [0u8; 1];
     file.read(&mut byte)
         .await
-        .with_context(|| format!("reading {}", path.display()))?;
+        .map_err(|e| with_path("reading", e))?;
     Ok(())
 }
 
@@ -2688,6 +2714,42 @@ mod tests {
             !skipped[0].error.is_empty(),
             "the system error is the only actionable thing the user sees"
         );
+    }
+
+    /// A file deleted between the walk and the probe (Valheim 1.0 removes the
+    /// previous generation on every save) is dropped, not reported unreadable:
+    /// otherwise a shared world's push would be held on every save the game
+    /// makes mid-walk (H-A).
+    #[tokio::test]
+    async fn a_file_gone_after_the_walk_is_dropped_not_unreadable() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        for rel in [
+            "worlds_local/Alpha/_main.1.db2",
+            "worlds_local/Alpha/_main.2.db2",
+        ] {
+            std::fs::create_dir_all(root.join(rel).parent().unwrap()).unwrap();
+            std::fs::write(root.join(rel), rel).unwrap();
+        }
+        let walked = walk_source(root, Scope::default()).unwrap();
+        std::fs::remove_file(root.join("worlds_local/Alpha/_main.1.db2")).unwrap();
+
+        let (ok, skipped) = split_unreadable(walked).await;
+        assert_eq!(
+            ok.iter()
+                .map(|f| f.relative_path.as_str())
+                .collect::<Vec<_>>(),
+            ["worlds_local/Alpha/_main.2.db2"]
+        );
+        assert!(skipped.is_empty(), "{skipped:?}");
+        let world = vec!["worlds_local/Alpha".to_string()];
+        assert!(refuse_partial_world(
+            &world,
+            skipped
+                .iter()
+                .map(|u| (u.relative_path.as_str(), u.error.as_str()))
+        )
+        .is_ok());
     }
 
     /// A shared world is never uploaded without one of its files: the upload
