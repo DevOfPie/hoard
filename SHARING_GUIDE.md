@@ -92,12 +92,102 @@ but cannot list its worlds, so name one with `--world`.
 else:
 
 ```
+worlds_local/<World>
 worlds_local/<World>.db
 worlds_local/<World>.fwl
 worlds_local/<World>.db.old
 worlds_local/<World>.fwl.old
 worlds_local/<World>_backup_*
 ```
+
+Valheim 1.0 keeps a world as a folder, `worlds_local/<World>/`, whose files
+(`_main.<N>.fwl2`, `_main.<N>.db2`, the `*.chunk` files) take new names on
+every save; the share names the folder, so everything in it travels. The flat
+`.db` and `.fwl` are the layout before 1.0, which 1.0 converts the first time
+it loads the world, leaving the `.old` twins and a `_backup_` copy behind.
+The share names both layouts, so a world shared before the conversion is
+still covered after it. The world picker lists worlds in either layout.
+
+**What a pull does to the world's folder.** Because 1.0 names its files anew
+on every save and loads the newest, a pull or a restore makes
+`worlds_local/<World>/` exactly what the version holds:
+
+- Files in it that the version does not have (the previous save's
+  `_main.<N>.*` and chunks, or a newer save when you restore an older version)
+  are moved into the conflicts folder.
+- A file in it that the version also has is replaced by the version's copy,
+  even when yours is newer; yours goes to the conflicts folder. A newer chunk
+  kept beside an older generation would mix two saves of the world.
+- Once the version holds the world as a folder, the world's flat files it
+  does not have (`<World>.db`, `<World>.fwl` and their `.old` twins, left
+  behind by 1.0's conversion) are moved aside too, so they do not travel back
+  with your next push. A version of a world not yet converted leaves them.
+
+Moved files are kept in the conflicts folder for the retention period
+(`conflict_retention_days`, 14 days by default) and then removed; see [Side
+copies, and where they are](#side-copies-and-where-they-are). Everything is
+moved before anything of the version is written: if a move fails, nothing is
+written, what already moved goes back, and the pull or restore reports the
+error; a write that fails after the moves takes back what it wrote and puts
+every moved file back too. It happens only when the service pulls with the
+game closed and nothing unsent in the folder (checked again right before the
+pull writes, with a fresh look for the game's process: a game started during
+the download, or a write to the folder during it, makes the pull wait), or when you restore a version into the
+save's own folder.
+
+**A restore downloads first.** `hoard restore` and the desktop's restore
+download the whole version into a staging folder before touching the save's
+folder, so a download that fails or is cut off leaves the folder exactly as
+it was. The staging folder, the pull's too, sits beside the conflicts folder
+in Hoard's data folder, not in the system's temporary folder (a RAM-backed
+`/tmp` would hold the whole version in memory); one a killed restore left
+behind is removed when the sync service next starts, and so are the
+half-written `.hoard-restore.tmp` files an interrupted merge leaves in a save
+folder. Creating or removing one is not a write to the save: it neither
+defers a pull nor asks for the lease. Only those of a process that is gone: a restore running while the
+service pulls into the same folder keeps its own. Then the version's files replace yours, each replaced file going to
+the conflicts folder first, once, and the command prints (the desktop's
+notice shows) the folder they went to. Files already identical are not
+rewritten, but on a self-hosted server they are still downloaded: the server
+sends the whole version.
+The sync service is not paused for the restore: it runs on local copies only,
+so the window is short, but a backup it starts in it can still read a
+half-applied folder. Everything else is
+merged as before and nothing of it is removed: the `_backup_` copies, other
+worlds and your characters. The restore dialog and `hoard restore --dry-run`
+list the files that will move aside, and the notice after a pull counts them.
+
+A shared world never goes up without one of its files. When one cannot be
+read (the game holds it open, a permission) or would not fit the plan's
+per-save cap, the push is held, with a warning on the game's card naming the
+file and which of the two it is, instead of publishing a version that would
+move the missing file out of every other member's folder. It retries after 1,
+5, 15 and 30 minutes and then stops, saying so on the card; any change to the
+save's files (fixing the permission is one) or *Back up now* tries again at
+once, and those retries do not count toward the stop, so a game saving
+several times in a row does not use them up. You keep the lease while it
+retries; once it stops, with the game closed, the lease is given back so
+somebody else can host. If the shared version moves past yours while your
+push is held (somebody hosted and pushed), your held changes go to the
+conflicts folder and their version comes down, whoever holds the lease by
+then. If they cannot be moved there (the file that held the push will not
+move either), that is tried again at the push's next retry, or after the next
+change once it has stopped; the move putting back what it had moved does not
+count as a change.
+
+The owner is held only when the world changed. When the world is the one
+last synced and only a file of it cannot be read, the owner's other files
+(the characters) still go up, the version keeping the synced copy of that
+file; this needs a self-hosted server of 1.1.3 or later. A world file the
+game writes while that push reads the folder makes it read the folder again,
+and a world that changed is held, never sent half old, half new.
+
+A file deleted while the push reads the folder (1.0 deletes the previous
+save's files) does not fail the push: the folder is read again, up to
+twenty times within three minutes, and files that did not change are not
+read twice. If a restore's safety copy is held, the desktop offers to restore
+without it, and that restore replaces the file that could not be read too,
+moving it to the conflicts folder first.
 
 Nothing under `characters_local/` ever travels: a character is the player's,
 not the world's. Every member keeps their own. For any other game the whole
@@ -149,7 +239,9 @@ the same flow as any save that only exists on the server:
 
 From then on the world is pulled to that folder whenever the game is closed
 and the server has a newer version. Your own characters in the same folder
-are untouched, because they are not in the share's file list.
+are untouched, because they are not in the share's file list, and they do
+not hold back the first pull: a folder with nothing of the world in it has
+nothing to push, so the world comes down without asking for the lease.
 
 **CLI.** Once you are in the group, `hoard save list` shows the shared save
 (`hoard saves` lists only what this machine tracks). Give it a folder here:
@@ -208,7 +300,9 @@ notice it left. While you hold a lease the Library row reads *hosting ·
 <group>* and members see *hosted by <name> · <elapsed>*.
 
 When the game closes, the host's final upload finishes and the lease is
-released. `hoard world lease <SAVE_ID>` says who holds it right now.
+released. A world you claimed with the game closed and then released is not
+held for the next launch, and a later push with no game running gives the
+lease back once it is up. `hoard world lease <SAVE_ID>` says who holds it right now.
 
 Every byte of a shared world sits in the group's storage, against the group
 owner's quota, whoever pushed it. A self-hosted server has no quota unless the
@@ -260,7 +354,8 @@ it.
 A side copy holds the world files from a session that could not push: a
 viewer's writes, or a host's writes under somebody else's lease. Only the
 share's own files move there, nothing else in the folder. They land next to
-the restore conflict copies, under the sync service's state folder:
+the restore conflict copies and the world files a pull moved aside, under the
+sync service's state folder:
 
 ```
 ~/.local/share/hoard/conflicts/<save_id>/<timestamp>/                            # Linux

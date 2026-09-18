@@ -371,12 +371,16 @@ fn give_back(slot: &mut SaveSlot, lease: Option<&LeaseHandle>, release: bool) {
 }
 
 /// The user gave the world back (`ReleaseWorld`): the lease goes, an acquire
-/// still out is cancelled, and the answer is not a lost lease.
+/// still out is cancelled, and the answer is not a lost lease. A role pinned
+/// for the next launch (`ClaimWorld` or `ForceWorld` outside a session) goes
+/// with it: giving the world back is not hosting it next time, and a pin left
+/// standing kept every later sessionless push's lease (HRD-F-0028).
 pub(crate) fn on_release_world(
     slot: &mut SaveSlot,
     events_tx: &mpsc::Sender<AgentEvent>,
     lease: Option<&LeaseHandle>,
 ) {
+    slot.role_pinned = false;
     give_back(slot, lease, true);
     let _ = events_tx.try_send(AgentEvent::WorldReleased {
         save_id: slot.save.save_id.clone(),
@@ -495,21 +499,40 @@ fn catch_up(slot: &mut SaveSlot, lease: Option<&LeaseHandle>) {
 /// kernel's recent-save grace either: a game `is_running` does not see may
 /// still have it open, and a later pass sets the writes aside once the folder
 /// is quiet.
+///
+/// A world whose push is held for a file that cannot be read goes further:
+/// once the head moved past the version it came from, it is set aside whatever
+/// the lease reads, `Other` or `Free` (somebody hosted, pushed and gave the
+/// world back), and parked or on its ladder. Its writes can never go up over
+/// that head, and waiting for its own next attempt to be refused as stale
+/// held the pull for minutes, and for good once parked, since a parked push
+/// makes no attempt of its own. Never under this machine's own lease. A held
+/// world's side copy that failed is tried again (M-2), on the held ladder's
+/// deadline or after a change to the save (`held_side_copy_retry_at`): the
+/// files that held it are the ones that may not move, and waiting as a viewer
+/// for good left the world behind the head for good.
 fn set_aside_behind(slot: &mut SaveSlot, now: Instant) -> bool {
-    let hosted_elsewhere = slot.save.owns_whole_folder() && slot.lease == LeaseObs::Other;
-    if (slot.stale_base.is_none() && !hosted_elsewhere)
+    let wall = OffsetDateTime::now_utc();
+    let retry_due =
+        slot.world_held.active() && slot.held_side_copy_retry_at.is_some_and(|t| wall >= t);
+    let hosted_elsewhere = (slot.save.owns_whole_folder() || slot.world_held.active())
+        && slot.lease == LeaseObs::Other;
+    let held_behind = slot.world_held.active()
+        && slot
+            .cloud_head
+            .is_some_and(|head| slot.known_version.is_none_or(|known| head > known));
+    if (slot.stale_base.is_none() && !hosted_elsewhere && !held_behind)
         || slot.session.is_some()
         || !slot.has_pending
         || slot.is_running
         || slot.in_flight.is_some()
-        || slot.local_only_pending
+        || (slot.local_only_pending && !retry_due)
         || slot.lease == LeaseObs::Mine
         // Only the world is set aside, the owner's included (HRD-D-0019).
         || !crate::agent::world_pending(slot)
     {
         return false;
     }
-    let wall = OffsetDateTime::now_utc();
     if slot
         .last_fs_event_at
         .is_some_and(|t| (wall - t).whole_seconds() < RECENT_SAVE_GRACE_SECS)
@@ -517,6 +540,10 @@ fn set_aside_behind(slot: &mut SaveSlot, now: Instant) -> bool {
         tracing::debug!(save_id = %slot.save.save_id, "agent: behind the head, but the folder was written recently; not setting it aside yet");
         return false;
     }
+    if retry_due {
+        tracing::info!(save_id = %slot.save.save_id, "agent: trying the held world's side copy again");
+    }
+    slot.held_side_copy_retry_at = None;
     tracing::info!(save_id = %slot.save.save_id, "agent: behind the head with local writes; setting them aside before the pull");
     let mut session = WorldSession::new(now);
     session.claimed = true;
@@ -568,8 +595,10 @@ pub(crate) fn may_request_lease(slot: &SaveSlot) -> bool {
 const SIDE_COPY_TAIL: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// A watcher hit while the side copy moves the world's files, or in the
-/// debouncer's tail once it landed, is the copy's own touch: not pending, not
-/// evidence. Marked pending it would veto the pull that refills the folder.
+/// debouncer's tail once it landed or failed (putting back what it moved), is
+/// the copy's own touch: not pending, not evidence. Marked pending it would
+/// veto the pull that refills the folder, or, after a failed copy, retry the
+/// held push and the copy with it, on end (M-A).
 pub(crate) fn hit_is_side_copy(slot: &SaveSlot, now: Instant) -> bool {
     if slot
         .session
@@ -580,9 +609,10 @@ pub(crate) fn hit_is_side_copy(slot: &SaveSlot, now: Instant) -> bool {
     }
     // A relaunch opened a session at the landing: its writes are the game's.
     slot.session.is_none()
-        && slot
-            .side_copy_landed_at
-            .is_some_and(|at| now.saturating_duration_since(at) < SIDE_COPY_TAIL)
+        && [slot.side_copy_landed_at, slot.side_copy_failed_at]
+            .into_iter()
+            .flatten()
+            .any(|at| now.saturating_duration_since(at) < SIDE_COPY_TAIL)
 }
 
 /// The user answered "not playing".
@@ -774,6 +804,9 @@ pub(crate) fn on_reconciled(
     lease: Option<&LeaseHandle>,
 ) -> Followup {
     catch_up(slot, lease);
+    if maybe_release_held_world(slot, events_tx, lease) {
+        return Followup::Nothing;
+    }
     let Some(session) = slot.session.as_mut() else {
         if set_aside_behind(slot, now) {
             return Followup::SideCopy;
@@ -927,6 +960,62 @@ fn maybe_release_after_push(slot: &mut SaveSlot, lease: Option<&LeaseHandle>) {
     give_back(slot, lease, true);
 }
 
+/// A world this machine hosts whose push is held for a file that cannot go up
+/// (`kernel::WorldHeld`) and has parked, with no game running here: the lease
+/// goes back, so another member can host rather than wait on a push that may
+/// never come.
+///
+/// Parked, not merely held. A file locked for a few seconds (an antivirus
+/// scan, an indexer) holds the first attempts too, and a lease given back then
+/// lets a member host from the old head: the next attempt reads `Other` and
+/// the whole last session goes to the side copy. While the push climbs its
+/// ladder the lease stays here; the reducer holds on `HOLD_WORLD_HELD` ahead
+/// of the lease, so nothing is asked of it meanwhile.
+///
+/// The rule: parked (`needs_attention`), the lease reads `Mine`, the game is
+/// not running and no session is live, and nothing is in flight or already
+/// asked of the lease task. It does not wait for `has_pending` to clear, which
+/// is what the other two releases wait for and what a held push never does.
+/// A role pinned for the next launch does not keep it, and is cleared with
+/// it: a pin is a wish to host, a host that cannot push is not hosting, and a
+/// pin left standing would take the lease at the next launch without asking
+/// (the same invariant as HRD-F-0028).
+///
+/// The writes stay pending. A parked push retries only on a change to the
+/// save or the user's word, so this is not a loop of acquires. If the head
+/// moves meanwhile, the held writes are set aside before the pull
+/// (`set_aside_behind`), as an owner's are, and the head comes down.
+/// `true` when it released.
+fn maybe_release_held_world(
+    slot: &mut SaveSlot,
+    events_tx: &mpsc::Sender<AgentEvent>,
+    lease: Option<&LeaseHandle>,
+) -> bool {
+    if !slot.world_held.needs_attention
+        || slot.lease != LeaseObs::Mine
+        || slot.is_running
+        || slot.session.as_ref().is_some_and(|w| w.live())
+        || slot.in_flight.is_some()
+        || slot.lease_requested
+        || slot.release_requested
+    {
+        return false;
+    }
+    tracing::info!(
+        save_id = %slot.save.save_id,
+        held = slot.world_held.consecutive,
+        parked = slot.world_held.needs_attention,
+        "agent: the world's push is held and no game is running; releasing the hosting lease so another member can host"
+    );
+    slot.role_pinned = false;
+    give_back(slot, lease, true);
+    let _ = events_tx.try_send(AgentEvent::WorldReleased {
+        save_id: slot.save.save_id.clone(),
+        game_slug: slot.save.game_slug.clone(),
+    });
+    true
+}
+
 /// After GameStopped on a world this machine hosts: give the lease back once
 /// the final flush is up, and not while anything is pending or in flight.
 /// `true` when the session ended here.
@@ -973,6 +1062,12 @@ pub(crate) fn side_copy_dir(root: &Path, save_id: &str, at: OffsetDateTime) -> P
 /// `dir`, so the folder holds nothing newer than the head and the next pull
 /// puts the head back without an mtime contest. Rename first, copy and
 /// remove across filesystems. Returns how many moved.
+///
+/// All or nothing (M-4, `restore::move_all_aside`): a file that will not move
+/// puts back the ones already moved, and the error comes back with the folder
+/// as it was. A held world is exactly the one with a file that may not move,
+/// and half a world in the side copy with the rest left behind would be
+/// pulled over as if nothing were pending.
 pub(crate) async fn move_world_aside(save: &WatchedSave, dir: &Path) -> anyhow::Result<u64> {
     let shields = crate::savefilter::shields_for_slug(&save.game_slug);
     let files = crate::backup::walk_source(
@@ -982,19 +1077,9 @@ pub(crate) async fn move_world_aside(save: &WatchedSave, dir: &Path) -> anyhow::
             include: save.world(),
         },
     )?;
-    let mut moved = 0;
-    for f in files {
-        let dest = dir.join(&f.relative_path);
-        if let Some(parent) = dest.parent() {
-            tokio::fs::create_dir_all(parent).await?;
-        }
-        if tokio::fs::rename(&f.absolute_path, &dest).await.is_err() {
-            tokio::fs::copy(&f.absolute_path, &dest).await?;
-            tokio::fs::remove_file(&f.absolute_path).await?;
-        }
-        moved += 1;
-    }
-    Ok(moved)
+    let rels: Vec<String> = files.into_iter().map(|f| f.relative_path).collect();
+    crate::restore::move_all_aside(&save.local_path, &rels, dir).await?;
+    Ok(rels.len() as u64)
 }
 
 /// The side copy landed: the session's bytes are safe there, so the folder
@@ -1026,6 +1111,14 @@ pub(crate) fn on_side_copied(
         // unversioned any more, and the head has to come back.
         slot.has_pending = false;
         slot.local_only_pending = false;
+        // A held world push is moot: the files it could not push are in the
+        // side copy.
+        if std::mem::take(&mut slot.world_held).active() {
+            let _ = events_tx.try_send(AgentEvent::BackupAttentionCleared {
+                save_id: slot.save.save_id.clone(),
+                game_slug: slot.save.game_slug.clone(),
+            });
+        }
         // The owner's writes outside the world are still unversioned. Marked
         // now they would veto the very pull that refills the world, so they
         // are marked again once it lands (HRD-D-0019).
@@ -1036,14 +1129,43 @@ pub(crate) fn on_side_copied(
         slot.last_restore_at = Some(OffsetDateTime::now_utc());
         slot.side_copy_landed_at = Some(now);
         end_session(slot);
-    } else if slot.has_pending {
+    } else if slot.has_pending && world_on_disk(&slot.save) {
         // Nothing moved and something is pending: the include list missed
         // what the game wrote, and it stays where it is.
         end_session_local_only(slot);
+    } else if slot.has_pending {
+        // Nothing moved because nothing of the world is here: the pending
+        // mark was about files outside it, which never go up with the world
+        // and which the pull does not touch. Nothing is left to lose, so the
+        // head comes down, rather than the slot waiting as a viewer on
+        // writes that do not exist.
+        tracing::info!(save_id = %slot.save.save_id, "agent: no file of the shared world is here; pulling the head");
+        slot.has_pending = false;
+        slot.local_only_pending = false;
+        // An owner's pending writes outside the world are still unversioned:
+        // marked again once the pull lands, as when the copy moved files.
+        slot.recheck_pending_after_pull = slot.save.owns_whole_folder();
+        slot.pull_pending = true;
+        end_session(slot);
     } else {
         end_session(slot);
     }
     after_side_copy(slots, save_id, now, events_tx);
+}
+
+/// Is any file of the shared world in the save's folder? What
+/// [`move_world_aside`] would move; a folder that cannot be walked counts as
+/// holding some, the side that keeps a slot from pushing.
+fn world_on_disk(save: &WatchedSave) -> bool {
+    let shields = crate::savefilter::shields_for_slug(&save.game_slug);
+    crate::backup::walk_source(
+        &save.local_path,
+        Scope {
+            shields: &shields,
+            include: save.world(),
+        },
+    )
+    .map_or(true, |files| !files.is_empty())
 }
 
 /// The side copy could not be made: the bytes stay where they are, pending,
@@ -1064,8 +1186,17 @@ pub(crate) fn on_side_copy_failed(
     {
         return;
     }
+    // The copy put back what it had moved: those renames' hits are its own.
+    slot.side_copy_failed_at = Some(now);
     if slot.has_pending {
         end_session_local_only(slot);
+        // A held world tries again on its ladder's next deadline (M-2); with
+        // none ahead (parked), on the next change.
+        let wall = OffsetDateTime::now_utc();
+        slot.held_side_copy_retry_at = slot
+            .world_held
+            .retry_at
+            .filter(|t| slot.world_held.active() && *t > wall);
     } else {
         end_session(slot);
     }
@@ -1531,6 +1662,49 @@ mod tests {
         );
     }
 
+    /// Behind the head with a pending mark and nothing of the world in the
+    /// folder (a member's own character beside it): the set-aside before the
+    /// pull moves nothing, and that is not a write left local-only. The slot
+    /// stays a host, nothing is pending, and the head comes down.
+    #[tokio::test(start_paused = true)]
+    async fn a_side_copy_with_no_world_on_disk_lets_the_pull_through() {
+        let (tx, _rx) = mpsc::channel(8);
+        let tmp = tempfile::tempdir().unwrap();
+        let character = tmp.path().join("characters_local/Friend.fch");
+        std::fs::create_dir_all(character.parent().unwrap()).unwrap();
+        std::fs::write(&character, b"friend").unwrap();
+        let mut save = world("w1", "valheim");
+        save.local_path = tmp.path().to_path_buf();
+        let list = crate::worldfiles::template("valheim", "Alpha")
+            .unwrap()
+            .unwrap();
+        save.include = list.clone();
+        save.shared.as_mut().unwrap().include = list;
+        let mut s = slots(vec![save.clone()]);
+        let now = Instant::now();
+        {
+            let slot = s.get_mut("w1").unwrap();
+            slot.lease = LeaseObs::Free;
+            slot.has_pending = true;
+            on_stale(slot, 3);
+            assert!(!slot.pull_pending, "held back by the pending mark");
+            assert_eq!(on_reconciled(slot, now, &tx, None), Followup::SideCopy);
+        }
+        let moved = move_world_aside(&save, &tmp.path().join("aside"))
+            .await
+            .unwrap();
+        assert_eq!(moved, 0);
+        on_side_copied(&mut s, "w1", moved, now, &tx);
+        let slot = &s["w1"];
+        assert!(slot.session.is_none());
+        assert!(!slot.has_pending);
+        assert!(!slot.local_only_pending);
+        assert!(slot.pull_pending);
+        assert_eq!(slot.role, WorldRole::Host);
+        assert!(!may_request_lease(slot));
+        assert_eq!(std::fs::read(&character).unwrap(), b"friend");
+    }
+
     /// The side copy is skipped or fails with writes still in the folder: the
     /// session ends, but the slot stays a viewer and asks for no lease until
     /// they are versioned or set aside, so the next tick cannot push them.
@@ -1963,6 +2137,442 @@ mod tests {
         }
     }
 
+    /// H-B: a world whose push is held for a file that cannot be read gives
+    /// its lease back once it parks and no game runs here, with the writes
+    /// still pending: another member can host. Not while the game runs, not
+    /// with a session live, and not while the push is still on its ladder
+    /// (H-B-1).
+    #[tokio::test(start_paused = true)]
+    async fn a_held_world_gives_the_lease_back_with_no_game_running() {
+        let (tx, mut rx) = mpsc::channel(8);
+        let (lease, mut seen) = LeaseHandle::probe();
+        let now = Instant::now();
+        let held = |s: &mut HashMap<String, SaveSlot>| {
+            let slot = s.get_mut("w1").unwrap();
+            slot.lease = LeaseObs::Mine;
+            slot.has_pending = true;
+            slot.world_held = kernel::WorldHeld {
+                consecutive: kernel::reconcile::WORLD_HELD_GIVE_UP_AFTER,
+                needs_attention: true,
+                ..kernel::WorldHeld::default()
+            };
+        };
+        for case in ["no session", "session stopped", "parked, pinned"] {
+            let mut s = slots(vec![world("w1", "valheim")]);
+            held(&mut s);
+            if case == "session stopped" {
+                on_game_started(&mut s, "w1", now, &tx);
+                on_game_stopped(s.get_mut("w1").unwrap());
+            }
+            if case == "parked, pinned" {
+                s.get_mut("w1").unwrap().role_pinned = true;
+            }
+            drain(&mut rx);
+            let slot = s.get_mut("w1").unwrap();
+            assert_eq!(
+                on_reconciled(slot, now, &tx, Some(&lease)),
+                Followup::Nothing
+            );
+            tokio::task::yield_now().await;
+            assert_eq!(seen.try_recv().unwrap(), "release w1", "{case}");
+            assert!(slot.has_pending, "{case}: the writes stay pending");
+            // M-1: the pin goes with the lease, or the next launch hosts
+            // without asking.
+            assert!(!slot.role_pinned, "{case}: the pin outlived the release");
+            assert!(
+                drain(&mut rx)
+                    .iter()
+                    .any(|e| matches!(e, AgentEvent::WorldReleased { .. })),
+                "{case}"
+            );
+        }
+        // Held but still on its ladder (H-B-1): a file locked for seconds must
+        // not hand the world to a member who would host from the old head.
+        for case in [
+            "running",
+            "session live",
+            "not held",
+            "held once",
+            "held, session stopped",
+        ] {
+            let mut s = slots(vec![world("w1", "valheim")]);
+            held(&mut s);
+            let on_ladder = kernel::WorldHeld {
+                consecutive: 1,
+                ..kernel::WorldHeld::default()
+            };
+            match case {
+                "running" => s.get_mut("w1").unwrap().is_running = true,
+                "session live" => on_game_started(&mut s, "w1", now, &tx),
+                "held once" => s.get_mut("w1").unwrap().world_held = on_ladder,
+                "held, session stopped" => {
+                    s.get_mut("w1").unwrap().world_held = on_ladder;
+                    on_game_started(&mut s, "w1", now, &tx);
+                    on_game_stopped(s.get_mut("w1").unwrap());
+                }
+                _ => s.get_mut("w1").unwrap().world_held = kernel::WorldHeld::default(),
+            }
+            let slot = s.get_mut("w1").unwrap();
+            on_reconciled(slot, now, &tx, Some(&lease));
+            tokio::task::yield_now().await;
+            assert!(seen.try_recv().is_err(), "{case}");
+        }
+    }
+
+    /// H-B: once somebody else hosts, a held world's writes can never go up,
+    /// so they are set aside before the pull, as an owner's are.
+    #[tokio::test(start_paused = true)]
+    async fn a_held_world_hosted_elsewhere_is_set_aside() {
+        let now = Instant::now();
+        for held in [true, false] {
+            let (tx, _rx) = mpsc::channel(8);
+            let mut s = slots(vec![world("w1", "valheim")]);
+            let slot = s.get_mut("w1").unwrap();
+            slot.lease = LeaseObs::Other;
+            slot.has_pending = true;
+            if held {
+                slot.world_held.consecutive = 2;
+                slot.world_held.retry_at =
+                    Some(OffsetDateTime::now_utc() + time::Duration::minutes(15));
+            }
+            let expected = if held {
+                Followup::SideCopy
+            } else {
+                Followup::Nothing
+            };
+            assert_eq!(on_reconciled(slot, now, &tx, None), expected, "held={held}");
+            if held {
+                // L-4: the side copy ends the held push, its deadline with it,
+                // so the next push does not wait out the old ladder.
+                on_side_copied(&mut s, "w1", 1, now, &tx);
+                let slot = &s["w1"];
+                assert_eq!(slot.world_held, kernel::WorldHeld::default());
+            }
+        }
+    }
+
+    /// M-2: a held world's side copy that failed (a file that will not move)
+    /// is tried again: on the held ladder's deadline, or, parked, after a
+    /// change once the folder is quiet. Not on every pass.
+    #[tokio::test(start_paused = true)]
+    async fn a_held_worlds_failed_side_copy_is_tried_again() {
+        let now = Instant::now();
+        for parked in [false, true] {
+            let (tx, _rx) = mpsc::channel(8);
+            let mut s = slots(vec![world("w1", "valheim")]);
+            let deadline = OffsetDateTime::now_utc() + time::Duration::minutes(15);
+            {
+                let slot = s.get_mut("w1").unwrap();
+                slot.lease = LeaseObs::Other;
+                slot.has_pending = true;
+                slot.world_held = kernel::WorldHeld {
+                    consecutive: 2,
+                    needs_attention: parked,
+                    retry_at: (!parked).then_some(deadline),
+                    by_change: false,
+                };
+                assert_eq!(on_reconciled(slot, now, &tx, None), Followup::SideCopy);
+            }
+            on_side_copy_failed(&mut s, "w1", now, &tx);
+            let slot = s.get_mut("w1").unwrap();
+            assert!(slot.local_only_pending, "parked={parked}");
+            assert_eq!(
+                on_reconciled(slot, now, &tx, None),
+                Followup::Nothing,
+                "parked={parked}"
+            );
+            if parked {
+                assert_eq!(slot.held_side_copy_retry_at, None);
+                let wall = OffsetDateTime::now_utc();
+                crate::agent::mark_fs_hit(slot, wall);
+                // Written just now: not while the game may still hold it.
+                assert_eq!(on_reconciled(slot, now, &tx, None), Followup::Nothing);
+                slot.last_fs_event_at =
+                    Some(wall - time::Duration::seconds(RECENT_SAVE_GRACE_SECS + 1));
+            } else {
+                assert_eq!(slot.held_side_copy_retry_at, Some(deadline));
+                // The ladder's deadline comes.
+                slot.held_side_copy_retry_at = Some(OffsetDateTime::now_utc());
+            }
+            assert_eq!(
+                on_reconciled(slot, now, &tx, None),
+                Followup::SideCopy,
+                "parked={parked}"
+            );
+            assert_eq!(slot.held_side_copy_retry_at, None);
+            // It lands this time.
+            on_side_copied(&mut s, "w1", 1, now, &tx);
+            let slot = &s["w1"];
+            assert!(!slot.local_only_pending);
+            assert!(slot.pull_pending, "parked={parked}");
+        }
+    }
+
+    /// M-A: a failed side copy puts back the files it moved, and the watcher
+    /// hits of that put-back reach the loop after the failure. They are the
+    /// copy's own: delivered as the watcher sends them, they neither un-park
+    /// the held push nor schedule the copy again, which otherwise cycled every
+    /// five minutes for good. A genuine change after the tail still does.
+    #[tokio::test(start_paused = true)]
+    async fn a_failed_side_copys_put_back_does_not_retry_it() {
+        use notify_debouncer_mini::{DebouncedEvent, DebouncedEventKind};
+        let now = Instant::now();
+        let (tx, _rx) = mpsc::channel(8);
+        let mut s = slots(vec![world("w1", "valheim")]);
+        let root = s["w1"].save.local_path.clone();
+        let parked = kernel::WorldHeld {
+            consecutive: 5,
+            needs_attention: true,
+            retry_at: None,
+            by_change: false,
+        };
+        {
+            let slot = s.get_mut("w1").unwrap();
+            slot.lease = LeaseObs::Other;
+            slot.has_pending = true;
+            slot.world_held = parked;
+            assert_eq!(on_reconciled(slot, now, &tx, None), Followup::SideCopy);
+        }
+        on_side_copy_failed(&mut s, "w1", now, &tx);
+        let events = |rels: &[&str]| -> Vec<DebouncedEvent> {
+            rels.iter()
+                .map(|r| DebouncedEvent {
+                    path: root.join(r),
+                    kind: DebouncedEventKind::Any,
+                })
+                .collect()
+        };
+        let put_back = events(&[
+            "worlds_local/Alpha",
+            "worlds_local/Alpha/_main.3.db2",
+            "worlds_local/Alpha/_main.3.fwl2",
+        ]);
+        let wall = OffsetDateTime::now_utc();
+        let delivered = crate::agent::deliver_fs_events(
+            &mut s,
+            &root,
+            &put_back,
+            wall,
+            now + std::time::Duration::from_secs(3),
+        );
+        assert_eq!(delivered, None, "the put-back is not a write");
+        let slot = s.get_mut("w1").unwrap();
+        assert_eq!(slot.held_side_copy_retry_at, None);
+        assert_eq!(slot.world_held, parked, "still parked");
+        assert!(slot.local_only_pending);
+        assert_eq!(
+            on_reconciled(slot, now, &tx, None),
+            Followup::Nothing,
+            "no copy again"
+        );
+
+        // The game, or a chmod, changes the world after the tail.
+        let later = now + SIDE_COPY_TAIL;
+        let delivered = crate::agent::deliver_fs_events(
+            &mut s,
+            &root,
+            &events(&["worlds_local/Alpha/_main.3.db2"]),
+            wall,
+            later,
+        );
+        assert_eq!(delivered.as_deref(), Some("w1"));
+        let slot = s.get_mut("w1").unwrap();
+        assert_eq!(slot.held_side_copy_retry_at, Some(wall));
+        assert!(!slot.world_held.needs_attention, "tried again");
+        slot.last_fs_event_at = Some(wall - time::Duration::seconds(RECENT_SAVE_GRACE_SECS + 1));
+        assert_eq!(on_reconciled(slot, later, &tx, None), Followup::SideCopy);
+    }
+
+    /// The third end-to-end run: a member's world push is held (and parks);
+    /// the owner hosts, pushes and gives the world back. The member reads the
+    /// lease `Free` and the head past its version: its held writes go to the
+    /// side copy and the head comes down now, not at its own next attempt, and
+    /// not never, which is when a parked push attempts. Not under its own
+    /// lease, and not for a world that is not held.
+    #[tokio::test(start_paused = true)]
+    async fn a_held_world_behind_the_head_is_set_aside_and_pulled_whatever_the_lease() {
+        let now = Instant::now();
+        let tmp = tempfile::tempdir().unwrap();
+        let folder = tmp.path().join("save");
+        std::fs::create_dir_all(folder.join("worlds_local")).unwrap();
+        std::fs::write(folder.join("worlds_local/Alpha.db"), b"mine").unwrap();
+        let member = || {
+            let mut save = world("w1", "valheim");
+            save.local_path = folder.clone();
+            save.include = vec!["worlds_local/Alpha.db".into()];
+            if let Some(shared) = save.shared.as_mut() {
+                shared.include = save.include.clone();
+            }
+            save
+        };
+        for parked in [true, false] {
+            let (tx, mut rx) = mpsc::channel(16);
+            let (lease, mut seen) = LeaseHandle::probe();
+            let mut s = slots(vec![member()]);
+            let slot = s.get_mut("w1").unwrap();
+            slot.has_pending = true;
+            slot.lease = LeaseObs::Mine;
+            slot.cloud_head = Some(3);
+            slot.world_held = kernel::WorldHeld {
+                consecutive: if parked {
+                    kernel::reconcile::WORLD_HELD_GIVE_UP_AFTER
+                } else {
+                    2
+                },
+                needs_attention: parked,
+                retry_at: (!parked).then(|| OffsetDateTime::now_utc() + time::Duration::minutes(5)),
+                by_change: false,
+            };
+            // Held under its own lease, on the head: nothing to set aside.
+            assert_eq!(
+                on_reconciled(slot, now, &tx, Some(&lease)),
+                Followup::Nothing,
+                "parked={parked}"
+            );
+            if parked {
+                // Parked: the lease goes back.
+                tokio::task::yield_now().await;
+                assert_eq!(seen.try_recv().unwrap(), "release w1");
+                on_lease(slot, LeaseObs::Free, None, false, &tx, Some(&lease));
+            } else {
+                // On its ladder the lease stays (H-B-1); the owner forces it.
+                on_lease(
+                    slot,
+                    LeaseObs::Other,
+                    Some("owner".into()),
+                    false,
+                    &tx,
+                    Some(&lease),
+                );
+            }
+            // The owner hosts, pushes v4 and gives the world back.
+            on_lease(
+                slot,
+                LeaseObs::Other,
+                Some("owner".into()),
+                false,
+                &tx,
+                Some(&lease),
+            );
+            on_lease(slot, LeaseObs::Free, None, false, &tx, Some(&lease));
+            slot.cloud_head = Some(4);
+            assert_eq!(
+                on_reconciled(slot, now, &tx, Some(&lease)),
+                Followup::SideCopy,
+                "parked={parked}: the held writes wait on nothing"
+            );
+            let dir = side_copy_dir(
+                &tmp.path().join("conflicts"),
+                if parked { "p" } else { "l" },
+                OffsetDateTime::UNIX_EPOCH,
+            );
+            let moved = move_world_aside(&s["w1"].save, &dir).await.unwrap();
+            assert_eq!(moved, 1);
+            drain(&mut rx);
+            on_side_copied(&mut s, "w1", moved, now, &tx);
+            let slot = &s["w1"];
+            assert!(slot.pull_pending, "parked={parked}: the head comes down");
+            assert!(!slot.has_pending);
+            assert_eq!(slot.world_held, kernel::WorldHeld::default());
+            assert_eq!(
+                std::fs::read(dir.join("worlds_local/Alpha.db")).unwrap(),
+                b"mine"
+            );
+            std::fs::write(folder.join("worlds_local/Alpha.db"), b"mine").unwrap();
+        }
+
+        // Not under its own lease, and not a world that is not held.
+        for case in ["own lease", "not held"] {
+            let (tx, _rx) = mpsc::channel(16);
+            let mut s = slots(vec![member()]);
+            let slot = s.get_mut("w1").unwrap();
+            slot.has_pending = true;
+            slot.cloud_head = Some(4);
+            if case == "own lease" {
+                slot.lease = LeaseObs::Mine;
+                slot.world_held.consecutive = 2;
+                slot.world_held.retry_at =
+                    Some(OffsetDateTime::now_utc() + time::Duration::minutes(5));
+            } else {
+                slot.lease = LeaseObs::Free;
+            }
+            assert_eq!(
+                on_reconciled(slot, now, &tx, None),
+                Followup::Nothing,
+                "{case}"
+            );
+        }
+    }
+
+    /// M-4: the side copy is all or nothing. A world file that will not move
+    /// puts back the ones already moved, and the folder is as it was.
+    #[tokio::test]
+    async fn a_side_copy_that_cannot_move_a_file_moves_none() {
+        let tmp = tempfile::tempdir().unwrap();
+        let folder = tmp.path().join("save");
+        std::fs::create_dir_all(folder.join("worlds_local")).unwrap();
+        std::fs::write(folder.join("worlds_local/Alpha.db"), b"db").unwrap();
+        std::fs::write(folder.join("worlds_local/Alpha.fwl"), b"fwl").unwrap();
+        let mut save = world("w1", "valheim");
+        save.local_path = folder.clone();
+        save.include = vec![
+            "worlds_local/Alpha.db".into(),
+            "worlds_local/Alpha.fwl".into(),
+        ];
+        if let Some(shared) = save.shared.as_mut() {
+            shared.include = save.include.clone();
+        }
+        let dir = tmp.path().join("conflicts/w1/ts");
+        // The second file's place in the copy is taken by a folder with
+        // something in it: neither a rename nor a copy lands there.
+        std::fs::create_dir_all(dir.join("worlds_local/Alpha.fwl/in the way")).unwrap();
+        assert!(move_world_aside(&save, &dir).await.is_err());
+        assert_eq!(
+            std::fs::read(folder.join("worlds_local/Alpha.db")).unwrap(),
+            b"db",
+            "the file already moved came back"
+        );
+        assert_eq!(
+            std::fs::read(folder.join("worlds_local/Alpha.fwl")).unwrap(),
+            b"fwl"
+        );
+        assert!(!dir.join("worlds_local/Alpha.db").exists());
+    }
+
+    /// HRD-F-0028: a claim made outside a session and then released leaves no
+    /// pin behind, so a later push with no session gives the lease back once
+    /// it is up, as any sessionless push does.
+    #[tokio::test(start_paused = true)]
+    async fn a_released_claim_does_not_keep_a_later_push_s_lease() {
+        let (tx, _rx) = mpsc::channel(16);
+        let (lease, mut seen) = LeaseHandle::probe();
+        let now = Instant::now();
+        let mut s = slots(vec![world("w1", "valheim")]);
+        let slot = s.get_mut("w1").unwrap();
+        on_claim_world(slot, WorldRole::Host, &tx, Some(&lease));
+        assert!(slot.role_pinned);
+        on_lease(slot, LeaseObs::Mine, None, true, &tx, Some(&lease));
+        on_release_world(slot, &tx, Some(&lease));
+        on_lease(slot, LeaseObs::Free, None, false, &tx, Some(&lease));
+        assert!(!slot.role_pinned);
+        tokio::task::yield_now().await;
+        while seen.try_recv().is_ok() {}
+
+        // A push with no session takes the lease, and goes up.
+        slot.has_pending = true;
+        request_acquire(slot, &lease);
+        on_lease(slot, LeaseObs::Mine, None, true, &tx, Some(&lease));
+        slot.has_pending = false;
+        tokio::task::yield_now().await;
+        while seen.try_recv().is_ok() {}
+        assert_eq!(
+            on_reconciled(slot, now, &tx, Some(&lease)),
+            Followup::Nothing
+        );
+        tokio::task::yield_now().await;
+        assert_eq!(seen.try_recv().unwrap(), "release w1");
+    }
+
     /// A lease taken off this machine, or gone while the renew could not get
     /// through, is lost, and still is after an earlier release was answered.
     #[tokio::test(start_paused = true)]
@@ -2281,6 +2891,35 @@ mod tests {
         folder
     }
 
+    /// L-A: an owner's side copy that finds no file of the world on disk
+    /// lets the pull through, and the owner's pending writes outside the
+    /// world (a character) are re-checked once it lands, not dropped.
+    #[tokio::test]
+    async fn a_side_copy_with_no_world_on_disk_keeps_the_owners_edits_for_after_the_pull() {
+        let (tx, _rx) = mpsc::channel(8);
+        let tmp = tempfile::tempdir().unwrap();
+        let folder = owner_folder(tmp.path());
+        std::fs::remove_file(folder.join("worlds_local/Alpha.db")).unwrap();
+        let now = Instant::now();
+        let mut s = slots(vec![owned_world(&folder)]);
+        {
+            let slot = s.get_mut("w1").unwrap();
+            slot.has_pending = true;
+            let mut session = WorldSession::new(now);
+            session.stopped = true;
+            session.side_copy_started = true;
+            slot.session = Some(session);
+        }
+        on_side_copied(&mut s, "w1", 0, now, &tx);
+        let slot = &s["w1"];
+        assert!(slot.session.is_none());
+        assert!(!slot.has_pending && slot.pull_pending);
+        assert!(
+            slot.recheck_pending_after_pull,
+            "the character is re-checked after the pull"
+        );
+    }
+
     /// The owner's walk takes the whole folder; its side copy still takes
     /// the world alone.
     #[tokio::test]
@@ -2489,6 +3128,127 @@ mod tests {
 
         std::fs::write(folder.join("worlds_local/Alpha.db"), b"world, changed").unwrap();
         assert_eq!(on_reconciled(slot, now, &tx, None), Followup::SideCopy);
+    }
+
+    /// A Valheim 1.0 world is a folder whose files change names on every save
+    /// (`_main.<N>.*`, `*.chunk`): a write, or the deletion of the generation
+    /// before, anywhere inside the shared world's folder claims it, and the
+    /// same inside another world's folder claims nothing.
+    #[tokio::test(start_paused = true)]
+    async fn a_write_inside_a_1_0_world_folder_claims_only_that_world() {
+        use notify_debouncer_mini::{DebouncedEvent, DebouncedEventKind};
+        let (tx, mut rx) = mpsc::channel(8);
+        let (lease, mut seen) = LeaseHandle::probe();
+        let tmp = tempfile::tempdir().unwrap();
+        let folder = tmp.path().join("save");
+        for f in [
+            "worlds_local/Alpha/_main.5.db2",
+            "worlds_local/Alpha/0_0.chunk",
+            "worlds_local/Gamma/_main.2.db2",
+            "characters_local/me.fch",
+        ] {
+            let path = folder.join(f);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, f).unwrap();
+        }
+        let mut save = world("w1", "valheim");
+        save.local_path = folder.clone();
+        if let Some(shared) = save.shared.as_mut() {
+            shared.include = crate::worldfiles::template("valheim", "Alpha")
+                .unwrap()
+                .unwrap();
+            shared.caller_owns = true;
+        }
+        let hit = |paths: &[PathBuf]| {
+            let events: Vec<DebouncedEvent> = paths
+                .iter()
+                .map(|p| DebouncedEvent {
+                    path: p.clone(),
+                    kind: DebouncedEventKind::Any,
+                })
+                .collect();
+            crate::agent::fs_hit(&folder, None, &events)
+                .expect("a hit under the folder")
+                .paths
+        };
+        let session = |rx: &mut mpsc::Receiver<AgentEvent>| {
+            let mut s = slots(vec![save.clone()]);
+            s.get_mut("w1").unwrap().lease = LeaseObs::Free;
+            on_game_started(&mut s, "w1", Instant::now(), &tx);
+            drain(rx);
+            s
+        };
+
+        // Another world's folder: a write, a generation gone, the folder itself.
+        let mut s = session(&mut rx);
+        let slot = s.get_mut("w1").unwrap();
+        for path in [
+            "worlds_local/Gamma/_main.2.db2",
+            "worlds_local/Gamma/_main.1.db2",
+            "worlds_local/Gamma",
+            "characters_local/me.fch",
+        ] {
+            on_write_at(slot, &hit(&[folder.join(path)]), &tx, Some(&lease));
+        }
+        tokio::task::yield_now().await;
+        assert!(
+            seen.try_recv().is_err(),
+            "a write in another world's folder asked for the lease"
+        );
+        assert!(!slot.session.as_ref().unwrap().claimed);
+        assert!(drain(&mut rx).is_empty());
+
+        // Inside the shared world's folder, each one claims.
+        for path in [
+            "worlds_local/Alpha/_main.5.db2",
+            "worlds_local/Alpha/0_0.chunk",
+            "worlds_local/Alpha/_main.4.db2",
+            "worlds_local/Alpha",
+        ] {
+            let mut s = session(&mut rx);
+            let slot = s.get_mut("w1").unwrap();
+            on_write_at(slot, &hit(&[folder.join(path)]), &tx, Some(&lease));
+            tokio::task::yield_now().await;
+            assert_eq!(seen.try_recv().unwrap(), "acquire w1", "{path}");
+            assert!(slot.session.as_ref().unwrap().claimed, "{path}");
+        }
+    }
+
+    /// The side copy of a 1.0 world takes its folder's files, nested paths
+    /// kept, and leaves another world's folder where it is.
+    #[tokio::test]
+    async fn the_side_copy_moves_a_1_0_world_folder() {
+        let tmp = tempfile::tempdir().unwrap();
+        let folder = tmp.path().join("save");
+        for f in [
+            "worlds_local/Alpha/_main.5.fwl2",
+            "worlds_local/Alpha/0_0.chunk",
+            "worlds_local/Gamma/_main.2.fwl2",
+            "characters_local/me.fch",
+        ] {
+            let path = folder.join(f);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, f).unwrap();
+        }
+        let mut save = world("w1", "valheim");
+        save.local_path = folder.clone();
+        save.include = crate::worldfiles::template("valheim", "Alpha")
+            .unwrap()
+            .unwrap();
+        if let Some(shared) = save.shared.as_mut() {
+            shared.include = save.include.clone();
+        }
+        let dir = side_copy_dir(
+            &tmp.path().join("conflicts"),
+            "w1",
+            OffsetDateTime::UNIX_EPOCH,
+        );
+        assert_eq!(move_world_aside(&save, &dir).await.unwrap(), 2);
+        assert!(dir.join("worlds_local/Alpha/_main.5.fwl2").exists());
+        assert!(dir.join("worlds_local/Alpha/0_0.chunk").exists());
+        assert!(!folder.join("worlds_local/Alpha/0_0.chunk").exists());
+        assert!(folder.join("worlds_local/Gamma/_main.2.fwl2").exists());
+        assert!(folder.join("characters_local/me.fch").exists());
     }
 
     /// Finding 3 of the third end-to-end run: with no session, the owner

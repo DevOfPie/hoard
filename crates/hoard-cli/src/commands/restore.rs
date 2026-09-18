@@ -1,4 +1,4 @@
-//! CLI wrapper around `hoard_agent::restore::download_snapshot`.
+//! CLI wrapper around `hoard_agent::restore::restore_staged`.
 //!
 //! The streaming download / decode / SHA-verify / extract logic lives in the
 //! agent crate. This file is the clap front-end and the indicatif progress
@@ -13,7 +13,7 @@ use std::sync::{Arc, Mutex};
 use hoard_agent::api::ApiClient;
 use hoard_agent::config::CliConfig;
 use hoard_agent::library;
-use hoard_agent::restore::{download_snapshot, resolve_version, RestoreOptions};
+use hoard_agent::restore::{resolve_version, RestoreOptions};
 use hoard_agent::state::CliState;
 
 use crate::commands::link;
@@ -27,10 +27,14 @@ pub struct PreviewOut {
     /// decides whether someone loses a session.
     pub modified: Vec<String>,
     pub added: Vec<String>,
-    /// On disk and not in the version. **Nothing deletes them**, but they are
-    /// the saves made *after* the version being restored, so they are the ones
-    /// worth reading before saying yes.
+    /// On disk and not in the version, and left there. They are the saves
+    /// made *after* the version being restored, so they are the ones worth
+    /// reading before saying yes.
     pub local_only: Vec<String>,
+    /// On disk, not in the version, and inside the shared world it replaces
+    /// whole: moved into the conflicts folder before the version is written,
+    /// and kept there for the retention period.
+    pub world_set_aside: Vec<String>,
     /// On the owner's restore of a shared save: overwritten files outside the
     /// share's list, whose current bytes may be in no version yet. The restore
     /// copies them into the side-copy folder before writing.
@@ -39,6 +43,7 @@ pub struct PreviewOut {
     pub modified_count: usize,
     pub added_count: usize,
     pub local_only_count: usize,
+    pub world_set_aside_count: usize,
     pub outside_share_count: usize,
     pub unchanged: usize,
     pub bytes_to_write: u64,
@@ -56,10 +61,18 @@ pub struct RestoredOut {
     pub files_reused: u64,
     pub bytes_reused: u64,
     pub destination: String,
-    /// The folder the files in `preview.outside_share` were copied to before
-    /// the restore wrote over them. Absent when nothing needed keeping.
+    /// The folder the shared world's files that the version does not have
+    /// were moved to, so the world's folder ends as the version's. Absent
+    /// when nothing moved.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub set_aside: Option<String>,
+    pub world_set_aside: Option<String>,
+    pub world_files_set_aside: u64,
+    /// The folder the local copies this restore replaced were moved to before
+    /// it wrote, so a restore of the wrong version can be undone by hand.
+    /// Absent when nothing was replaced.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub replaced_set_aside: Option<String>,
+    pub files_replaced_set_aside: u64,
 }
 
 #[derive(Serialize)]
@@ -149,15 +162,26 @@ pub async fn apply(
     let include = hoard_agent::savefilter::restore_include(shared);
     let gate = hoard_agent::savefilter::gate_for_save(slug, include, allow_ini);
     // The owner's side of the same list, by the server's owner mark: what the
-    // restore overwrites outside it is copied aside before writing.
+    // restore overwrites outside it is announced, and moved aside with the
+    // rest of what it replaces.
     let outside = hoard_agent::savefilter::owner_share_include(shared);
+
+    // The share's world, owner and member alike, when `dest` is (or is about to
+    // become) this save's folder: a restore there leaves the world's folders as
+    // the version has them. A restore into some other folder is a copy and keeps
+    // whatever it finds.
+    let is_home = home.is_some() || row.as_ref().is_some_and(|s| s.local_path == dest);
+    let world: Vec<String> = match shared {
+        Some(s) if is_home => s.world().to_vec(),
+        _ => Vec::new(),
+    };
 
     // What is going to happen to the folder. Nothing is downloaded: it crosses
     // the version's manifest with what is on disk. Always shown, because
     // restoring overwrites and that deserves saying beforehand; with `--dry-run`
     // it is all the command does.
     let (preview, preview_error) = match hoard_agent::preview::restore_preview(
-        &client, &save_id, version, &dest, &gate, outside,
+        &client, &save_id, version, &dest, &gate, outside, &world,
     )
     .await
     {
@@ -166,10 +190,12 @@ pub async fn apply(
                 modified: p.modified,
                 added: p.added,
                 local_only: p.local_only,
+                world_set_aside: p.world_set_aside,
                 outside_share: p.outside_share,
                 modified_count: p.modified_count,
                 added_count: p.added_count,
                 local_only_count: p.local_only_count,
+                world_set_aside_count: p.world_set_aside_count,
                 outside_share_count: p.outside_share_count,
                 unchanged: p.unchanged,
                 bytes_to_write: p.bytes_to_write,
@@ -247,30 +273,46 @@ pub async fn apply(
         bar.set_position(downloaded);
     };
 
-    // Kept before anything is written. Only with `--force`: without it a folder
-    // with files in it is refused, so there is nothing to overwrite.
-    let set_aside = if force {
-        let root = CliConfig::state_dir()?.join("conflicts");
-        hoard_agent::restore::keep_outside_share(
-            &client, &save_id, version, &dest, &gate, outside, &root,
-        )
-        .await
-        .context("couldn't copy the files outside the shared world aside; nothing was restored")?
-    } else {
-        None
-    };
-
-    let options = RestoreOptions {
-        skip_verify: no_verify,
-        force,
-        // Extraction goes straight into `dest`, so that's also the folder worth
-        // deduping against: identical bytes already there aren't downloaded again.
-        reuse_from: Some(dest.clone()),
-        gate,
-    };
-    let outcome = download_snapshot(&client, &save_id, version, &dest, options, on_progress)
-        .await
-        .context("restore failed")?;
+    // Files outside the shared world that the version replaces are no longer
+    // copied aside first: the staged restore below moves every local copy it
+    // replaces into the conflicts tree, theirs included, and a copy made here
+    // as well put the same file in two folders.
+    let root = CliConfig::state_dir()?.join("conflicts");
+    // Downloaded whole into a staging folder first; the save's folder is only
+    // touched once that succeeded, so a download that fails or is killed
+    // leaves it as it was. Then, all or nothing, what the version replaces or
+    // does not have (in the shared world) moves into the conflicts tree, kept
+    // there for the retention period, and the version is copied in.
+    // Identical files are neither downloaded (where the server allows it) nor
+    // rewritten.
+    let quiet = output::json();
+    let staged = hoard_agent::restore::restore_staged(
+        &client,
+        &save_id,
+        version,
+        &dest,
+        RestoreOptions {
+            skip_verify: no_verify,
+            force,
+            reuse_from: None,
+            gate,
+        },
+        &world,
+        &root,
+        |dir| {
+            if !quiet {
+                println!(
+                    "  downloaded; anything this restore replaces or moves out of the \
+                     folder goes to {}",
+                    dir.display()
+                );
+            }
+        },
+        on_progress,
+    )
+    .await
+    .context("restore failed")?;
+    let outcome = &staged.outcome;
 
     {
         let bar = pb.lock().unwrap();
@@ -305,7 +347,18 @@ pub async fn apply(
             files_reused: outcome.files_reused as u64,
             bytes_reused: outcome.bytes_reused,
             destination: outcome.destination.display().to_string(),
-            set_aside: set_aside.as_ref().map(|s| s.dir.display().to_string()),
+            world_set_aside: staged
+                .moved_to
+                .as_ref()
+                .filter(|_| staged.world_files_set_aside > 0)
+                .map(|d| d.display().to_string()),
+            world_files_set_aside: staged.world_files_set_aside as u64,
+            replaced_set_aside: staged
+                .moved_to
+                .as_ref()
+                .filter(|_| staged.replaced_set_aside > 0)
+                .map(|d| d.display().to_string()),
+            files_replaced_set_aside: staged.replaced_set_aside as u64,
         }),
         remembered,
     };
@@ -325,10 +378,16 @@ pub async fn apply(
                 fmt_bytes(r.bytes_reused)
             );
         }
-        if let (Some(dir), Some(kept)) = (&r.set_aside, &set_aside) {
+        if let Some(dir) = &r.world_set_aside {
             println!(
-                "  {} file(s) outside the shared world were copied to {dir} first",
-                kept.files
+                "  {} file(s) of the shared world that v{} does not have were moved to {dir}",
+                r.world_files_set_aside, out.version
+            );
+        }
+        if let Some(dir) = &r.replaced_set_aside {
+            println!(
+                "  {} file(s) it replaced were moved to {dir} first",
+                r.files_replaced_set_aside
             );
         }
         if let Some(applied) = &out.remembered {
@@ -345,10 +404,12 @@ fn clone_preview(p: &PreviewOut) -> PreviewOut {
         modified: p.modified.clone(),
         added: p.added.clone(),
         local_only: p.local_only.clone(),
+        world_set_aside: p.world_set_aside.clone(),
         outside_share: p.outside_share.clone(),
         modified_count: p.modified_count,
         added_count: p.added_count,
         local_only_count: p.local_only_count,
+        world_set_aside_count: p.world_set_aside_count,
         outside_share_count: p.outside_share_count,
         unchanged: p.unchanged,
         bytes_to_write: p.bytes_to_write,
@@ -388,9 +449,16 @@ fn print_preview(out: &RestoreOut, full: bool) {
     );
     if p.outside_share_count > 0 {
         println!(
-            "{} of the overwritten file(s) are outside the shared world: they are copied to \
-             the side-copy folder first",
+            "{} of the overwritten file(s) are outside the shared world: they are moved to \
+             the conflicts folder first, with anything else it replaces",
             p.outside_share_count
+        );
+    }
+    if p.world_set_aside_count > 0 {
+        println!(
+            "{} file(s) of the shared world that this version does not have will be moved to \
+             the conflicts folder first, and kept there for the retention period",
+            p.world_set_aside_count
         );
     }
 
@@ -413,11 +481,16 @@ fn print_preview(out: &RestoreOut, full: bool) {
     };
     listed("overwritten", &p.modified, p.modified_count);
     listed(
-        "outside the shared world (copied aside first)",
+        "outside the shared world (moved aside first)",
         &p.outside_share,
         p.outside_share_count,
     );
     listed("created", &p.added, p.added_count);
+    listed(
+        "only on disk, in the shared world (will be moved aside)",
+        &p.world_set_aside,
+        p.world_set_aside_count,
+    );
     listed(
         "only on disk (kept, but newer than this version)",
         &p.local_only,

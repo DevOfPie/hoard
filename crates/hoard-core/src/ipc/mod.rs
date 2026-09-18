@@ -424,8 +424,9 @@ pub enum Request {
     /// Move a save into a group's namespace. Answers [`Payload::Save`].
     ///
     /// `world` names the world inside the save's root (`Alpha` for Valheim's
-    /// `worlds_local/Alpha.db`); the daemon turns it into the include list the
-    /// share carries, so members pull that world and nothing else. `None`
+    /// `worlds_local/Alpha/`, or `worlds_local/Alpha.db` before 1.0); the
+    /// daemon turns it into the include list the share carries, so members
+    /// pull that world and nothing else. `None`
     /// shares the whole folder. A game with no template or a name that is not
     /// a file stem answers [`IpcError::Invalid`].
     ShareSave {

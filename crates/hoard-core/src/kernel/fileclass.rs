@@ -213,6 +213,65 @@ pub fn included(include: &[String], rel_path: &str) -> bool {
             .any(|pattern| pattern_covers(pattern, rel_path))
 }
 
+/// The entries of a shared save's list that could name a folder outright: no
+/// `*` or `?` anywhere in them. Whether one is a folder or a file is the
+/// disk's answer, not the list's; [`in_mirrored_folder`] only takes paths
+/// beneath one.
+pub fn mirrored_folders(include: &[String]) -> impl Iterator<Item = &str> {
+    include
+        .iter()
+        .map(String::as_str)
+        .filter(|pattern| !pattern.is_empty() && !pattern.contains(['*', '?']))
+}
+
+/// Is `rel_path` inside a folder the share names whole, so that a version
+/// written into the save replaces the folder's contents instead of merging
+/// into them (HRD-Q-0027)?
+///
+/// A game that renames its files on every save (Valheim 1.0's
+/// `worlds_local/<W>/_main.<N>.*` generations) leaves the older generation
+/// beside a pulled one, and the game loads the newest; files there that the
+/// version does not have are moved into the conflicts folder, kept there for
+/// the retention period. True when an entry of
+/// [`mirrored_folders`] equals the path's leading segments and the path has
+/// more segments than the entry: `worlds_local/Alpha` covers
+/// `worlds_local/Alpha/_main.8.db2` but neither `worlds_local/Alpha.db` nor
+/// `worlds_local/Alpha2/x`. A wildcard entry (`worlds_local/Alpha_backup_*`)
+/// and a flat file keep the merge. An empty list is no share: nothing is.
+pub fn in_mirrored_folder(include: &[String], rel_path: &str) -> bool {
+    mirrored_folders(include).any(|folder| {
+        rel_path
+            .strip_prefix(folder.trim_end_matches('/'))
+            .and_then(|rest| rest.strip_prefix('/'))
+            .is_some_and(|rest| !rest.is_empty())
+    })
+}
+
+/// Does a version with these files hold the share's world as a folder, a file
+/// beneath one of its [`mirrored_folders`]? A Valheim world converted to 1.0
+/// does; a legacy flat world's version does not.
+pub fn holds_mirrored_folder<'a>(
+    include: &[String],
+    mut version_files: impl Iterator<Item = &'a str>,
+) -> bool {
+    version_files.any(|rel| in_mirrored_folder(include, rel))
+}
+
+/// Is `rel_path`, a local file the version being written does not carry,
+/// replaced by that version, and so moved aside rather than kept
+/// (HRD-Q-0027)? Anything beneath a folder the share names whole
+/// ([`in_mirrored_folder`]). And once the version holds the world as a folder
+/// (`version_holds_folder`, [`holds_mirrored_folder`]), the files the list
+/// names outright too: a converted world's legacy `<W>.db` and `<W>.fwl`, and
+/// their `.old` twins, would otherwise stay beside the folder and go up again
+/// with the next push. Wildcard entries (`<W>_backup_*`, the game's own
+/// backups) never are.
+pub fn replaced_by_version(include: &[String], rel_path: &str, version_holds_folder: bool) -> bool {
+    in_mirrored_folder(include, rel_path)
+        || (version_holds_folder
+            && mirrored_folders(include).any(|entry| entry.trim_end_matches('/') == rel_path))
+}
+
 /// Can any file under the directory `rel_dir` be [`included`]? The walk asks
 /// before descending, so a shared save's fingerprint never reads the folders
 /// its list cannot name. A pattern reaches beneath when its leading segments
@@ -299,6 +358,17 @@ impl RestoreGate {
 /// without meeting another rule. `scope.include`, when set, is checked first:
 /// a file a shared save does not name is [`FileClass::Junk`], never backed up,
 /// never restored, never counted.
+/// The suffix a restore gives each file it stages beside its destination
+/// before renaming it into place. Never save data ([`classify`]); a leftover
+/// is swept at the save's start and before the next merge.
+pub const RESTORE_TMP_SUFFIX: &str = ".hoard-restore.tmp";
+
+/// Is `path` (a name, or a path whose last part is the name) a restore's
+/// staged copy? The suffix whatever its case, as [`classify`] takes it.
+pub fn is_restore_tmp(path: &str) -> bool {
+    path.to_ascii_lowercase().ends_with(RESTORE_TMP_SUFFIX)
+}
+
 pub fn classify(rel_path: &str, scope: Scope<'_>) -> FileClass {
     // 0. A shared save is its named files and nothing else.
     if !included(scope.include, rel_path) {
@@ -307,6 +377,13 @@ pub fn classify(rel_path: &str, scope: Scope<'_>) -> FileClass {
 
     let lower = rel_path.to_ascii_lowercase();
     let name = lower.rsplit('/').next().unwrap_or(&lower);
+
+    // 0b. Hoard's own restore staging, ahead of the shields: a shield ending
+    //     in `*` (438 catalog games) would take a crash's leftover for save
+    //     data and push it (L-1).
+    if is_restore_tmp(name) {
+        return FileClass::Junk;
+    }
 
     // 1. The manifest rules: if it says this is a save, it is a save.
     if scope.shields.iter().any(|p| glob_match(p, name)) {
@@ -683,6 +760,85 @@ mod tests {
         ));
     }
 
+    /// HRD-Q-0027: only a folder named outright, and only beneath it.
+    #[test]
+    fn a_mirrored_folder_is_a_wildcard_free_entry_covering_paths_beneath_it() {
+        let list = inc(&[
+            "worlds_local/Alpha",
+            "worlds_local/Alpha.db",
+            "worlds_local/Alpha_backup_*",
+            "saves/slot?",
+        ]);
+        assert!(in_mirrored_folder(&list, "worlds_local/Alpha/_main.8.db2"));
+        assert!(in_mirrored_folder(&list, "worlds_local/Alpha/sub/x.chunk"));
+        // A sibling whose name starts the same is another world.
+        assert!(!in_mirrored_folder(&list, "worlds_local/Alpha2/x"));
+        assert!(!in_mirrored_folder(&list, "worlds_local/Alpha2"));
+        // The entry itself, and the legacy flat files beside it.
+        assert!(!in_mirrored_folder(&list, "worlds_local/Alpha"));
+        assert!(!in_mirrored_folder(&list, "worlds_local/Alpha.db"));
+        // Wildcard entries keep the merge, file or folder.
+        assert!(!in_mirrored_folder(
+            &list,
+            "worlds_local/Alpha_backup_auto-1/_main.3.db2"
+        ));
+        assert!(!in_mirrored_folder(&list, "saves/slot1/a.sav"));
+        // Case is exact, as in `included`.
+        assert!(!in_mirrored_folder(&list, "worlds_local/alpha/_main.8.db2"));
+        // Characters, and a save that is not shared at all.
+        assert!(!in_mirrored_folder(&list, "characters_local/Me.fch"));
+        assert!(!in_mirrored_folder(&[], "worlds_local/Alpha/_main.8.db2"));
+        assert_eq!(
+            mirrored_folders(&list).collect::<Vec<_>>(),
+            vec!["worlds_local/Alpha", "worlds_local/Alpha.db"]
+        );
+    }
+
+    /// HRD-Q-0027, a converted world: once the version holds the folder, the
+    /// flat files the list names outright are replaced too; a backup the
+    /// wildcard names, a character and another world never are. A legacy
+    /// version replaces only what is beneath the folder.
+    #[test]
+    fn a_version_holding_the_folder_replaces_the_flat_files_too() {
+        let list = inc(&[
+            "worlds_local/Alpha",
+            "worlds_local/Alpha.db",
+            "worlds_local/Alpha.fwl",
+            "worlds_local/Alpha.db.old",
+            "worlds_local/Alpha_backup_*",
+        ]);
+        assert!(holds_mirrored_folder(
+            &list,
+            ["characters_local/Me.fch", "worlds_local/Alpha/_main.2.db2"].into_iter()
+        ));
+        assert!(!holds_mirrored_folder(
+            &list,
+            ["worlds_local/Alpha.db", "worlds_local/Alpha.fwl"].into_iter()
+        ));
+        for flat in [
+            "worlds_local/Alpha.db",
+            "worlds_local/Alpha.fwl",
+            "worlds_local/Alpha.db.old",
+        ] {
+            assert!(replaced_by_version(&list, flat, true), "{flat}");
+            assert!(!replaced_by_version(&list, flat, false), "{flat}");
+        }
+        assert!(replaced_by_version(
+            &list,
+            "worlds_local/Alpha/_main.1.db2",
+            false
+        ));
+        for kept in [
+            "worlds_local/Alpha_backup_auto-1.db",
+            "worlds_local/Alpha_backup_auto-1/_main.1.db2",
+            "worlds_local/Alpha2.db",
+            "characters_local/Me.fch",
+        ] {
+            assert!(!replaced_by_version(&list, kept, true), "{kept}");
+        }
+        assert!(!replaced_by_version(&[], "worlds_local/Alpha.db", true));
+    }
+
     /// `?` is one character of one segment, like everywhere else in the module.
     #[test]
     fn include_question_mark_is_one_character() {
@@ -709,6 +865,26 @@ mod tests {
         assert_eq!(classify("worlds_local/Beta.db", scope), FileClass::Junk);
         assert!(!classify("worlds_local/Beta.db", scope).is_backed_up());
         assert!(!classify("worlds_local/Beta.db", scope).is_restored(true));
+    }
+
+    /// L-1: a restore's staged copy left by a crash is litter even where a
+    /// shield ending in `*` would take every file for save data, and inside a
+    /// shared world's folder.
+    #[test]
+    fn a_restore_temp_file_is_junk_before_the_shields() {
+        let star = inc(&["*"]);
+        let tmp = "worlds_local/Alpha/0_0.chunk.hoard-restore.tmp";
+        assert_eq!(shielded(tmp, &star), FileClass::Junk);
+        let include = inc(&["worlds_local/Alpha"]);
+        let scope = Scope {
+            shields: &star,
+            include: &include,
+        };
+        assert_eq!(classify(tmp, scope), FileClass::Junk);
+        assert_eq!(
+            classify("worlds_local/Alpha/0_0.chunk", scope),
+            FileClass::SaveData
+        );
     }
 
     #[test]

@@ -62,6 +62,7 @@
     backup_quota_full: HardDrive,
     backup_trimmed: Scissors,
     backup_files_unreadable: FileWarning,
+    backup_world_held: FileWarning,
     auto_restore_failed: XCircle,
     auto_restore_stuck: AlertTriangle,
     auto_restore_recovered: CheckCircle2,
@@ -94,6 +95,7 @@
     backup_quota_full: "text-red-400",
     backup_trimmed: "text-amber-300",
     backup_files_unreadable: "text-amber-300",
+    backup_world_held: "text-red-400",
     auto_restore_failed: "text-red-400",
     auto_restore_stuck: "text-amber-400",
     auto_restore_recovered: "text-emerald-400",
@@ -130,6 +132,8 @@
     // uploads, `upload_failed`'s red row appears next to it and that one rules.
     backup_files_unreadable:
       "my-1 rounded-md border border-amber-500/60 bg-amber-500/10",
+    // Red: nothing went up, and the rest of the world waits on this file.
+    backup_world_held: "my-1 rounded-md border border-red-500/60 bg-red-500/10",
     storage_purging: "my-1 rounded-md border border-amber-500/60 bg-amber-500/10",
     storage_grace: "my-1 rounded-md border border-sky-500/60 bg-sky-500/10",
   };

@@ -715,12 +715,34 @@ export type AgentEvent =
       uploaded: boolean;
     }
   | {
+      /** A shared world's push is held: one of its files can't be read, and
+       *  a version without it would move it out of every member's folder.
+       *  Nothing went up. `parked`: retrying on a clock has stopped; it tries
+       *  again when the save's files change or on "back up now". Cleared by
+       *  `backup_success` or `backup_attention_cleared`. */
+      type: "backup_world_held";
+      save_id: string;
+      game_slug: string;
+      label: string;
+      count: number;
+      sample_path: string;
+      sample_error: string;
+      attempts: number;
+      parked: boolean;
+      /** Left out by the plan's per-save cap, not unreadable. Absent from
+       *  older engines. */
+      over_cap?: boolean;
+    }
+  | {
       type: "save_auto_restored";
       save_id: string;
       game_slug: string;
       version_num: number;
       files_extracted: number;
       bytes_extracted: number;
+      /** The folder's signatures after the merge, for the service's state. */
+      set_hash?: string;
+      world_hash?: string;
     }
   | {
       type: "save_auto_restore_failed";
@@ -1218,6 +1240,15 @@ export type RestoreOutcome = {
   /** If `backup_first` was set on the call, this is the version number of
    *  the safety backup the user can restore to undo this restore. */
   safety_version: number | null;
+  /** Files of the shared world this version doesn't have, moved into the
+   *  conflicts folder (kept there for the retention period) so the world's
+   *  folder ends as the version's. 0 on any other restore. */
+  world_files_set_aside: number;
+  /** Local files the version replaced, moved into the same folder before it
+   *  was written (the restore is downloaded whole first, then applied). */
+  files_replaced_set_aside: number;
+  /** Where the files moved out went, when any did. */
+  set_aside_dir: string | null;
 };
 
 export type LogLine = {
@@ -1300,7 +1331,12 @@ export type RestorePreview = {
   /** Capped at 200 entries, count with `modified_count`, never `.length`. */
   modified: string[];
   added: string[];
+  /** Only on disk, and left there. */
   local_only: string[];
+  /** Only on disk, inside the shared world the version replaces whole: moved
+   *  to the conflicts folder before the version is written. Never also in
+   *  `local_only`. */
+  world_set_aside: string[];
   /** On the owner's restore of a shared save: overwritten files outside the
    *  share's list, which the restore copies to the side-copy folder first. */
   outside_share: string[];
@@ -1308,6 +1344,7 @@ export type RestorePreview = {
   modified_count: number;
   added_count: number;
   local_only_count: number;
+  world_set_aside_count: number;
   outside_share_count: number;
   bytes_to_write: number;
   comparable: boolean;
@@ -1354,6 +1391,9 @@ export function restoreSnapshot(args: {
  *  for this save, prompt the user to pick one and retry with
  *  `destination_override`". */
 export const NEEDS_DESTINATION = "NEEDS_DESTINATION";
+/** Prefix of the restore error when the safety copy is held because a file of
+ *  the shared world can't be read: `SAFETY_COPY_HELD\n<path>\n<reason>`. */
+export const SAFETY_COPY_HELD = "SAFETY_COPY_HELD";
 
 export function setSavePaused(saveId: string, paused: boolean): Promise<void> {
   return invoke<void>("set_save_paused", { saveId, paused });

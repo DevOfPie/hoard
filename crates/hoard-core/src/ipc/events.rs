@@ -230,6 +230,18 @@ pub enum AgentEvent {
         version_num: i64,
         files_extracted: u64,
         bytes_extracted: u64,
+        /// The folder's signature after the merge, when it ended equal to the
+        /// head, in [`AgentEvent::BackupSuccess::set_hash`]'s shape. Persisted
+        /// with the version so a restart does not read the pull's own writes
+        /// as a change to push. `None` when the folder kept local changes, or
+        /// from an older daemon: the stored one stays.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        set_hash: Option<String>,
+        /// The shared world's signature after the merge, when it ended equal
+        /// to the head's. Persisted whenever `set_hash` is, `None` included,
+        /// so a stale world signature never outlives the pull.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        world_hash: Option<String>,
     },
     /// Auto-restore was attempted but failed (network error, sha mismatch,
     /// permission denied writing to the local path). Surfaced separately
@@ -301,6 +313,38 @@ pub enum AgentEvent {
         conflicts: u32,
         /// The last error chain, so the card says *why*.
         error: String,
+    },
+    /// A shared world's push is **held**: one of its files cannot be read (or
+    /// would not fit the plan's cap), and a version without it would move good
+    /// copies out of every puller's world folder. Nothing went up.
+    ///
+    /// Not [`AgentEvent::BackupFilesUnreadable`]: that one is a version that
+    /// went up without some files, or a folder where nothing reads. Here the
+    /// rest of the world reads fine and still does not go up, on purpose.
+    ///
+    /// Sent on each held attempt. `parked` means the retry budget is spent: no
+    /// retry is coming on a clock, only when the save's files change or the
+    /// user presses "back up now". Cleared by a backup that goes up
+    /// (`BackupSuccess`) or by [`AgentEvent::BackupAttentionCleared`].
+    BackupWorldHeld {
+        save_id: String,
+        game_slug: String,
+        label: String,
+        /// How many of the world's files cannot go up.
+        count: u64,
+        /// The first of them, relative to the save folder.
+        sample_path: String,
+        /// Why, verbatim: the OS error, or the cap.
+        sample_error: String,
+        /// Consecutive held pushes.
+        attempts: u32,
+        /// Retrying on a clock has stopped.
+        parked: bool,
+        /// The files were left out by the plan's per-save cap, not because
+        /// they can't be read: the UI says which (M-3). Absent from older
+        /// engines, which reads as unreadable.
+        #[serde(default)]
+        over_cap: bool,
     },
     /// A save that had emitted [`AgentEvent::BackupNeedsAttention`] is uploading
     /// again (or has a fresh reason to try). Lets the frontends drop the

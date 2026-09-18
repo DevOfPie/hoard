@@ -48,7 +48,7 @@
   import Input from "../lib/components/Input.svelte";
   import Cover from "../lib/components/Cover.svelte";
   import * as api from "../lib/api";
-  import { NEEDS_DESTINATION } from "../lib/api";
+  import { NEEDS_DESTINATION, SAFETY_COPY_HELD } from "../lib/api";
   import type {
     SnapshotEntry,
     SnapshotDetail,
@@ -198,6 +198,16 @@
   // Pending-destination modal: shown when restore_snapshot returns
   // NEEDS_DESTINATION because there's no local mapping for this save yet.
   let pickingDestination = $state<SnapshotEntry | null>(null);
+  // The safety copy was held: a file of the shared world can't be read. The
+  // user may restore without it; nothing else changes.
+  let safetyHeld = $state<{
+    target: SnapshotEntry;
+    destinationOverride: string | null;
+    path: string;
+    error: string;
+    /** The plan's per-save cap left the file out; it is not unreadable. */
+    overCap: boolean;
+  } | null>(null);
 
   let togglingPause = $state(false);
   let backingUp = $state(false);
@@ -416,6 +426,7 @@
   async function performRestore(
     target: SnapshotEntry,
     destinationOverride: string | null,
+    withoutSafety = false,
   ) {
     restoring = true;
     restoreProgress = null;
@@ -423,23 +434,37 @@
       const out = await api.restoreSnapshot({
         save_id: saveId,
         version: target.version_num,
-        backup_first: backupFirst,
+        backup_first: backupFirst && !withoutSafety,
         destination_override: destinationOverride,
         allow_config: allowConfig,
       });
+      const setAside =
+        out.world_files_set_aside > 0
+          ? $_("history.set_aside_suffix", {
+              values: { count: out.world_files_set_aside },
+            })
+          : "";
+      const replaced =
+        out.files_replaced_set_aside > 0
+          ? $_("history.replaced_suffix", {
+              values: { count: out.files_replaced_set_aside },
+            })
+          : "";
       const safety = out.safety_version
         ? $_("history.safety_suffix", {
             values: { version: out.safety_version },
           })
         : "";
+      const restored = $_("history.restored_toast", {
+        values: {
+          version: target.version_num,
+          count: out.files_extracted,
+          safety: setAside + replaced + safety,
+        },
+      });
+      // Where the moved files went: the only way to undo by hand.
       toastSuccess(
-        $_("history.restored_toast", {
-          values: {
-            version: target.version_num,
-            count: out.files_extracted,
-            safety,
-          },
-        }),
+        out.set_aside_dir ? `${restored}\n${out.set_aside_dir}` : restored,
       );
       restoreTarget = null;
       pickingDestination = null;
@@ -451,6 +476,16 @@
       // the user.
       if (msg === NEEDS_DESTINATION) {
         pickingDestination = target;
+        restoreTarget = null;
+      } else if (msg.startsWith(`${SAFETY_COPY_HELD}\n`)) {
+        const [, path = "", error = "", cause = ""] = msg.split("\n");
+        safetyHeld = {
+          target,
+          destinationOverride,
+          path,
+          error,
+          overCap: cause === "cap",
+        };
         restoreTarget = null;
       } else {
         toastError(msg);
@@ -1319,7 +1354,9 @@
           <div class="text-zinc-500">{$_("history.preview_loading")}</div>
         {:else if !preview.comparable}
           <div class="text-zinc-400">{$_("history.preview_unavailable")}</div>
-        {:else if preview.modified_count === 0 && preview.added_count === 0}
+        {:else if preview.modified_count === 0 &&
+          preview.added_count === 0 &&
+          preview.world_set_aside_count === 0}
           <div class="text-zinc-400">{$_("history.preview_nothing")}</div>
         {:else}
           <ul class="space-y-1 text-zinc-300">
@@ -1350,6 +1387,13 @@
           <div class="mt-1.5 text-amber-200">
             {$_("history.preview_outside_share", {
               values: { count: preview.outside_share_count },
+            })}
+          </div>
+        {/if}
+        {#if preview && preview.world_set_aside_count > 0}
+          <div class="mt-1.5 text-amber-200">
+            {$_("history.preview_set_aside", {
+              values: { count: preview.world_set_aside_count },
             })}
           </div>
         {/if}
@@ -1436,6 +1480,43 @@
     >
       <FolderOpen size={14} />
       {$_("history.browse")}
+    </Button>
+  {/snippet}
+</Modal>
+
+<!-- The safety copy was held: offer the restore without it. -->
+<Modal
+  open={!!safetyHeld}
+  title={$_("history.safety_held_title")}
+  dismissible={!restoring}
+  onClose={() => {
+    if (!restoring) safetyHeld = null;
+  }}
+>
+  <p class="text-sm text-zinc-300" title={safetyHeld?.error ?? ""}>
+    {$_(safetyHeld?.overCap ? "history.safety_held_cap_body" : "history.safety_held_body", {
+      values: { path: safetyHeld?.path ?? "" },
+    })}
+  </p>
+  {#snippet footer()}
+    <Button
+      variant="secondary"
+      onclick={() => (safetyHeld = null)}
+      disabled={restoring}
+    >
+      {$_("common.cancel")}
+    </Button>
+    <Button
+      variant="primary"
+      loading={restoring}
+      onclick={async () => {
+        if (!safetyHeld) return;
+        const held = safetyHeld;
+        await performRestore(held.target, held.destinationOverride, true);
+        safetyHeld = null;
+      }}
+    >
+      {$_("history.restore_without_safety")}
     </Button>
   {/snippet}
 </Modal>

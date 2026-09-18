@@ -125,6 +125,10 @@ pub struct RestoreOutcome {
     pub bytes_reused: u64,
     /// What each half of the restore cost. See [`RestoreTimings`].
     pub timings: RestoreTimings,
+    /// Every file the version carries, `/`-separated relative paths, whether
+    /// or not the gate let it be written: what [`set_aside_stale_world`]
+    /// holds the folder against.
+    pub version_files: Vec<String>,
 }
 
 /// How a restore's time is split between its phases.
@@ -226,63 +230,366 @@ fn extraction_root(dest: &Path, snapshot_names: &[&str]) -> PathBuf {
     dest.to_path_buf()
 }
 
-/// Where [`keep_outside_share`] put the files it copied.
+/// Where [`set_aside_stale_world`] put the files it moved.
 #[derive(Debug, Clone)]
 pub struct SetAside {
     pub dir: PathBuf,
     pub files: usize,
+    /// The files, relative to the save's folder and to `dir` alike.
+    pub paths: Vec<String>,
 }
 
-/// Before an owner's restore of a shared save writes: copies the files on disk
-/// outside the share's list that it would overwrite into a side-copy folder
-/// under `root`, the tree a session's side copies use, so one retention sweep
-/// covers both.
+/// The files in a shared save's own folder `dest` that a version made of
+/// `version_files` replaces and does not carry, so they are moved aside rather
+/// than kept (HRD-Q-0027): save data beneath the world's folders
+/// ([`hoard_core::kernel::fileclass::in_mirrored_folder`]) and, once the version
+/// holds the world as a folder, the legacy flat files the list names outright
+/// ([`hoard_core::kernel::fileclass::replaced_by_version`]). Config the gate
+/// would not write and litter the backup never reads stay put, as does
+/// everything else (the characters, other worlds, the game's `_backup_*`
+/// copies). Sorted. Empty for an unshared save (`world` empty), a single-file
+/// save, and a folder that is not there.
 ///
-/// A file outside the share written since the owner's last upload (a
-/// character played while a member hosted, say) and overwritten by an older
-/// version would otherwise be in no version and in no copy. `share_include`
-/// comes from [`crate::savefilter::owner_share_include`]; empty, and `None`
-/// back, for any other restore. Files are copied, never moved: the restore decides what
-/// changes in the folder. `None` when nothing needed keeping.
-pub async fn keep_outside_share(
+/// What [`set_aside_stale_world`] moves and what a preview announces as moved,
+/// out of one decision.
+pub fn stale_world_files(
+    dest: &Path,
+    version_files: &[String],
+    shields: &[String],
+    world: &[String],
+) -> Result<Vec<String>> {
+    use hoard_core::kernel::fileclass::{
+        classify, holds_mirrored_folder, mirrored_folders, replaced_by_version,
+    };
+    use hoard_core::kernel::fileclass::{FileClass, Scope};
+
+    let names: Vec<&str> = version_files.iter().map(String::as_str).collect();
+    if mirrored_folders(world).next().is_none()
+        || !dest.is_dir()
+        || is_single_file_snapshot(dest, &names)
+    {
+        return Ok(Vec::new());
+    }
+    let holds_folder = holds_mirrored_folder(world, names.iter().copied());
+    let kept: HashSet<&str> = names.into_iter().collect();
+    let scope = Scope {
+        shields,
+        include: world,
+    };
+    let mut stale: Vec<String> = crate::backup::walk_source(dest, scope)?
+        .into_iter()
+        .map(|f| f.relative_path)
+        .filter(|rel| {
+            replaced_by_version(world, rel, holds_folder)
+                && classify(rel, scope) == FileClass::SaveData
+                && !kept.contains(rel.as_str())
+        })
+        .collect();
+    stale.sort();
+    Ok(stale)
+}
+
+/// Before a version is written into a shared save's own folder: moves the
+/// files it replaces and does not carry ([`stale_world_files`]) into a
+/// conflicts folder under `root`, the tree the pull's conflict backups and a
+/// session's side copies use, so the folder ends as the version's world and
+/// one retention sweep covers all three (HRD-Q-0027). They are kept there for
+/// the retention period (`conflict_retention_days`), not deleted by this.
+///
+/// Valheim 1.0 writes a world as `worlds_local/<W>/_main.<N>.*` and loads the
+/// highest `N`, so without this a restored older version sits beside the newer
+/// generation it was meant to replace and never loads. `version_files` is the
+/// version's whole list, whether or not the gate writes each file
+/// ([`crate::preview::remote_files`]); `world` is the share's list, owner and
+/// member alike ([`crate::state::SharedRef::world`]).
+///
+/// Moved first and written after (the caller downloads once this returns): a
+/// move that fails puts back what already moved and returns the error, so
+/// nothing is written over a half-moved world. A download that fails after
+/// it hands the result to [`put_back`]. `None` when nothing moved.
+pub async fn set_aside_stale_world(
+    dest: &Path,
+    version_files: &[String],
+    shields: &[String],
+    world: &[String],
+    root: &Path,
+    save_id: &str,
+) -> Result<Option<SetAside>> {
+    let stale = stale_world_files(dest, version_files, shields, world)?;
+    if stale.is_empty() {
+        return Ok(None);
+    }
+    let dir = crate::claim::side_copy_dir(root, save_id, time::OffsetDateTime::now_utc());
+    move_all_aside(dest, &stale, &dir).await?;
+    for rel in &stale {
+        prune_emptied(dest, rel, world);
+    }
+    tracing::info!(
+        save_id,
+        files = stale.len(),
+        dir = %dir.display(),
+        "restore: moved the world's files the version does not have aside"
+    );
+    Ok(Some(SetAside {
+        dir,
+        files: stale.len(),
+        paths: stale,
+    }))
+}
+
+/// What [`restore_staged`] did.
+#[derive(Debug, Clone)]
+pub struct StagedRestore {
+    /// The download into staging; `destination` is the save's folder.
+    pub outcome: RestoreOutcome,
+    /// Where the files that left the folder went, when any did.
+    pub moved_to: Option<PathBuf>,
+    /// The shared world's files the version does not have, moved aside.
+    pub world_files_set_aside: usize,
+    /// Local copies the version replaced, moved aside before it was written.
+    pub replaced_set_aside: usize,
+}
+
+/// An explicit restore of `version` into `dest`, the CLI's and the desktop's,
+/// done the way the engine's pull is (M-B): the whole version is downloaded
+/// into a staging folder first, and the live folder is touched only once that
+/// succeeded. A download that fails, or is killed, leaves `dest` as it was.
+///
+/// Then, locally and all or nothing ([`crate::agent::restore_files_into_as`]):
+/// the version wins every file it carries whatever the mtimes, a different
+/// local copy is moved into a folder under `conflict_root` first, and so are
+/// the shared world's files the version does not have (HRD-Q-0027; `world`
+/// empty for an unshared save). Files identical to the version are neither
+/// downloaded (`reuse_from` is the live folder, where the server's path allows
+/// it) nor rewritten. What the gate keeps out stays as it is, and so does
+/// anything else the version does not carry.
+///
+/// `on_moving` is told the folder before anything can move out of `dest`
+/// (not called for an empty or new folder). Without
+/// `options.force` a folder with files in it is refused before the download.
+#[allow(clippy::too_many_arguments)]
+pub async fn restore_staged<F>(
     client: &ApiClient,
     save_id: &str,
     version: i64,
     dest: &Path,
-    gate: &RestoreGate,
-    share_include: &[String],
-    root: &Path,
-) -> Result<Option<SetAside>> {
-    if share_include.is_empty() {
-        return Ok(None);
-    }
-    let remote = crate::preview::remote_files(client, save_id, version).await?;
-    let files = crate::preview::overwritten_outside_share(&remote, dest, gate, share_include).await;
-    if files.is_empty() {
-        return Ok(None);
-    }
-    let dir = crate::claim::side_copy_dir(root, save_id, time::OffsetDateTime::now_utc());
-    copy_aside(dest, &files, &dir).await?;
-    Ok(Some(SetAside {
-        dir,
-        files: files.len(),
-    }))
+    options: RestoreOptions,
+    world: &[String],
+    conflict_root: &Path,
+    on_moving: impl FnOnce(&Path),
+    progress: F,
+) -> Result<StagedRestore>
+where
+    F: Fn(u64, u64) + Send + Sync + 'static,
+{
+    let state_dir = crate::config::CliConfig::state_dir().ok();
+    restore_staged_in(
+        state_dir.as_deref(),
+        client,
+        save_id,
+        version,
+        dest,
+        options,
+        world,
+        conflict_root,
+        on_moving,
+        progress,
+    )
+    .await
 }
 
-/// Copies each of `files` (relative to `dest`) to the same path under `dir`.
-async fn copy_aside(dest: &Path, files: &[String], dir: &Path) -> Result<()> {
-    for rel in files {
-        let to = dir.join(rel);
-        if let Some(parent) = to.parent() {
-            tokio::fs::create_dir_all(parent)
-                .await
-                .with_context(|| format!("creating {}", parent.display()))?;
+/// [`restore_staged`] with the state folder resolved by the caller: staging
+/// goes under its `staging` ([`crate::agent::staging_root_in`]), and `dest`
+/// is checked against it.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn restore_staged_in<F>(
+    state_dir: Option<&Path>,
+    client: &ApiClient,
+    save_id: &str,
+    version: i64,
+    dest: &Path,
+    options: RestoreOptions,
+    world: &[String],
+    conflict_root: &Path,
+    on_moving: impl FnOnce(&Path),
+    progress: F,
+) -> Result<StagedRestore>
+where
+    F: Fn(u64, u64) + Send + Sync + 'static,
+{
+    // The same shape rule as adding, and for the same reason: a restore over
+    // `C:\Users\<x>` or over `~` would dump a snapshot on top of the user's
+    // profile. It matters even more here, because this WRITES, and the path can
+    // come from a `state.json` poisoned by an old detection or from another
+    // machine. The folder may not exist yet (a new machine), so only the shape
+    // is checked. On the live folder: staging is Hoard's own, under the state
+    // folder the rule refuses ([`download_snapshot`]).
+    crate::library::validate_path_shape_in(dest, state_dir)?;
+    if dest.is_dir() && std::fs::read_dir(dest)?.next().is_some() && !options.force {
+        bail!(
+            "destination is not empty: {} (set force = true to extract anyway)",
+            dest.display()
+        );
+    }
+    let staging = crate::agent::staging_dir_in(&crate::agent::staging_root_in(state_dir), save_id);
+    tokio::fs::create_dir_all(&staging)
+        .await
+        .with_context(|| format!("creating staging dir {}", staging.display()))?;
+    let reuse_from = if dest.is_dir() {
+        Some(dest.to_path_buf())
+    } else {
+        dest.parent().filter(|p| p.is_dir()).map(Path::to_path_buf)
+    };
+    let gate = options.gate.clone();
+    let downloaded = download_snapshot(
+        client,
+        save_id,
+        version,
+        &staging,
+        RestoreOptions {
+            skip_verify: options.skip_verify,
+            force: false,
+            reuse_from,
+            gate: gate.clone(),
+        },
+        progress,
+    )
+    .await;
+    let mut outcome = match downloaded {
+        Ok(outcome) => outcome,
+        Err(e) => {
+            crate::agent::cleanup_staging(&staging).await;
+            return Err(e.context(format!(
+                "downloading v{version}; nothing in {} was changed",
+                dest.display()
+            )));
         }
-        tokio::fs::copy(dest.join(rel), &to)
+    };
+
+    let names: Vec<&str> = outcome.version_files.iter().map(String::as_str).collect();
+    let root = extraction_root(dest, &names);
+    let applied = async {
+        tokio::fs::create_dir_all(&root)
             .await
-            .with_context(|| format!("copying {rel} aside to {}", to.display()))?;
+            .with_context(|| format!("creating {}", root.display()))?;
+        let dir =
+            crate::claim::side_copy_dir(conflict_root, save_id, time::OffsetDateTime::now_utc());
+        if std::fs::read_dir(&root)?.next().is_some() {
+            on_moving(&dir);
+        }
+        let stats = crate::agent::restore_files_into_as(
+            &root,
+            &staging,
+            Some(&dir),
+            gate.scope(),
+            world,
+            true,
+        )
+        .await?;
+        anyhow::Ok((dir, stats))
+    }
+    .await;
+    crate::agent::cleanup_staging(&staging).await;
+    let (dir, stats) = applied?;
+    outcome.destination = dest.to_path_buf();
+    let moved = stats.world_files_set_aside + stats.conflicts_backed_up;
+    Ok(StagedRestore {
+        outcome,
+        moved_to: (moved > 0).then_some(dir),
+        world_files_set_aside: stats.world_files_set_aside,
+        replaced_set_aside: stats.conflicts_backed_up,
+    })
+}
+
+/// Moves each of `rels` from `dest` to the same path under `dir`, in order.
+/// All or nothing: when one fails, those already moved go back where they
+/// were and the error is returned.
+pub(crate) async fn move_all_aside(dest: &Path, rels: &[String], dir: &Path) -> Result<()> {
+    for (i, rel) in rels.iter().enumerate() {
+        if let Err(e) = move_aside(&dest.join(rel), &dir.join(rel)).await {
+            put_back_moved(dest, &rels[..i], dir).await;
+            return Err(e.context(format!("moving {rel} aside; nothing was moved")));
+        }
     }
     Ok(())
+}
+
+/// Moves back what [`set_aside_stale_world`] moved, after the download that
+/// was to follow it failed: the version carries none of those paths, so
+/// nothing it may have written is in the way. Best effort; what cannot go
+/// back stays in the conflicts folder and is logged.
+pub async fn put_back(dest: &Path, set_aside: &SetAside) {
+    put_back_moved(dest, &set_aside.paths, &set_aside.dir).await;
+}
+
+pub(crate) async fn put_back_moved(dest: &Path, rels: &[String], dir: &Path) {
+    for rel in rels.iter().rev() {
+        if let Err(e) = move_aside(&dir.join(rel), &dest.join(rel)).await {
+            tracing::warn!(
+                rel,
+                dir = %dir.display(),
+                error = %format!("{e:#}"),
+                "restore: couldn't put a file moved aside back; it stays in the conflicts folder"
+            );
+        }
+    }
+}
+
+/// Moves `from` to `to`, creating `to`'s parents: a rename, or a copy and a
+/// remove when the two sit on different filesystems.
+pub(crate) async fn move_aside(from: &Path, to: &Path) -> Result<()> {
+    if let Some(parent) = to.parent() {
+        tokio::fs::create_dir_all(parent)
+            .await
+            .with_context(|| format!("creating {}", parent.display()))?;
+    }
+    if tokio::fs::rename(from, to).await.is_err() {
+        copy_then_remove(from, to).await?;
+    }
+    Ok(())
+}
+
+/// The cross-filesystem half of a move: copy, stamp the copy with the
+/// original's mtime, remove the original. The mtime is what the pull's
+/// merge and the game's "latest save" pick go by, so a file put back must
+/// not come back as brand new (L-D). A failed stamp is logged, not fatal.
+pub(crate) async fn copy_then_remove(from: &Path, to: &Path) -> Result<()> {
+    let mtime = tokio::fs::metadata(from)
+        .await
+        .and_then(|m| m.modified())
+        .ok();
+    tokio::fs::copy(from, to)
+        .await
+        .with_context(|| format!("copying {} to {}", from.display(), to.display()))?;
+    if let Some(mtime) = mtime {
+        if let Err(e) = filetime::set_file_mtime(to, filetime::FileTime::from_system_time(mtime)) {
+            tracing::warn!(
+                to = %to.display(),
+                error = %e,
+                "restore: couldn't keep a moved file's mtime"
+            );
+        }
+    }
+    tokio::fs::remove_file(from)
+        .await
+        .with_context(|| format!("removing {} after moving it", from.display()))?;
+    Ok(())
+}
+
+/// After `rel` moved out of `dest`: removes the folders it leaves empty
+/// between it and the world's folder, never that folder itself. `remove_dir`
+/// refuses a folder with anything in it, so only an empty folder goes.
+pub(crate) fn prune_emptied(dest: &Path, rel: &str, world: &[String]) {
+    let mut dir = Path::new(rel).parent();
+    while let Some(d) = dir {
+        let d_str = d.to_string_lossy().replace('\\', "/");
+        if !hoard_core::kernel::fileclass::in_mirrored_folder(world, &d_str)
+            || std::fs::remove_dir(dest.join(d)).is_err()
+        {
+            return;
+        }
+        dir = d.parent();
+    }
 }
 
 /// Resolve the snapshot version to use: the explicit one if supplied, else the
@@ -321,7 +628,15 @@ pub async fn resolve_version(
 /// `tar.zst`** per snapshot: the server streams the whole archive and there's
 /// no per-file GET to skip, so knowing a file is already on disk saves
 /// nothing. That path is left exactly as it was.
-pub async fn download_snapshot<F>(
+///
+/// `dest` is not shape-checked here: it is a staging folder Hoard made itself
+/// ([`crate::agent::staging_dir_in`]), under the state folder, which the shape
+/// check refuses by design (the fourth end-to-end run's blocker: every pull
+/// and restore failed on it). The check belongs on the folder the staged
+/// version is merged INTO, and both callers ([`restore_staged_in`] and the
+/// engine's pull) run it on the save's folder before downloading. Never pass
+/// a path that came from state or from the user.
+pub(crate) async fn download_snapshot<F>(
     client: &ApiClient,
     save_id: &str,
     version: i64,
@@ -332,13 +647,6 @@ pub async fn download_snapshot<F>(
 where
     F: Fn(u64, u64) + Send + Sync + 'static,
 {
-    // The same shape rule as adding, and for the same reason: a restore over
-    // `C:\Users\<x>` or over `~` would dump a snapshot on top of the user's
-    // profile. It matters even more here, because this WRITES, and the path can
-    // come from a `state.json` poisoned by an old detection or from another
-    // machine. The folder may not exist yet (a new machine), so only the shape is
-    // checked.
-    crate::library::validate_path_shape(dest)?;
     if client.is_cloud().await {
         return download_snapshot_cloud(client, save_id, version, dest, options, progress).await;
     }
@@ -407,6 +715,7 @@ where
     let mut entries = archive.entries().context("opening tar archive")?;
     let mut files_extracted = 0usize;
     let mut bytes_extracted = 0u64;
+    let mut version_files = Vec::new();
 
     while let Some(entry) = entries.next().await {
         let mut entry = entry.context("reading tar entry")?;
@@ -433,6 +742,7 @@ where
         }
 
         let key = safe_rel.to_string_lossy().replace('\\', "/");
+        version_files.push(key.clone());
         // Config and litter from the machine that uploaded the snapshot are not
         // written over this one's unless the user asked for it.
         if !single_file && !options.gate.allows(&key) {
@@ -516,6 +826,7 @@ where
         // Whole-archive path: nothing to skip per file.
         files_reused: 0,
         bytes_reused: 0,
+        version_files,
     })
 }
 
@@ -823,6 +1134,7 @@ where
         .collect();
     let root = extraction_root(dest, &names);
     let single_file = root != dest;
+    let version_files: Vec<String> = names.iter().map(|n| n.to_string()).collect();
 
     if dest.exists() {
         let empty = !single_file && std::fs::read_dir(dest)?.next().is_none();
@@ -1078,6 +1390,7 @@ where
             transfer_ms,
             total_ms: 0,
         },
+        version_files,
     })
 }
 
@@ -1167,6 +1480,7 @@ where
     let mut entries = archive.entries().context("opening tar archive")?;
     let mut files_extracted = 0usize;
     let mut bytes_extracted = 0u64;
+    let mut version_files = Vec::new();
 
     while let Some(entry) = entries.next().await {
         let mut entry = entry.context("reading tar entry")?;
@@ -1189,11 +1503,9 @@ where
                 .with_context(|| format!("creating parent {}", parent.display()))?;
         }
 
-        if !single_file
-            && !options
-                .gate
-                .allows(&safe_rel.to_string_lossy().replace('\\', "/"))
-        {
+        let key = safe_rel.to_string_lossy().replace('\\', "/");
+        version_files.push(key.clone());
+        if !single_file && !options.gate.allows(&key) {
             tracing::debug!(path = %safe_rel.display(), "restore: skipping device-local file");
             continue;
         }
@@ -1234,6 +1546,7 @@ where
         // The total is stamped by `download_snapshot_cloud`, which started the
         // stopwatch (asking for the manifest included).
         timings: RestoreTimings::default(),
+        version_files,
     })
 }
 
@@ -1394,12 +1707,11 @@ mod tests {
     }
 
     /// The owner shared world One and kept playing a character, not yet in a
-    /// version. Restoring an older version writes the
-    /// character over: its current bytes land in the side-copy folder first,
-    /// and the world's files, which later versions hold, and a file the
-    /// version brings back unchanged, are not copied.
+    /// version. Restoring an older version writes the character over, which
+    /// the preview announces; the world's files, which later versions hold,
+    /// and a file the version brings back unchanged, are not named.
     #[tokio::test]
-    async fn an_owners_restore_keeps_what_it_overwrites_outside_the_share() {
+    async fn an_owners_restore_names_what_it_overwrites_outside_the_share() {
         let tmp = tempfile::tempdir().unwrap();
         let save = tmp.path().join("save");
         std::fs::create_dir_all(save.join("worlds_local")).unwrap();
@@ -1436,23 +1748,585 @@ mod tests {
         let files = crate::preview::overwritten_outside_share(&remote, &save, &gate, &share).await;
         assert_eq!(files, vec!["characters_local/Bob.fch".to_string()]);
 
-        let dir = tmp.path().join("conflicts").join("save-1").join("ts");
-        copy_aside(&save, &files, &dir).await.unwrap();
-        assert_eq!(
-            std::fs::read(dir.join("characters_local/Bob.fch")).unwrap(),
-            b"bob, level 40"
-        );
-        assert!(!dir.join("worlds_local/One.db").exists());
-        assert!(!dir.join("characters_local/Ann.fch").exists());
-        // Copied, not moved.
-        assert!(save.join("characters_local/Bob.fch").exists());
-
         // Nobody but the owner has a list here, so nothing is kept.
         assert!(
             crate::preview::overwritten_outside_share(&remote, &save, &gate, &[])
                 .await
                 .is_empty()
         );
+    }
+
+    /// HRD-Q-0027, the explicit restore: v7 is about to be written into the
+    /// save's own folder over generation 9. What the world's folder holds and
+    /// v7 does not moves into the conflicts tree, bytes intact, and so does a
+    /// flat file of the world v7 does not carry, since v7 holds the folder;
+    /// the flat file v7 carries, the game's backup, the character, another
+    /// world and config the gate would not write stay. Unshared, and into a
+    /// fresh folder, nothing moves.
+    #[tokio::test]
+    async fn a_restore_into_the_saves_folder_moves_the_worlds_newer_generation_aside() {
+        let tmp = tempfile::tempdir().unwrap();
+        let save = tmp.path().join("save");
+        let root = tmp.path().join("conflicts");
+        let put = |rel: &str| {
+            let p = save.join(rel);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(&p, rel).unwrap();
+        };
+        let gen = |n: u32| -> Vec<String> {
+            ["fwl2", "db2", "chunks", "ok"]
+                .iter()
+                .map(|e| format!("worlds_local/Alpha/_main.{n}.{e}"))
+                .collect()
+        };
+        let mut version_files = gen(7);
+        version_files.push("worlds_local/Alpha.fwl".into());
+        version_files.push("characters_local/Me.fch".into());
+        let mut stale = gen(9);
+        stale.push("worlds_local/Alpha/sub/3_3.chunk".into());
+        // v7 holds the world as a folder: a flat file it does not carry is
+        // the converted world's leftover, and goes too.
+        stale.push("worlds_local/Alpha.db.old".into());
+        let stays = [
+            "worlds_local/Alpha.fwl",
+            "worlds_local/Alpha_backup_auto-1.db",
+            "worlds_local/Alpha/graphics.ini",
+            "worlds_local/Beta/_main.2.fwl2",
+            "worlds_local/Alpha2/_main.2.fwl2",
+            "characters_local/Me.fch",
+            "characters_local/Other.fch",
+        ];
+        for rel in version_files.iter().chain(&stale) {
+            put(rel);
+        }
+        for rel in stays {
+            put(rel);
+        }
+        let world = crate::worldfiles::template("valheim", "Alpha")
+            .unwrap()
+            .unwrap();
+
+        // Not shared: nothing moves.
+        assert!(
+            set_aside_stale_world(&save, &version_files, &[], &[], &root, "w1")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(save.join(&stale[0]).exists());
+
+        let moved = set_aside_stale_world(&save, &version_files, &[], &world, &root, "w1")
+            .await
+            .unwrap()
+            .expect("generation 9 moved");
+        assert_eq!(moved.files, stale.len());
+        let mut sorted = stale.clone();
+        sorted.sort();
+        assert_eq!(moved.paths, sorted);
+        assert!(moved.dir.starts_with(root.join("w1")));
+        for rel in &stale {
+            assert!(!save.join(rel).exists(), "{rel}");
+            assert_eq!(std::fs::read(moved.dir.join(rel)).unwrap(), rel.as_bytes());
+        }
+        assert!(!save.join("worlds_local/Alpha/sub").exists());
+        for rel in version_files.iter().map(String::as_str).chain(stays) {
+            assert_eq!(
+                std::fs::read(save.join(rel)).unwrap(),
+                rel.as_bytes(),
+                "{rel}"
+            );
+        }
+
+        // Nothing left to move; a fresh folder has nothing either.
+        assert!(
+            set_aside_stale_world(&save, &version_files, &[], &world, &root, "w1")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(set_aside_stale_world(
+            &tmp.path().join("nowhere"),
+            &version_files,
+            &[],
+            &world,
+            &root,
+            "w1"
+        )
+        .await
+        .unwrap()
+        .is_none());
+    }
+
+    /// A version with a world file and a config file the default gate does
+    /// not write, for the three download paths below.
+    const GATED_VERSION: &[(&str, &[u8])] = &[
+        ("worlds_local/Alpha/_main.2.db2", b"generation two"),
+        ("worlds_local/Alpha.fwl", b"flat"),
+        ("graphics.ini", b"res=4k"),
+    ];
+
+    fn version_names() -> Vec<String> {
+        GATED_VERSION
+            .iter()
+            .map(|(rel, _)| rel.to_string())
+            .collect()
+    }
+
+    fn sorted(mut v: Vec<String>) -> Vec<String> {
+        v.sort();
+        v
+    }
+
+    fn tree(dir: &Path) -> std::collections::BTreeMap<String, Vec<u8>> {
+        crate::backup::walk_source(dir, Default::default())
+            .map(|files| {
+                files
+                    .into_iter()
+                    .map(|f| (f.relative_path, std::fs::read(f.absolute_path).unwrap()))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    fn put(root: &Path, rel: &str, bytes: &[u8]) {
+        let p = root.join(rel);
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(p, bytes).unwrap();
+    }
+
+    /// L-D: the copy fallback of a move (another filesystem) keeps the
+    /// file's mtime, so a file put back is not mistaken for a newer one.
+    #[tokio::test]
+    async fn a_move_by_copy_keeps_the_mtime() {
+        let tmp = tempfile::tempdir().unwrap();
+        let from = tmp.path().join("a/0_0.chunk");
+        let to = tmp.path().join("b/0_0.chunk");
+        put(tmp.path(), "a/0_0.chunk", b"chunk");
+        let old = filetime::FileTime::from_unix_time(1_600_000_000, 0);
+        filetime::set_file_mtime(&from, old).unwrap();
+        std::fs::create_dir_all(to.parent().unwrap()).unwrap();
+        copy_then_remove(&from, &to).await.unwrap();
+        assert!(!from.exists());
+        let meta = std::fs::metadata(&to).unwrap();
+        assert_eq!(filetime::FileTime::from_last_modification_time(&meta), old);
+    }
+
+    /// S6b / M-B: an explicit restore whose download fails half-way through
+    /// the archive leaves the save's folder byte-for-byte as it was: nothing
+    /// moved aside, nothing extracted into it. The same restore with the whole
+    /// archive lands: the world's folder is the version's, the older
+    /// generation and the replaced chunk are in the conflicts folder, and the
+    /// member's own character is untouched.
+    /// An owner's explicit restore that replaces a character outside the
+    /// shared world keeps the character's current bytes once, in the folder
+    /// the restore moves what it replaces to: not also in a second side copy.
+    #[tokio::test]
+    async fn an_owners_restore_keeps_a_replaced_character_once() {
+        let tmp = tempfile::tempdir().unwrap();
+        let save = tmp.path().join("save");
+        let conflicts = tmp.path().join("conflicts");
+        put(&save, "worlds_local/Alpha/0_0.chunk", b"chunk now");
+        put(&save, "characters_local/Me.fch", b"me now");
+        let version: Vec<(&str, &[u8])> = vec![
+            ("worlds_local/Alpha/0_0.chunk", b"chunk at v4"),
+            ("characters_local/Me.fch", b"me at v4"),
+        ];
+        let world = crate::worldfiles::template("valheim", "Alpha")
+            .unwrap()
+            .unwrap();
+        let routes = crate::testserver::selfhosted_version("w1", 4, &version).await;
+        let (url, _) = crate::testserver::serve(move |_| routes).await;
+        let client = ApiClient::new(url, "t").unwrap();
+        let done = restore_staged_in(
+            Some(&tmp.path().join("state")),
+            &client,
+            "w1",
+            4,
+            &save,
+            RestoreOptions {
+                force: true,
+                ..Default::default()
+            },
+            &world,
+            &conflicts,
+            |_| {},
+            |_, _| {},
+        )
+        .await
+        .unwrap();
+        assert_eq!(done.replaced_set_aside, 2);
+        let kept: Vec<String> = tree(&conflicts)
+            .into_keys()
+            .filter(|k| k.ends_with("characters_local/Me.fch"))
+            .collect();
+        assert_eq!(kept.len(), 1, "{kept:?}");
+        let moved = tree(done.moved_to.as_deref().unwrap());
+        assert_eq!(moved.get("characters_local/Me.fch").unwrap(), b"me now");
+        assert_eq!(
+            tree(&save).get("characters_local/Me.fch").unwrap(),
+            b"me at v4"
+        );
+    }
+
+    /// The blocker of the fourth end-to-end run: an explicit restore stages
+    /// under the state folder's `staging`, which the shape check refuses, so
+    /// the check runs on the save's folder and never on staging. Staged there
+    /// for real (seen mid-download), cleaned after, and a save's folder inside
+    /// the state folder is still refused.
+    #[tokio::test]
+    async fn an_explicit_restore_stages_under_the_state_folder() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = tmp.path().join("state");
+        let save = tmp.path().join("save");
+        let conflicts = state.join("conflicts");
+        put(&save, "worlds_local/Alpha/0_0.chunk", b"chunk now");
+        let version: Vec<(&str, &[u8])> = vec![("worlds_local/Alpha/0_0.chunk", b"chunk at v4")];
+        let world = crate::worldfiles::template("valheim", "Alpha")
+            .unwrap()
+            .unwrap();
+        let routes = crate::testserver::selfhosted_version("w1", 4, &version).await;
+        let (url, _) = crate::testserver::serve(move |_| routes).await;
+        let client = ApiClient::new(url, "t").unwrap();
+        let staging_root = crate::agent::staging_root_in(Some(&state));
+        let seen = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let seen_in = seen.clone();
+        let root_in = staging_root.clone();
+        let done = restore_staged_in(
+            Some(&state),
+            &client,
+            "w1",
+            4,
+            &save,
+            RestoreOptions {
+                force: true,
+                ..Default::default()
+            },
+            &world,
+            &conflicts,
+            |_| {},
+            move |_, _| {
+                let staged = std::fs::read_dir(&root_in)
+                    .map(|mut d| d.next().is_some())
+                    .unwrap_or(false);
+                if staged {
+                    seen_in.store(true, std::sync::atomic::Ordering::Relaxed);
+                }
+            },
+        )
+        .await
+        .unwrap();
+        assert!(seen.load(std::sync::atomic::Ordering::Relaxed));
+        assert_eq!(done.replaced_set_aside, 1);
+        assert_eq!(
+            tree(&save).get("worlds_local/Alpha/0_0.chunk").unwrap(),
+            b"chunk at v4"
+        );
+        assert!(std::fs::read_dir(&staging_root).unwrap().next().is_none());
+
+        let inside = state.join("save");
+        let err = restore_staged_in(
+            Some(&state),
+            &client,
+            "w1",
+            4,
+            &inside,
+            RestoreOptions::default(),
+            &world,
+            &conflicts,
+            |_| {},
+            |_, _| {},
+        )
+        .await
+        .expect_err("the state folder is Hoard's own");
+        assert!(
+            format!("{err:#}").contains("Hoard's own data folder"),
+            "{err:#}"
+        );
+        assert!(!inside.exists());
+    }
+
+    #[tokio::test]
+    async fn a_restore_whose_download_fails_leaves_the_folder_untouched() {
+        let tmp = tempfile::tempdir().unwrap();
+        let save = tmp.path().join("save");
+        let conflicts = tmp.path().join("conflicts");
+        put(&save, "worlds_local/Alpha/_main.8.db2", b"gen 8 db");
+        put(&save, "worlds_local/Alpha/_main.8.fwl2", b"gen 8 fwl");
+        put(&save, "worlds_local/Alpha/0_0.chunk", b"gen 8 chunk");
+        put(&save, "worlds_local/Alpha/1_0.chunk", b"same chunk");
+        put(&save, "characters_local/Me.fch", b"me");
+        let before = tree(&save);
+        let big: Vec<u8> = (0..200_000u32).flat_map(|i| i.to_le_bytes()).collect();
+        let version: Vec<(&str, &[u8])> = vec![
+            ("worlds_local/Alpha/0_0.chunk", b"gen 5 chunk"),
+            ("worlds_local/Alpha/1_0.chunk", b"same chunk"),
+            ("worlds_local/Alpha/_main.5.db2", &big),
+            ("worlds_local/Alpha/_main.5.fwl2", b"gen 5 fwl"),
+        ];
+        let world = crate::worldfiles::template("valheim", "Alpha")
+            .unwrap()
+            .unwrap();
+        let restore = |url: String| {
+            let state = tmp.path().join("state");
+            let save = save.clone();
+            let conflicts = conflicts.clone();
+            let world = world.clone();
+            async move {
+                let client = ApiClient::new(url, "t").unwrap();
+                restore_staged_in(
+                    Some(&state),
+                    &client,
+                    "w1",
+                    4,
+                    &save,
+                    RestoreOptions {
+                        force: true,
+                        ..Default::default()
+                    },
+                    &world,
+                    &conflicts,
+                    |_| {},
+                    |_, _| {},
+                )
+                .await
+            }
+        };
+
+        let mut routes = crate::testserver::selfhosted_version("w1", 4, &version).await;
+        let archive = &mut routes.last_mut().unwrap().2;
+        archive.truncate(archive.len() / 2);
+        let (url, _) = crate::testserver::serve(move |_| routes).await;
+        let err = restore(url).await.expect_err("the archive is cut");
+        assert!(format!("{err:#}").contains("nothing in"), "{err:#}");
+        assert_eq!(tree(&save), before);
+        assert!(tree(&conflicts).is_empty());
+
+        let routes = crate::testserver::selfhosted_version("w1", 4, &version).await;
+        let (url, _) = crate::testserver::serve(move |_| routes).await;
+        let done = restore(url).await.unwrap();
+        let after = tree(&save);
+        for (rel, bytes) in &version {
+            assert_eq!(after.get(*rel).map(Vec::as_slice), Some(*bytes), "{rel}");
+        }
+        assert_eq!(after.get("characters_local/Me.fch").unwrap(), b"me");
+        assert_eq!(after.len(), version.len() + 1, "{:?}", after.keys());
+        assert_eq!(done.world_files_set_aside, 2);
+        assert_eq!(done.replaced_set_aside, 1);
+        let moved = tree(done.moved_to.as_deref().unwrap());
+        assert_eq!(
+            moved.keys().cloned().collect::<Vec<_>>(),
+            [
+                "worlds_local/Alpha/0_0.chunk",
+                "worlds_local/Alpha/_main.8.db2",
+                "worlds_local/Alpha/_main.8.fwl2",
+            ]
+        );
+        assert_eq!(moved["worlds_local/Alpha/0_0.chunk"], b"gen 8 chunk");
+    }
+
+    /// The self-hosted tar path fills `version_files` with every entry of
+    /// the archive, the one the gate refuses included, and writes only what
+    /// the gate lets through.
+    #[tokio::test]
+    async fn the_tar_download_lists_every_file_of_the_version() {
+        let routes = crate::testserver::selfhosted_version("w1", 4, GATED_VERSION).await;
+        let (url, _) = crate::testserver::serve(move |_| routes).await;
+        let client = ApiClient::new(url, "t").unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let dest = tmp.path().join("save");
+
+        let outcome = download_snapshot(
+            &client,
+            "w1",
+            4,
+            &dest,
+            RestoreOptions::default(),
+            |_, _| {},
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(sorted(outcome.version_files), sorted(version_names()));
+        assert_eq!(outcome.files_extracted, 2);
+        assert!(!dest.join("graphics.ini").exists(), "the gate refused it");
+    }
+
+    /// Cloud's content-addressed path: the list is the manifest's, gate or
+    /// no gate.
+    #[tokio::test]
+    async fn the_cas_download_lists_every_file_of_the_version() {
+        use crate::testserver::{ok, sha_hex};
+        let (url, _) = crate::testserver::serve(|url| {
+            let files: Vec<serde_json::Value> = GATED_VERSION
+                .iter()
+                .map(|(rel, bytes)| {
+                    serde_json::json!({
+                        "relative_path": rel,
+                        "sha256": sha_hex(bytes),
+                        "size_bytes": bytes.len(),
+                        "download": {"method": "GET", "url": format!("{url}/blob/{}", sha_hex(bytes))},
+                    })
+                })
+                .collect();
+            let mut routes = vec![
+                ok("GET /v1/health", r#"{"status":"ok","version":"test","mode":"cloud"}"#),
+                ok(
+                    "GET /v1/cloud/saves/w1/versions/4/manifest",
+                    serde_json::json!({"content_addressed": true, "files": files}).to_string(),
+                ),
+            ];
+            for (_, bytes) in GATED_VERSION {
+                routes.push(ok(format!("GET /blob/{}", sha_hex(bytes)), bytes.to_vec()));
+            }
+            routes
+        })
+        .await;
+        let client = ApiClient::new(url, "t").unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let dest = tmp.path().join("save");
+
+        let outcome = download_snapshot(
+            &client,
+            "w1",
+            4,
+            &dest,
+            RestoreOptions::default(),
+            |_, _| {},
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(sorted(outcome.version_files), sorted(version_names()));
+        assert_eq!(outcome.files_extracted, 2);
+        assert!(!dest.join("graphics.ini").exists());
+    }
+
+    /// Cloud's legacy whole-archive path lists the archive's entries.
+    #[tokio::test]
+    async fn the_legacy_cloud_archive_lists_every_file_of_the_version() {
+        use crate::testserver::{ok, sha_hex};
+        let archive = crate::testserver::tar_zst(GATED_VERSION).await;
+        let (url, _) = crate::testserver::serve(move |url| {
+            vec![
+                ok(
+                    "GET /v1/health",
+                    r#"{"status":"ok","version":"test","mode":"cloud"}"#,
+                ),
+                ok(
+                    "GET /v1/cloud/saves/w1/versions/4/manifest",
+                    r#"{"content_addressed":false}"#,
+                ),
+                ok(
+                    "GET /v1/cloud/saves/w1/versions/4/download",
+                    serde_json::json!({
+                        "save_id": "w1",
+                        "version_num": 4,
+                        "sha256": sha_hex(&archive),
+                        "size_bytes": archive.len(),
+                        "download": {"method": "GET", "url": format!("{url}/archive")},
+                    })
+                    .to_string(),
+                ),
+                ok("GET /archive", archive),
+            ]
+        })
+        .await;
+        let client = ApiClient::new(url, "t").unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let dest = tmp.path().join("save");
+
+        let outcome = download_snapshot(
+            &client,
+            "w1",
+            4,
+            &dest,
+            RestoreOptions::default(),
+            |_, _| {},
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(sorted(outcome.version_files), sorted(version_names()));
+        assert_eq!(outcome.files_extracted, 2);
+        assert!(!dest.join("graphics.ini").exists());
+    }
+
+    /// The explicit restore: the files a version lacks move before it is
+    /// written, and a move that fails puts back the ones already moved and
+    /// returns the error, the folder as it was.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_explicit_restore_whose_move_fails_leaves_the_folder_as_it_was() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let save = tmp.path().join("save");
+        let root = tmp.path().join("conflicts");
+        for rel in [
+            "worlds_local/Alpha/_main.9.db2",
+            "worlds_local/Alpha/_main.9.fwl2",
+            "worlds_local/Alpha/zz/9_9.chunk",
+        ] {
+            let p = save.join(rel);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(&p, rel).unwrap();
+        }
+        let before: Vec<String> = crate::backup::walk_source(&save, Default::default())
+            .unwrap()
+            .into_iter()
+            .map(|f| f.relative_path)
+            .collect();
+        let world = crate::worldfiles::template("valheim", "Alpha")
+            .unwrap()
+            .unwrap();
+        // The save's folder in the conflicts tree, read-only: the timestamped
+        // folder each call makes below it cannot be made, so the first move
+        // fails. (A move failing half way is `agent`'s
+        // `a_move_that_fails_leaves_the_folder_as_it_was`, the same
+        // `move_all_aside`.)
+        std::fs::create_dir_all(root.join("w1")).unwrap();
+        std::fs::set_permissions(root.join("w1"), std::fs::Permissions::from_mode(0o555)).unwrap();
+
+        let result = set_aside_stale_world(
+            &save,
+            &["worlds_local/Alpha/_main.7.db2".to_string()],
+            &[],
+            &world,
+            &root,
+            "w1",
+        )
+        .await;
+        std::fs::set_permissions(root.join("w1"), std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        assert!(result.is_err());
+        let after: Vec<String> = crate::backup::walk_source(&save, Default::default())
+            .unwrap()
+            .into_iter()
+            .map(|f| f.relative_path)
+            .collect();
+        assert_eq!(after, before);
+
+        // And `put_back` undoes a move that succeeded, for a download that
+        // then failed.
+        let moved = set_aside_stale_world(
+            &save,
+            &["worlds_local/Alpha/_main.7.db2".to_string()],
+            &[],
+            &world,
+            &root,
+            "w1",
+        )
+        .await
+        .unwrap()
+        .expect("generation 9 moved");
+        assert_eq!(moved.files, 3);
+        assert!(!save.join("worlds_local/Alpha/_main.9.db2").exists());
+        put_back(&save, &moved).await;
+        let back: Vec<String> = crate::backup::walk_source(&save, Default::default())
+            .unwrap()
+            .into_iter()
+            .map(|f| f.relative_path)
+            .collect();
+        assert_eq!(back, before);
     }
 
     #[test]

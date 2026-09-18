@@ -753,6 +753,12 @@ pub fn watched_saves_from_state(
 /// profile, a system root, or Hoard's own state directory, whose backup would copy
 /// itself in a loop.
 pub fn validate_path_shape(local_path: &Path) -> Result<()> {
+    validate_path_shape_in(local_path, CliConfig::state_dir().ok().as_deref())
+}
+
+/// [`validate_path_shape`] against the state folder `state_dir` (none: no
+/// state-folder rule), for a caller that resolved it already.
+pub(crate) fn validate_path_shape_in(local_path: &Path, state_dir: Option<&Path>) -> Result<()> {
     if local_path.as_os_str().is_empty() {
         anyhow::bail!("Save folder path can't be empty.");
     }
@@ -762,8 +768,8 @@ pub fn validate_path_shape(local_path: &Path) -> Result<()> {
             local_path.display()
         );
     }
-    if let Ok(state_dir) = CliConfig::state_dir() {
-        if local_path.starts_with(&state_dir) || state_dir.starts_with(local_path) {
+    if let Some(state_dir) = state_dir {
+        if local_path.starts_with(state_dir) || state_dir.starts_with(local_path) {
             anyhow::bail!(
                 "Refusing to use {}: that's Hoard's own data folder.",
                 local_path.display()
@@ -4337,6 +4343,7 @@ mod sharing_tests {
         assert_eq!(
             include_for_share("valheim", Some("Alpha"), None).unwrap(),
             vec![
+                "worlds_local/Alpha",
                 "worlds_local/Alpha.db",
                 "worlds_local/Alpha.fwl",
                 "worlds_local/Alpha.db.old",

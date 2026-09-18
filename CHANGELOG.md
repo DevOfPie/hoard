@@ -45,6 +45,96 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   rows say who hosts each world, their menu releases it or takes over a lease
   nobody has pushed under, and a session that could not push ends in a side
   copy with a notice that opens it.
+- **Sharing a Valheim world understands Valheim 1.0.** The world picker lists
+  worlds kept in 1.0's folder layout (`worlds_local/<name>/`) beside the flat
+  ones, and a shared world names its folder too, so every file 1.0 writes in
+  it travels and a world shared before 1.0 converted it stays covered after.
+- **A pull or a restore leaves a Valheim 1.0 world exactly as the version has
+  it.** 1.0 names its world files anew on every save and loads the newest, so
+  the older files a pull left beside the new ones made restoring an older
+  version do nothing and kept the owner asking for the lease after a pull.
+  Files in the shared world's folder that the version does not have now move
+  into the conflicts folder, where they are kept for the retention period
+  (`conflict_retention_days`, 14 days by default); a file there that the
+  version also has takes the version's copy even when the local one is newer,
+  the local one going to the conflicts folder, so a pull never mixes two
+  generations. Once the version holds the world as a folder, the world's flat
+  `.db`, `.fwl` and `.old` files it lacks move aside too, so a converted world's
+  leftovers stop travelling back. Everything moves before anything is written,
+  and a move that fails writes nothing and puts back what moved. A pull whose
+  game started during the download waits for it to close. Everything else in
+  the folder is left alone. The restore dialog, its success notice,
+  `hoard restore --dry-run` and the pull's notice say how many files moved.
+- **A shared world is never pushed partial.** A world file that cannot be read,
+  or that the plan's per-save cap would drop, holds the push, with a warning
+  on the card and in the activity feed naming the file and saying which of the
+  two it is, instead of publishing a version that would move that file out of
+  every other member's folder. The push retries after 1, 5, 15 and 30 minutes
+  and then stops until the save's files change or *Back up now* is pressed; a
+  change to the files retries at once, and does not count toward the stop.
+  The lease is kept while it retries, so a file locked for a few seconds does
+  not hand the world to somebody hosting from the older version; once it
+  stops, with the game closed, the lease is given back so another member can
+  host. Once the shared version moves past a held push, the held changes go
+  to the conflicts folder and the new version comes down, whoever holds the
+  lease; a move to the conflicts folder that fails is tried again at the next
+  retry, or after the next change once the push has stopped; putting back
+  what the failed move had moved is not such a change. An owner whose world is unchanged is not held for a world file that
+  cannot be read: the characters go up and the version keeps the synced copy
+  of that file (self-hosted 1.1.3 or later). A world file written while such
+  a push reads the folder makes it read the folder again, so a world that
+  changed meanwhile is held rather than sent half old, half new. A file deleted while the push
+  reads the folder makes it read the folder again rather than fail, up to
+  twenty times within three minutes, without reading unchanged files twice. A restore
+  whose safety copy is held this way offers to go ahead without it, and
+  replaces the unreadable file too.
+- **A restore downloads before it touches the folder.** `hoard restore` and
+  the desktop's restore download the version into a staging folder first, so
+  a download that fails or is cut off leaves the save's folder as it was. The
+  staging folder, the pull's included, sits beside the conflicts folder in
+  Hoard's data folder rather than the system's temporary folder, which can be
+  RAM-backed; a self-hosted server sends the whole version even when most of
+  its files already match. Every file the restore replaces is moved into the
+  conflicts folder first, once, and the folder is printed and shown in the
+  notice.
+
+### Fixed
+- **A member adopting a world beside their own characters gets the world.** A
+  folder holding only the member's characters was taken for unsent changes:
+  the first pull waited on them, the lease was asked for to push nothing, and
+  the world never came down. Such a folder now has nothing to push, the first
+  pull runs, and no lease is asked for. A write outside the files a save
+  pushes no longer marks it as having changes.
+- **A restart after a pull no longer pushes the pulled version back.** The
+  folder's signature after a pull is now kept with the version, so the service
+  starting again does not take the pull's own writes for changes, take the
+  lease and push.
+- **Releasing a world claimed with the game closed lets go of it.** The claim
+  was kept for the next launch, and every later push with no game running
+  held on to the lease.
+- **A pull or merge that fails half-way puts the folder back.** A write that
+  failed after the old files moved aside left some files in neither place;
+  the whole merge is now undone. A pull deferred by a game starting is no
+  longer counted as landed, and a write to the folder during a pull's
+  download defers it too, which catches a game the process check misses, and
+  the process list is read afresh right before the merge rather than taken
+  from the last idle check, up to 8 seconds old. Files moved across drives
+  keep their modification time. Staged `.hoard-restore.tmp` files and staging
+  folders an interrupted merge or a killed restore left behind are removed
+  when the save is next watched, before the next merge, and when the sync
+  service starts, and are never taken for save data or for a write to the
+  folder, so creating or removing one neither defers a pull nor asks for the
+  lease. Both carry the id of
+  the process that made them, so a merge still running in another process
+  (a restore from the command line during a pull) keeps its own.
+- **An owner's restore keeps each replaced file once.** A file outside the
+  shared world that the restore replaced was copied to one conflicts folder
+  and moved to another; it is now only moved, with the rest of what the
+  restore replaces. `hoard restore --json` no longer prints `set_aside`: those
+  files are counted in `replaced_set_aside`.
+- **An owner's pull that kept the owner's other changes survives a restart.**
+  The world's signature was dropped when the rest of the folder differed from
+  the version, so a restart read the pulled world as the owner's change.
 
 ## [1.1.7] - 2026-09-13
 

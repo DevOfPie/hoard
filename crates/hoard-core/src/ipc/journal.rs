@@ -215,6 +215,8 @@ impl Journal {
 ///   for as long as the cause lasts, and a stalled on-demand file provider can
 ///   last weeks. One warning, not one per copy. It collapses on content, so a
 ///   different file or a different error opens a row.
+/// - `BackupWorldHeld`, per save, file, error and whether it parked: the held
+///   push repeats on its backoff with the same answer.
 /// - `HeavyProcessDetected`. Seeing the same heavy process again is not a new
 ///   discovery.
 /// - `WorldHostedElsewhere`, once per hold, and a restarted engine can hold
@@ -244,6 +246,20 @@ pub fn collapse_key(event: &AgentEvent) -> Option<String> {
     } = event
     {
         return Some(format!("quota_full:{plan}:{used_bytes}:{limit_bytes}"));
+    }
+    // A held world push is sent on every attempt; the attempt count is not a
+    // new fact, so it stays out of the key. Parking is one.
+    if let AgentEvent::BackupWorldHeld {
+        save_id,
+        sample_path,
+        sample_error,
+        parked,
+        ..
+    } = event
+    {
+        return Some(format!(
+            "world_held:{save_id}:{sample_path}:{sample_error}:{parked}"
+        ));
     }
     if let AgentEvent::WorldClaimWanted { game_slug, .. } = event {
         return Some(format!("world_claim_wanted:{game_slug}"));

@@ -119,7 +119,11 @@ pub async fn list_save_snapshots(
 fn restore_gate(
     save_id: &str,
     allow_config: bool,
-) -> (hoard_core::kernel::fileclass::RestoreGate, Vec<String>) {
+) -> (
+    hoard_core::kernel::fileclass::RestoreGate,
+    Vec<String>,
+    Vec<String>,
+) {
     CliState::load_default()
         .ok()
         .and_then(|(st, _)| {
@@ -131,6 +135,9 @@ fn restore_gate(
                         allow_config,
                     ),
                     hoard_agent::savefilter::owner_share_include(s.shared.as_ref()).to_vec(),
+                    s.shared
+                        .as_ref()
+                        .map_or_else(Vec::new, |shared| shared.world().to_vec()),
                 )
             })
         })
@@ -141,6 +148,7 @@ fn restore_gate(
                     allow_device_local: allow_config,
                     ..Default::default()
                 },
+                Vec::new(),
                 Vec::new(),
             )
         })
@@ -170,10 +178,14 @@ pub async fn preview_restore(
                 .ok_or_else(|| "NEEDS_DESTINATION".to_string())?
         }
     };
-    let (gate, outside) = restore_gate(&save_id, allow_config);
-    hoard_agent::preview::restore_preview(&client, &save_id, version, &dest, &gate, &outside)
-        .await
-        .map_err(pretty_error)
+    // The restore writes into the folder it previews, the save's own (a
+    // picked folder becomes it), so the world's set-aside is announced.
+    let (gate, outside, world) = restore_gate(&save_id, allow_config);
+    hoard_agent::preview::restore_preview(
+        &client, &save_id, version, &dest, &gate, &outside, &world,
+    )
+    .await
+    .map_err(pretty_error)
 }
 
 /// Detail view: snapshot metadata + per-file list, used by the expandable
@@ -362,6 +374,15 @@ pub struct RestoreOutcome {
     pub bytes_extracted: u64,
     pub destination: String,
     pub safety_version: Option<i64>,
+    /// Files of the shared world the version does not have, moved into the
+    /// conflicts folder (kept there for the retention period) so the world's
+    /// folder ends as the version's.
+    pub world_files_set_aside: usize,
+    /// Local files the version replaced, moved into the same folder before
+    /// it was written.
+    pub files_replaced_set_aside: usize,
+    /// Where the files moved out went, when any did.
+    pub set_aside_dir: Option<String>,
 }
 
 /// Restore an old snapshot into the local save folder.
@@ -462,11 +483,16 @@ pub async fn restore_snapshot(
                 &save_id,
                 &game_slug,
                 &include,
+                // A shared world's safety copy is a version like any other,
+                // and is held rather than published without one of its files.
+                shared.as_ref().map_or(&[][..], |s| s.world()),
                 &label,
                 &local_path,
                 // Pre-restore safety backup is an explicit user action; don't
                 // gate it on fast-forward.
                 None,
+                None,
+                // Not a push of the synced world: nothing is carried.
                 None,
                 // No re-upload check either (ADR 0021 D.8.3): this safety copy has
                 // to exist as a version of its own before the folder is overwritten,
@@ -490,7 +516,7 @@ pub async fn restore_snapshot(
                 },
             )
             .await
-            .map_err(pretty_error)?;
+            .map_err(safety_copy_error)?;
             safety_version = Some(outcome.snapshot.version_num);
         }
     }
@@ -505,34 +531,25 @@ pub async fn restore_snapshot(
     );
 
     // 1b) The owner's restore writes the whole folder, and a file outside the
-    //     share it overwrites may hold bytes no version has yet. Those files
-    //     are copied into the side-copy tree first, and a copy that fails stops
-    //     the restore before it writes.
-    let outside = hoard_agent::savefilter::owner_share_include(shared.as_ref());
-    if !outside.is_empty() {
-        let root = CliConfig::state_dir()
-            .map_err(|e| e.to_string())?
-            .join("conflicts");
-        restore::keep_outside_share(
-            &client,
-            &save_id,
-            version,
-            &local_path,
-            &gate,
-            outside,
-            &root,
-        )
-        .await
-        .map_err(pretty_error)?;
-    }
+    //     share it overwrites may hold bytes no version has yet. It is not
+    //     copied aside here: the staged restore below moves every local copy
+    //     it replaces into the conflicts tree first, those included, and a
+    //     copy made here as well put the same file in two folders.
 
-    // 2) Download + verify + extract. We pass `force = true` because the
-    //    user has explicitly confirmed they want to overwrite; refusing on
-    //    "destination not empty" here would defeat the whole point.
+    // 2) Download + verify into a staging folder, then apply locally, all or
+    //    nothing: the version wins every file it carries, and a different
+    //    local copy is moved into the conflicts tree first, as are the shared
+    //    world's files the version does not have (HRD-Q-0027), kept there for
+    //    the retention period. The save's folder is not touched until the
+    //    download succeeded, so one that fails or is killed leaves it as it
+    //    was (M-B). `force` because the user confirmed the overwrite.
+    let conflicts = CliConfig::state_dir()
+        .map_err(|e| e.to_string())?
+        .join("conflicts");
     let app_for_dl = app.clone();
     let save_id_for_dl = save_id.clone();
     emit_phase(&app, &save_id, version, RestorePhase::Downloading, 0, 0);
-    let outcome = restore::download_snapshot(
+    let staged = restore::restore_staged(
         &client,
         &save_id,
         version,
@@ -540,11 +557,18 @@ pub async fn restore_snapshot(
         RestoreOptions {
             skip_verify: false,
             force: true,
-            // Files land straight into the save folder here, so the folder we
-            // dedup against is the destination itself: anything already there
-            // with the right bytes is copied (or left) instead of re-downloaded.
-            reuse_from: Some(local_path.clone()),
+            reuse_from: None,
             gate,
+        },
+        shared.as_ref().map_or(&[][..], |s| s.world()),
+        &conflicts,
+        |dir| {
+            tracing::info!(
+                save_id = %save_id,
+                version,
+                dir = %dir.display(),
+                "restore: downloaded; what it replaces or moves out goes here"
+            );
         },
         move |downloaded, total| {
             let _ = app_for_dl.emit(
@@ -561,6 +585,7 @@ pub async fn restore_snapshot(
     )
     .await
     .map_err(pretty_error)?;
+    let outcome = &staged.outcome;
 
     emit_phase(&app, &save_id, version, RestorePhase::Done, 0, 0);
 
@@ -583,7 +608,39 @@ pub async fn restore_snapshot(
         bytes_extracted: outcome.bytes_extracted,
         destination: outcome.destination.to_string_lossy().into_owned(),
         safety_version,
+        world_files_set_aside: staged.world_files_set_aside,
+        files_replaced_set_aside: staged.replaced_set_aside,
+        set_aside_dir: staged
+            .moved_to
+            .as_ref()
+            .map(|d| d.to_string_lossy().into_owned()),
     })
+}
+
+/// Sentinel prefix of the error a restore returns when its safety copy is
+/// held because a file of the shared world can't be read
+/// ([`backup::PartialWorld`]): `SAFETY_COPY_HELD\n<path>\n<reason>\n<cause>`,
+/// the cause `cap` when the plan's per-save cap left the file out and
+/// `unreadable` otherwise, so the text says which (M-3). The UI
+/// offers the restore again without the safety copy (`backup_first: false`),
+/// which is the user's call: a copy without that file is never made (M-D).
+pub const SAFETY_COPY_HELD: &str = "SAFETY_COPY_HELD";
+
+/// The safety copy's error for the UI: the sentinel for a held world, the
+/// usual text for anything else.
+fn safety_copy_error(e: anyhow::Error) -> String {
+    match e
+        .chain()
+        .find_map(|c| c.downcast_ref::<backup::PartialWorld>())
+    {
+        Some(p) => format!(
+            "{SAFETY_COPY_HELD}\n{}\n{}\n{}",
+            p.first,
+            p.reason,
+            if p.over_cap { "cap" } else { "unreadable" }
+        ),
+        None => pretty_error(e),
+    }
 }
 
 fn emit_phase(
@@ -768,4 +825,40 @@ fn parse_log_line(raw: &str) -> LogLine {
 pub fn logs_path() -> Result<String, String> {
     let dir = CliConfig::logs_dir().map_err(|e| e.to_string())?;
     Ok(dir.join("agent.log").to_string_lossy().into_owned())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// M-D: a safety copy held because a world file can't be read comes back
+    /// as the sentinel with the file and why, which the UI turns into "restore
+    /// without the safety copy?", not as "holding the push: ...".
+    #[test]
+    fn a_held_safety_copy_is_its_own_error() {
+        let held = anyhow::Error::new(backup::PartialWorld {
+            count: 1,
+            first: "worlds_local/Alpha/0_0.chunk".into(),
+            reason: "Permission denied".into(),
+            over_cap: false,
+        })
+        .context("uploading the safety copy");
+        assert_eq!(
+            safety_copy_error(held),
+            "SAFETY_COPY_HELD\nworlds_local/Alpha/0_0.chunk\nPermission denied\nunreadable"
+        );
+        // M-3: the plan's cap is its own cause, and the text follows it.
+        let capped = anyhow::Error::new(backup::PartialWorld {
+            count: 1,
+            first: "worlds_local/Alpha/0_0.chunk".into(),
+            reason: "over the free plan's per-save cap".into(),
+            over_cap: true,
+        });
+        assert_eq!(
+            safety_copy_error(capped),
+            "SAFETY_COPY_HELD\nworlds_local/Alpha/0_0.chunk\nover the free plan's per-save cap\ncap"
+        );
+        let other = safety_copy_error(anyhow::anyhow!("network down"));
+        assert!(!other.starts_with(SAFETY_COPY_HELD), "{other}");
+    }
 }

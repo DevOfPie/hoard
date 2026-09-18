@@ -62,6 +62,9 @@ pub use credentials::{Credentials, TokenStorage, UserSection};
 pub use state::{CliState, SaveState};
 
 #[cfg(test)]
+pub(crate) mod testserver;
+
+#[cfg(test)]
 pub(crate) mod test_lock {
     //! Single process-wide mutex guarding tests that mutate environment
     //! variables (`HOME`, `XDG_*`). Cargo runs tests in parallel by default,

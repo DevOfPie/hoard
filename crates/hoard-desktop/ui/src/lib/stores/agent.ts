@@ -145,6 +145,23 @@ export type UnreadableFiles = {
 export const filesUnreadable: Writable<Record<string, UnreadableFiles>> =
   writable({});
 
+/** A shared world whose push is held for a file that can't be read. */
+export type HeldWorld = {
+  /** The first file that can't go up, and why: the notice and its tooltip. */
+  path: string;
+  error: string;
+  count: number;
+  /** Retrying on a clock has stopped. */
+  parked: boolean;
+  /** Left out by the plan's per-save cap, not unreadable: the text says so. */
+  overCap: boolean;
+};
+
+/** Shared worlds whose push is held, by `save_id`. Sticky like
+ * `filesUnreadable`: it lasts as long as the file stays unreadable. A push
+ * that goes up (`backup_success`) or `backup_attention_cleared` clears it. */
+export const worldHeld: Writable<Record<string, HeldWorld>> = writable({});
+
 /** A save whose upload gave up against a conflict it cannot resolve. */
 export type BlockedBackup = {
   /** Consecutive conflicts on giving up, so the notice reads as a pattern. */
@@ -298,6 +315,11 @@ function applyEvent(ev: AgentEvent, at: number = Date.now()) {
         const { [ev.save_id]: _gone, ...rest } = m;
         return rest;
       });
+      worldHeld.update((m) => {
+        if (!(ev.save_id in m)) return m;
+        const { [ev.save_id]: _gone, ...rest } = m;
+        return rest;
+      });
       patch(ev.save_id, {
         state: "ok",
         last_version: ev.version_num,
@@ -356,6 +378,41 @@ function applyEvent(ev: AgentEvent, at: number = Date.now()) {
           error: ev.sample_error,
           will_retry: true,
         });
+      }
+      break;
+    }
+    case "backup_world_held": {
+      const wasParked = get(worldHeld)[ev.save_id]?.parked ?? false;
+      worldHeld.update((m) => ({
+        ...m,
+        [ev.save_id]: {
+          path: ev.sample_path,
+          error: ev.sample_error,
+          count: ev.count,
+          parked: ev.parked,
+          overCap: ev.over_cap ?? false,
+        },
+      }));
+      patch(ev.save_id, {
+        state: "failed",
+        error: ev.sample_error,
+        will_retry: !ev.parked,
+      });
+      // Once per park, like the conflict: no retry is coming on its own.
+      const $prefs = get(prefs);
+      if (ev.parked && !wasParked && !replaying && $prefs?.notify_on_failure) {
+        const t = get(i18n);
+        notify(
+          t("library.world_parked_notify_title"),
+          t(
+            ev.over_cap
+              ? "library.world_parked_notify_cap_body"
+              : "library.world_parked_notify_body",
+            {
+              values: { name: ev.label || ev.game_slug, path: ev.sample_path },
+            },
+          ),
+        );
       }
       break;
     }
@@ -443,6 +500,11 @@ function applyEvent(ev: AgentEvent, at: number = Date.now()) {
     }
     case "backup_attention_cleared": {
       backupBlocked.update((m) => {
+        if (!(ev.save_id in m)) return m;
+        const { [ev.save_id]: _gone, ...rest } = m;
+        return rest;
+      });
+      worldHeld.update((m) => {
         if (!(ev.save_id in m)) return m;
         const { [ev.save_id]: _gone, ...rest } = m;
         return rest;

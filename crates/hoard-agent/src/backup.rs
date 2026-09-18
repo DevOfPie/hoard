@@ -14,7 +14,7 @@ use futures::stream::{self, StreamExt, TryStreamExt};
 use futures::FutureExt;
 use reqwest::multipart;
 use sha2::{Digest, Sha256};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -189,6 +189,101 @@ where
     }
 }
 
+/// A file the walk listed was gone when the upload came to read it: it left
+/// the folder after the walk (a game rotating its save generations). Not a
+/// failure of the push: [`upload_directory`] walks again.
+#[derive(Debug, thiserror::Error)]
+#[error("{path} left the folder after the walk")]
+pub struct VanishedAfterWalk {
+    /// Relative to the save.
+    pub path: String,
+}
+
+/// A file of the world moved (size or mtime) between the walk and the end of
+/// hashing, in an attempt that carries entries for unreadable world files: the
+/// carry was decided on a world that is no longer the one hashed. Not a
+/// failure of the push: [`upload_directory`] walks again, and the re-walk
+/// decides the carry afresh (M-B).
+#[derive(Debug, thiserror::Error)]
+#[error("{path} changed while the upload hashed the world")]
+pub struct WorldMovedAfterWalk {
+    /// Relative to the save.
+    pub path: String,
+}
+
+/// A test's hook into [`upload_directory_attempt`].
+#[cfg(test)]
+pub(crate) type UploadHook = Box<dyn Fn(&str)>;
+
+#[cfg(test)]
+thread_local! {
+    /// Called by an upload attempt with where it is (`walk`, before the walk;
+    /// `probed`, after the probe; `hashed`, after a CAS upload hashed its
+    /// files), on this thread: a test changes the folder between them.
+    pub(crate) static UPLOAD_HOOK: std::cell::RefCell<Option<UploadHook>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn upload_hook(phase: &str) {
+    UPLOAD_HOOK.with(|h| {
+        if let Some(f) = h.borrow().as_ref() {
+            f(phase)
+        }
+    });
+}
+
+/// Is `e` a [`VanishedAfterWalk`] or a [`WorldMovedAfterWalk`], either of
+/// which walks the folder again?
+fn vanished_after_walk(e: &anyhow::Error) -> bool {
+    // `downcast_ref`, not `chain()`: it is attached as context, and anyhow
+    // finds a context type through every layer above it.
+    e.downcast_ref::<VanishedAfterWalk>().is_some()
+        || e.downcast_ref::<WorldMovedAfterWalk>().is_some()
+}
+
+/// `Err(WorldMovedAfterWalk)` for the first of `world_walk` (the world's files
+/// as the attempt walked them) whose size or mtime is not the walk's, or
+/// which is gone.
+async fn world_still_as_walked(world_walk: &[UploadFile]) -> Result<()> {
+    for f in world_walk {
+        let moved = match tokio::fs::metadata(&f.absolute_path).await {
+            Ok(m) => m.len() != f.size_bytes || m.modified().ok() != f.modified,
+            Err(_) => true,
+        };
+        if moved {
+            return Err(WorldMovedAfterWalk {
+                path: f.relative_path.clone(),
+            }
+            .into());
+        }
+    }
+    Ok(())
+}
+
+/// `e` as a [`VanishedAfterWalk`] for `rel` when the file was not found, else
+/// as it was.
+fn vanished_or(e: anyhow::Error, rel: &str) -> anyhow::Error {
+    let not_found = e.chain().any(|c| {
+        c.downcast_ref::<std::io::Error>()
+            .is_some_and(|io| io.kind() == std::io::ErrorKind::NotFound)
+    });
+    if not_found {
+        return e.context(VanishedAfterWalk {
+            path: rel.to_string(),
+        });
+    }
+    e
+}
+
+/// Opens a file the walk listed, for sending: gone is [`VanishedAfterWalk`].
+async fn open_listed(f: &UploadFile) -> Result<tokio::fs::File> {
+    tokio::fs::File::open(&f.absolute_path)
+        .await
+        .with_context(|| format!("opening {}", f.absolute_path.display()))
+        .map_err(|e| vanished_or(e, &f.relative_path))
+}
+
 /// The source directory exists but holds no regular files to upload (only empty
 /// subdirs, or nothing). Typed so the agent can treat it as "nothing to back up"
 /// (a `BackupSkippedEmpty`) rather than a red failure: pushing an empty snapshot
@@ -236,6 +331,214 @@ pub struct UnreadableSource {
     pub count: usize,
     /// The first one's error, which is the one that explains the rest.
     pub first: String,
+}
+
+/// A shared world would go up without some of its files: unreadable right now
+/// ([`split_unreadable`]), or left out by the plan's per-save cap
+/// ([`trim_to_cap`]).
+///
+/// A partial version of anything else is published with a warning, since a
+/// save minus one file beats no save. Not a shared world's: a member who pulls
+/// it has the world's folder made equal to it, and the files the version lacks
+/// are moved out of their live folder (HRD-Q-0027), so a partial world would
+/// take good copies away from everyone who pulls it. The push is held instead,
+/// on the failure backoff, until every file of the world can go up.
+#[derive(Debug, thiserror::Error)]
+#[error("holding the push: {count} file(s) of the shared world would be left out of the version ({first}: {reason})")]
+pub struct PartialWorld {
+    /// How many of the world's files would be left out.
+    pub count: usize,
+    /// The first of them, relative to the save.
+    pub first: String,
+    /// Why: the system error for an unreadable file, or the cap.
+    pub reason: String,
+    /// Left out by the plan's per-save cap rather than unreadable. What the
+    /// user is told follows it: a permissions hint is wrong for a cap (M-3).
+    pub over_cap: bool,
+}
+
+/// [`PartialWorld`] when any of `left_out` (relative path and reason) is part
+/// of the shared world `world`; nothing for an unshared save (`world` empty).
+fn refuse_partial_world<'a>(
+    world: &[String],
+    left_out: impl Iterator<Item = (&'a str, &'a str)>,
+    over_cap: bool,
+) -> Result<(), PartialWorld> {
+    if world.is_empty() {
+        return Ok(());
+    }
+    let mut hit: Vec<(&str, &str)> = left_out
+        .filter(|(rel, _)| hoard_core::kernel::fileclass::included(world, rel))
+        .collect();
+    hit.sort();
+    match hit.first() {
+        None => Ok(()),
+        Some((first, reason)) => Err(PartialWorld {
+            count: hit.len(),
+            first: first.to_string(),
+            reason: reason.to_string(),
+            over_cap,
+        }),
+    }
+}
+
+/// [`refuse_partial_world`] over what a cap trim left out of `files`.
+fn refuse_trimmed_world(
+    world: &[String],
+    files: &[UploadFile],
+    kept: &[&UploadFile],
+    plan: &str,
+) -> Result<(), PartialWorld> {
+    let kept: HashSet<&str> = kept.iter().map(|f| f.relative_path.as_str()).collect();
+    let reason = format!("over the {plan} plan's per-save cap");
+    refuse_partial_world(
+        world,
+        files
+            .iter()
+            .map(|f| f.relative_path.as_str())
+            .filter(|rel| !kept.contains(rel))
+            .map(|rel| (rel, reason.as_str())),
+        true,
+    )
+}
+
+/// Splits the world files among `unreadable` off into entries carried from
+/// `world_from`, and refuses ([`PartialWorld`]) the ones that cannot be.
+/// Returns the carried entries and the unreadable files still left out (none
+/// of them the world's).
+///
+/// The route for M-2: an owner's whole-folder push whose world is unchanged
+/// was refused whole for one world file that could not be read (a root-owned
+/// chunk), and its characters never backed up again. The server already takes
+/// a content-addressed manifest entry for content it holds without the bytes
+/// travelling, and a version's own entries are content it holds, so the file
+/// goes into the manifest as `world_from`'s entry: same path, sha and size.
+/// The world the version publishes is then exactly the synced one, which is
+/// what the server's owner exemption compares (HRD-D-0019), so no lease is
+/// needed either.
+///
+/// Carried only when all of this holds, and refused otherwise:
+/// - the attempt's own walk, the one whose files go up, finds the folder's
+///   world is `world_from`'s (the cheap signature, paths, sizes and mtimes,
+///   equals the synced one; bytes that cannot be read cannot be compared);
+/// - the server speaks the content-addressed protocol (self-hosted 1.1.3 and
+///   later: the multipart paths need the bytes, and Cloud has no shares);
+/// - `world_from` lists the file with a sha and the size the walk saw.
+///
+/// A world that changed, or one whose file the version does not have, stays
+/// held, as before.
+async fn carry_unreadable_world(
+    client: &ApiClient,
+    save_id: &str,
+    world: &[String],
+    world_from: Option<i64>,
+    walked: &HashMap<String, (u64, Option<SystemTime>)>,
+    unreadable: Vec<UnreadableFile>,
+) -> Result<(Vec<CasFile>, Vec<UnreadableFile>)> {
+    if world.is_empty() {
+        return Ok((Vec::new(), unreadable));
+    }
+    let (in_world, rest): (Vec<UnreadableFile>, Vec<UnreadableFile>) = unreadable
+        .into_iter()
+        .partition(|u| fileclass::included(world, &u.relative_path));
+    if in_world.is_empty() {
+        return Ok((Vec::new(), rest));
+    }
+    let held = |in_world: &[UnreadableFile]| -> anyhow::Error {
+        match refuse_partial_world(
+            world,
+            in_world
+                .iter()
+                .map(|u| (u.relative_path.as_str(), u.error.as_str())),
+            false,
+        ) {
+            Err(partial) => partial.into(),
+            Ok(()) => anyhow!("a world file left out was not refused"),
+        }
+    };
+    let Some(from) = world_from else {
+        return Err(held(&in_world));
+    };
+    let _ = client.server_mode().await;
+    if client.probed_is_cloud() != Some(false) || client.probed_supports_cas() != Some(true) {
+        return Err(held(&in_world));
+    }
+    let detail = match client.snapshot_detail(save_id, from).await {
+        Ok(detail) => detail,
+        // The version is gone (purged since): there is nothing to carry the
+        // file from, which is a held world like any other, not a failure to
+        // retry as one (L-6).
+        Err(e)
+            if e.chain().any(|c| {
+                matches!(
+                    c.downcast_ref::<crate::api::ApiError>(),
+                    Some(crate::api::ApiError::NotFound)
+                )
+            }) =>
+        {
+            tracing::info!(
+                save_id,
+                version = from,
+                "upload: the synced version is gone from the server; nothing to carry the world's unreadable files from"
+            );
+            return Err(held(&in_world));
+        }
+        Err(e) => {
+            return Err(e.context(format!("reading version {from}'s files to carry its world")))
+        }
+    };
+    let mut carried = Vec::with_capacity(in_world.len());
+    for u in &in_world {
+        let entry = detail
+            .files
+            .iter()
+            .find(|f| f.relative_path == u.relative_path);
+        let walked = walked.get(&u.relative_path);
+        match (entry, walked) {
+            (Some(e), Some((size, modified)))
+                if e.sha256.is_some() && e.size_bytes == *size as i64 =>
+            {
+                carried.push(CasFile {
+                    relative_path: u.relative_path.clone(),
+                    sha256: e.sha256.clone().expect("checked above"),
+                    size_bytes: e.size_bytes,
+                    modified_at: modified
+                        .and_then(|m| m.duration_since(UNIX_EPOCH).ok())
+                        .map(|d| d.as_secs() as i64),
+                });
+            }
+            _ => return Err(held(&in_world)),
+        }
+    }
+    tracing::info!(
+        save_id,
+        version = from,
+        files = carried.len(),
+        first = %in_world[0].relative_path,
+        error = %in_world[0].error,
+        "upload: the world is unchanged but some of its files can't be read; carrying the synced version's entries for them"
+    );
+    Ok((carried, rest))
+}
+
+/// The shared world as last synced: the fingerprint of its signature
+/// (`crate::agent::fingerprint_of` of [`world_signature`]) and the version it
+/// is. An upload whose walk finds the world still that one, file for file, may
+/// carry the version's entries for world files it cannot read (M-2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SyncedWorld {
+    pub fingerprint: u64,
+    pub version: i64,
+}
+
+impl SyncedWorld {
+    /// The version to carry from when `files` (a walk) hold this world, paths,
+    /// sizes and mtimes; `None` when the world changed or there is none.
+    fn version_for(&self, files: &[UploadFile], world: &[String]) -> Option<i64> {
+        (!world.is_empty()
+            && crate::agent::fingerprint_of(&world_signature(files, world)) == self.fingerprint)
+            .then_some(self.version)
+    }
 }
 
 /// One file enumerated from the source directory.
@@ -344,6 +647,11 @@ pub struct UploadOutcome {
     /// `snapshot` describes the version that already had it (ADR 0021 D.8.3). See
     /// [`ServerHead`].
     pub landed: bool,
+    /// The cheap signature and the world signature of the walk whose files
+    /// went up: the last one, when a file vanishing made the upload walk the
+    /// folder again ([`upload_directory`]). `None` from a path that does not
+    /// walk.
+    pub walk: Option<(String, String)>,
 }
 
 /// The head the server publishes for a save: which version it is and what content
@@ -482,6 +790,28 @@ pub fn manifest_digest<'a>(files: impl Iterator<Item = (&'a str, &'a str, i64)>)
 /// "unreadable" and "empty" never give the same digest.
 const UNREADABLE_MARKER: &[u8] = b"\x01hoard:unreadable\x01";
 
+/// The files [`compute_content_signature`] warned it could not read, until one
+/// is read again: the warning is once per stretch of unreadability, not once
+/// per pass (a held push hashes the folder on every attempt and every save).
+static UNREADABLE_WARNED: std::sync::LazyLock<std::sync::Mutex<HashSet<PathBuf>>> =
+    std::sync::LazyLock::new(Default::default);
+
+/// Records `path` as unreadable; `true` the first time since it last read.
+fn unreadable_first_seen(path: &Path) -> bool {
+    UNREADABLE_WARNED
+        .lock()
+        .map_or(true, |mut warned| warned.insert(path.to_path_buf()))
+}
+
+/// `path` read: its next failure warns again.
+fn unreadable_read_again(path: &Path) {
+    if let Ok(mut warned) = UNREADABLE_WARNED.lock() {
+        if !warned.is_empty() {
+            warned.remove(path);
+        }
+    }
+}
+
 /// A content signature over the sorted `(relative_path, bytes)` set.
 ///
 /// Unlike [`compute_set_signature`] this *reads every file*, so it is only used as
@@ -534,12 +864,32 @@ async fn compute_content_signature(files: &[UploadFile]) -> String {
         }
         .await;
         if let Err(e) = read {
-            tracing::warn!(
-                path = %f.relative_path,
-                error = %format!("{e:#}"),
-                "hashing: skipping unreadable file"
-            );
+            // Gone since the walk (a game rotating its save generations) is
+            // not a file that can't be read: nothing to warn about, and the
+            // upload walks the folder again.
+            let gone = e.chain().any(|c| {
+                c.downcast_ref::<std::io::Error>()
+                    .is_some_and(|io| io.kind() == std::io::ErrorKind::NotFound)
+            });
+            if gone {
+                tracing::debug!(path = %f.relative_path, "hashing: a file left the folder after the walk");
+            } else if unreadable_first_seen(&f.absolute_path) {
+                tracing::warn!(
+                    path = %f.relative_path,
+                    error = %format!("{e:#}"),
+                    "hashing: skipping unreadable file"
+                );
+            } else {
+                // Said already, and a held push says so on every attempt.
+                tracing::debug!(
+                    path = %f.relative_path,
+                    error = %format!("{e:#}"),
+                    "hashing: skipping unreadable file, still"
+                );
+            }
             h.update(UNREADABLE_MARKER);
+        } else {
+            unreadable_read_again(&f.absolute_path);
         }
         h.update([0u8]);
     }
@@ -566,14 +916,27 @@ async fn compute_content_signature(files: &[UploadFile]) -> String {
 /// It preserves the input order (`buffered`, not `buffer_unordered`): the list
 /// arrives sorted by path from [`walk_source`] and the manifest's digest depends
 /// on that order.
+///
+/// A file that is gone by the time it is probed is neither: it left the folder
+/// between the walk and the probe (Valheim 1.0 deletes the previous generation
+/// on every save), so it is dropped from the list like a file the walk never
+/// saw. Counting it as unreadable would hold a shared world's push
+/// ([`refuse_partial_world`]) on every save the game makes mid-walk.
 async fn split_unreadable(files: Vec<UploadFile>) -> (Vec<UploadFile>, Vec<UnreadableFile>) {
     let probes = files.into_iter().map(|f| {
         async move {
             match probe_readable(&f.absolute_path).await {
-                Ok(()) => Ok(f),
-                Err(e) => Err(UnreadableFile {
+                Ok(()) => Probe::Readable(f),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    tracing::debug!(
+                        path = %f.relative_path,
+                        "upload: a file left the folder after the walk; dropping it"
+                    );
+                    Probe::Vanished
+                }
+                Err(e) => Probe::Unreadable(UnreadableFile {
                     relative_path: f.relative_path.clone(),
-                    error: format!("{e:#}"),
+                    error: format!("{e}"),
                 }),
             }
         }
@@ -587,29 +950,37 @@ async fn split_unreadable(files: Vec<UploadFile>) -> (Vec<UploadFile>, Vec<Unrea
     let mut unreadable = Vec::new();
     for outcome in probed {
         match outcome {
-            Ok(f) => readable.push(f),
-            Err(u) => {
-                tracing::warn!(
-                    path = %u.relative_path,
-                    error = %u.error,
-                    "upload: leaving out a file whose bytes can't be read"
-                );
-                unreadable.push(u);
-            }
+            Probe::Readable(f) => readable.push(f),
+            Probe::Vanished => {}
+            // Not said here: a world's file holds the push rather than being
+            // left out, and only the upload knows which it is.
+            Probe::Unreadable(u) => unreadable.push(u),
         }
     }
     (readable, unreadable)
 }
 
-/// Can this file's bytes be read? It opens and reads one byte.
-async fn probe_readable(path: &Path) -> Result<()> {
+/// What [`split_unreadable`] found for one file.
+enum Probe {
+    Readable(UploadFile),
+    /// Gone since the walk: not part of this version, and not a fault.
+    Vanished,
+    Unreadable(UnreadableFile),
+}
+
+/// Can this file's bytes be read? It opens and reads one byte. The error keeps
+/// its [`std::io::ErrorKind`], so a vanished file can be told from a denied one.
+async fn probe_readable(path: &Path) -> std::io::Result<()> {
+    let with_path = |what: &str, e: std::io::Error| {
+        std::io::Error::new(e.kind(), format!("{what} {}: {e}", path.display()))
+    };
     let mut file = tokio::fs::File::open(path)
         .await
-        .with_context(|| format!("opening {}", path.display()))?;
+        .map_err(|e| with_path("opening", e))?;
     let mut byte = [0u8; 1];
     file.read(&mut byte)
         .await
-        .with_context(|| format!("reading {}", path.display()))?;
+        .map_err(|e| with_path("reading", e))?;
     Ok(())
 }
 
@@ -788,15 +1159,98 @@ pub async fn upload_directory<F>(
     save_id: &str,
     game_slug: &str,
     include: &[String],
+    world: &[String],
+    label: &str,
+    source: &Path,
+    base_version: Option<i64>,
+    world_base_version: Option<i64>,
+    synced_world: Option<SyncedWorld>,
+    head: Option<&ServerHead>,
+    origin: VersionOrigin,
+    progress: F,
+) -> Result<UploadOutcome>
+where
+    F: Fn(u64, u64) + Send + Sync,
+{
+    // A file the walk listed and that is gone by the time it is hashed or sent
+    // (Valheim 1.0 deletes the previous generation on every save) fails the
+    // attempt it is in, not the push: the folder is walked again at once, and
+    // that does not count against the caller's retries. Dropping the file and
+    // going on is not enough, because the walk may predate the generation that
+    // replaced it. Bounded: past `MAX_REWALKS` walks, or `MAX_REWALK_TIME`
+    // since the first, it is an ordinary failure. Generous enough for a game
+    // saving every few seconds (the fourth end-to-end run's 45 s save loop spent
+    // five), since a re-walk only hashes the files that changed.
+    const MAX_REWALKS: u32 = 20;
+    const MAX_REWALK_TIME: std::time::Duration = std::time::Duration::from_secs(180);
+    let started = std::time::Instant::now();
+    let mut rewalks = 0u32;
+    // Hashes by path, size and mtime from this upload's earlier walks: a
+    // re-walk does not read an unchanged file again.
+    let mut hashes = HashCache::new();
+    loop {
+        let attempt = upload_directory_attempt(
+            client,
+            save_id,
+            game_slug,
+            include,
+            world,
+            label,
+            source,
+            base_version,
+            world_base_version,
+            synced_world,
+            head,
+            origin,
+            &progress,
+            &mut hashes,
+        )
+        .await;
+        match attempt {
+            Err(e)
+                if rewalks < MAX_REWALKS
+                    && started.elapsed() < MAX_REWALK_TIME
+                    && vanished_after_walk(&e) =>
+            {
+                rewalks += 1;
+                tracing::info!(
+                    save_id,
+                    rewalks,
+                    error = %format!("{e:#}"),
+                    "upload: a file left or changed after the walk; walking it again"
+                );
+            }
+            other => return other,
+        }
+    }
+}
+
+/// One walk of [`upload_directory`]: walk, probe, hash, send.
+#[allow(clippy::too_many_arguments)]
+async fn upload_directory_attempt<F>(
+    client: &ApiClient,
+    save_id: &str,
+    game_slug: &str,
+    include: &[String],
+    // The share's world (`WatchedSave::world`), empty for an unshared save:
+    // none of its files may be left out of the version ([`PartialWorld`]).
+    world: &[String],
     label: &str,
     source: &Path,
     base_version: Option<i64>,
     // The version the folder's shared world came from, sent only when it is
     // not the base (HRD-D-0019). Self-hosted only; Cloud has no shares.
     world_base_version: Option<i64>,
+    // The world as last synced, when known: if THIS attempt's walk finds the
+    // folder's world still equal to it, file for file, a world file whose bytes
+    // cannot be read takes that version's entry instead of holding the push
+    // ([`carry_unreadable_world`], M-2).
+    synced_world: Option<SyncedWorld>,
     head: Option<&ServerHead>,
     origin: VersionOrigin,
     progress: F,
+    // Hashes from the upload's earlier walks ([`hash_manifest`]).
+    hashes: &mut HashCache,
 ) -> Result<UploadOutcome>
 where
     // `Sync` because the cloud path shares the callback by reference across
@@ -812,6 +1266,8 @@ where
         bail!("source must be a folder or a file: {}", source.display());
     }
 
+    #[cfg(test)]
+    upload_hook("walk");
     let files = walk_source(
         &source,
         Scope {
@@ -822,12 +1278,46 @@ where
     if files.is_empty() {
         return Err(EmptySource { path: source }.into());
     }
+    // Decided from this walk, the one whose files go up, and again on every
+    // re-walk: a world that changed since the caller's walk (a game rewriting
+    // chunks while one is locked) is not carried, it is held (H-1).
+    let world_from = synced_world.and_then(|synced| synced.version_for(&files, world));
+    // What the caller persists once this walk's files are up (L-1).
+    let walk = Some((
+        compute_set_signature(&files),
+        world_signature(&files, world),
+    ));
     // A file that will not be read leaves the list here, at the ONE point all four
     // upload paths (cloud, CAS, pack, multipart) pass through, so none of them
     // meets it mid-transfer. Whatever is left out travels in the `UploadOutcome`
     // so the caller can report it: a silently incomplete version is the outcome
     // that does not count.
+    let walked: HashMap<String, (u64, Option<SystemTime>)> = files
+        .iter()
+        .map(|f| (f.relative_path.clone(), (f.size_bytes, f.modified)))
+        .collect();
+    // The world as this walk saw it, readable files and not: checked again
+    // after hashing when anything is carried (M-B).
+    let world_walk: Vec<UploadFile> = files
+        .iter()
+        .filter(|f| !world.is_empty() && fileclass::included(world, &f.relative_path))
+        .cloned()
+        .collect();
     let (files, unreadable) = split_unreadable(files).await;
+    #[cfg(test)]
+    upload_hook("probed");
+    // A shared world is never published without one of its files. One that
+    // did not change since `world_from` goes up as that version's entry
+    // instead; any other holds the push.
+    let (carried, unreadable) =
+        carry_unreadable_world(client, save_id, world, world_from, &walked, unreadable).await?;
+    for u in &unreadable {
+        tracing::warn!(
+            path = %u.relative_path,
+            error = %u.error,
+            "upload: leaving out a file whose bytes can't be read"
+        );
+    }
     if files.is_empty() {
         // Nothing readable is left: uploading here would publish an empty version
         // and delete the last good copy in the cloud.
@@ -878,6 +1368,7 @@ where
             client,
             save_id,
             game_slug,
+            world,
             label,
             &files,
             total_bytes,
@@ -885,9 +1376,11 @@ where
             head,
             origin,
             progress,
+            hashes,
         )
         .await?;
         outcome.unreadable = unreadable;
+        outcome.walk = walk;
         return Ok(outcome);
     }
 
@@ -903,14 +1396,19 @@ where
             client,
             save_id,
             &files,
+            carried,
+            &world_walk,
+            world,
             total_bytes,
             base_version,
             world_base_version,
             origin,
             progress,
+            hashes,
         )
         .await?;
         outcome.unreadable = unreadable;
+        outcome.walk = walk;
         return Ok(outcome);
     }
 
@@ -981,9 +1479,7 @@ where
             // open the handle, wrap it as a byte stream and hand it to reqwest
             // as a streaming multipart part. A 2 GB save no longer means 2 GB
             // of process memory.
-            let file = tokio::fs::File::open(&f.absolute_path)
-                .await
-                .with_context(|| format!("reading {}", f.absolute_path.display()))?;
+            let file = open_listed(f).await?;
             let stream = tokio_util::io::ReaderStream::new(file);
             let body = reqwest::Body::wrap_stream(stream);
             let part = multipart::Part::stream_with_length(body, f.size_bytes)
@@ -1010,32 +1506,76 @@ where
         // The self-hosted multipart path has no per-save cap trim.
         trimmed: None,
         landed: false,
+        walk,
     })
 }
 
+/// Hashes an upload already took, by relative path: the size and mtime the
+/// walk saw, and the SHA-256 ([`hash_manifest`]).
+pub(crate) type HashCache = HashMap<String, (u64, SystemTime, String)>;
+
 /// Whole-file SHA-256 of every file in the manifest, a few in flight at once so
 /// per-file open/read latency overlaps instead of adding up.
+///
+/// A file `cache` holds at the size and mtime this walk saw is not read
+/// again: the upload's earlier walk hashed it, moments ago (a re-walk after a
+/// file vanished, whose other files are mostly unchanged; the fourth
+/// end-to-end run re-read a 200 MB file on each). What is hashed goes into
+/// `cache`, a failed pass's too, so the re-walk it causes reuses it.
 ///
 /// (The futures are built eagerly into a Vec of `BoxFuture`s rather than through
 /// `iter().map(closure)`: a closure over borrowed items retained inside the
 /// stream trips rustc's "Send/FnOnce is not general enough" false positive when
 /// the whole upload future crosses a `tokio::spawn`. One small allocation per
 /// file, all of them IO-bound.)
-async fn hash_manifest(files: &[UploadFile]) -> Result<HashMap<&str, String>> {
+async fn hash_manifest<'a>(
+    files: &'a [UploadFile],
+    cache: &mut HashCache,
+) -> Result<HashMap<&'a str, String>> {
+    let mut out = HashMap::with_capacity(files.len());
     let mut hash_futs = Vec::with_capacity(files.len());
     for f in files {
+        let known = f.modified.and_then(|m| {
+            cache
+                .get(&f.relative_path)
+                .filter(|(size, mtime, _)| *size == f.size_bytes && *mtime == m)
+        });
+        if let Some((_, _, sha)) = known {
+            out.insert(f.relative_path.as_str(), sha.clone());
+            continue;
+        }
         hash_futs.push(
             async move {
-                let sha = hash_file(&f.absolute_path).await?;
-                Ok::<_, anyhow::Error>((f.relative_path.as_str(), sha))
+                let sha = hash_file(&f.absolute_path)
+                    .await
+                    .map_err(|e| vanished_or(e, &f.relative_path))?;
+                Ok::<_, anyhow::Error>((f, sha))
             }
             .boxed(),
         );
     }
-    stream::iter(hash_futs)
+    let hashed: Vec<Result<(&UploadFile, String)>> = stream::iter(hash_futs)
         .buffer_unordered(TRANSFER_CONCURRENCY)
-        .try_collect()
-        .await
+        .collect()
+        .await;
+    let mut failed = None;
+    for r in hashed {
+        match r {
+            Ok((f, sha)) => {
+                if let Some(m) = f.modified {
+                    cache.insert(f.relative_path.clone(), (f.size_bytes, m, sha.clone()));
+                }
+                out.insert(f.relative_path.as_str(), sha);
+            }
+            Err(e) => {
+                failed.get_or_insert(e);
+            }
+        }
+    }
+    match failed {
+        Some(e) => Err(e),
+        None => Ok(out),
+    }
 }
 
 /// Self-hosted content-addressed upload: hash, declare the manifest, upload only
@@ -1058,11 +1598,19 @@ async fn upload_directory_cas<F>(
     client: &ApiClient,
     save_id: &str,
     files: &[UploadFile],
+    // Entries that go into the manifest without a file to read them from: the
+    // world's unreadable files, as the synced version has them
+    // ([`carry_unreadable_world`]).
+    carried: Vec<CasFile>,
+    // The world's files as the attempt walked them.
+    world_walk: &[UploadFile],
+    world: &[String],
     total_bytes: u64,
     base_version: Option<i64>,
     world_base_version: Option<i64>,
     origin: VersionOrigin,
     progress: F,
+    hashes: &mut HashCache,
 ) -> Result<UploadOutcome>
 where
     F: Fn(u64, u64) + Send + Sync,
@@ -1070,7 +1618,16 @@ where
     use hoard_core::ids::Sha256 as Sha256Hex;
 
     progress(0, total_bytes);
-    let sha_by_path = hash_manifest(files).await?;
+    let sha_by_path = hash_manifest(files, hashes).await?;
+    #[cfg(test)]
+    upload_hook("hashed");
+    // The carry was decided on the walk, and the readable files hashed after
+    // it: a world chunk the game rewrote meanwhile, beside a locked one, would
+    // go up torn, half the synced version's and half new. A world that moved
+    // is walked again, which decides the carry again (M-B).
+    if !carried.is_empty() {
+        world_still_as_walked(world_walk).await?;
+    }
 
     let mut manifest: Vec<CasFile> = Vec::with_capacity(files.len());
     for f in files {
@@ -1085,6 +1642,10 @@ where
                 .and_then(|m| m.duration_since(UNIX_EPOCH).ok())
                 .map(|d| d.as_secs() as i64),
         });
+    }
+    if !carried.is_empty() {
+        manifest.extend(carried.iter().cloned());
+        manifest.sort_by(|a, b| a.relative_path.cmp(&b.relative_path));
     }
 
     let init = client
@@ -1112,6 +1673,21 @@ where
     let mut pending: Vec<(&UploadFile, String)> = Vec::with_capacity(init.missing.len());
     for blob in &init.missing {
         let Some(f) = by_sha.get(blob.sha256.as_str()) else {
+            // A carried entry whose content the server no longer holds (its
+            // version purged meanwhile): the world would go up without it.
+            if let Some(c) = carried
+                .iter()
+                .find(|c| c.sha256.as_str() == blob.sha256.as_str())
+            {
+                refuse_partial_world(
+                    world,
+                    std::iter::once((
+                        c.relative_path.as_str(),
+                        "can't be read, and the synced version's copy is gone from the server",
+                    )),
+                    false,
+                )?;
+            }
             bail!(
                 "server requested a blob not in the manifest: {}",
                 blob.sha256.as_str()
@@ -1203,9 +1779,7 @@ where
                     return Ok::<_, anyhow::Error>(());
                 }
                 put_blob_paced(&f.relative_path, paced_wait_ms, || async {
-                    let file = tokio::fs::File::open(&f.absolute_path)
-                        .await
-                        .with_context(|| format!("opening {}", f.absolute_path.display()))?;
+                    let file = open_listed(f).await?;
                     let (stream, sent) = hashing_stream(file);
                     client
                         .cas_upload_blob(
@@ -1267,6 +1841,7 @@ where
         // With no plan there is no per-save cap to trim against.
         trimmed: None,
         landed: false,
+        walk: None,
     })
 }
 
@@ -1282,6 +1857,7 @@ async fn upload_directory_cloud<F>(
     client: &ApiClient,
     save_id: &str,
     game_slug: &str,
+    world: &[String],
     label: &str,
     files: &[UploadFile],
     total_bytes: u64,
@@ -1289,6 +1865,7 @@ async fn upload_directory_cloud<F>(
     head: Option<&ServerHead>,
     origin: VersionOrigin,
     progress: F,
+    hashes: &mut HashCache,
 ) -> Result<UploadOutcome>
 where
     F: Fn(u64, u64) + Send + Sync,
@@ -1298,7 +1875,7 @@ where
     // 1. Whole-file SHA-256 of every file, the dedup key. Hashed once up front and
     //    cached by path so a per-save-cap trim-and-retry (below) does not re-read
     //    the files.
-    let sha_by_path = hash_manifest(files).await?;
+    let sha_by_path = hash_manifest(files, hashes).await?;
 
     // 1b. Is it already up there? (ADR 0021 D.8.3.) With the hashes already
     // computed, asking the server's truth whether this exact content is its head
@@ -1328,6 +1905,7 @@ where
                 unreadable: Vec::new(),
                 trimmed: None,
                 landed: true,
+                walk: None,
             });
         }
     }
@@ -1352,6 +1930,7 @@ where
     if let Some(cap) = client.plan_cap() {
         if total_bytes > cap.limit_bytes {
             if let Some(info) = trim_to_cap(&mut working, cap.limit_bytes, &cap.plan) {
+                refuse_trimmed_world(world, files, &working, &cap.plan)?;
                 tracing::debug!(
                     save_id,
                     game_slug,
@@ -1435,6 +2014,7 @@ where
                     // too-large.
                     return Err(e).context("cloud cas init");
                 };
+                refuse_trimmed_world(world, files, &working, &detail.plan)?;
                 tracing::warn!(
                     save_id,
                     game_slug,
@@ -1554,9 +2134,7 @@ where
                     }
                 } else {
                     put_blob_paced(&f.relative_path, paced_wait_ms, || async {
-                        let file = tokio::fs::File::open(&f.absolute_path)
-                            .await
-                            .with_context(|| format!("opening {}", f.absolute_path.display()))?;
+                        let file = open_listed(f).await?;
                         let (stream, sent) = hashing_stream(file);
                         client
                             .put_presigned(
@@ -1648,6 +2226,7 @@ where
         unreadable: Vec::new(),
         trimmed,
         landed: false,
+        walk: None,
     })
 }
 
@@ -2051,6 +2630,11 @@ pub async fn upload_directory_checked<F, G>(
     prev_signature: Option<&str>,
     base_version: Option<i64>,
     world_base_version: Option<i64>,
+    // The world's fingerprint as last synced (the agent's
+    // `synced_world_fingerprint`, `crate::agent::fingerprint_of` of its
+    // signature), when known. A folder whose world still matches it may carry
+    // that version's entries for world files it cannot read (M-2).
+    synced_world: Option<u64>,
     head: Option<&ServerHead>,
     origin: VersionOrigin,
     progress: F,
@@ -2097,7 +2681,21 @@ where
     }
     let (prev_cheap, prev_content) = split_signature(prev_signature);
     let cheap = compute_set_signature(&files);
+    // The list itself still goes to the upload, which refuses to leave any of
+    // its files out.
+    let world_list = world;
     let world = world_signature(&files, world);
+    // The world as synced, and the version an unreadable world file's entry
+    // comes from: the world base when the world was carried forward, else the
+    // base. Whether the folder's world still IS it is decided by each upload
+    // attempt over its own walk ([`SyncedWorld::version_for`]).
+    let synced_world = synced_world
+        .filter(|_| !world_list.is_empty())
+        .zip(world_base_version.or(base_version))
+        .map(|(fingerprint, version)| SyncedWorld {
+            fingerprint,
+            version,
+        });
     // `is_deliberate` rather than `== Manual`: the safety net taken before a
     // restore counts too, and skipping it there is worse, since it is the copy that
     // lets a wrong restore be undone.
@@ -2126,15 +2724,27 @@ where
         save_id,
         game_slug,
         include,
+        world_list,
         label,
         &canonical,
         base_version,
         world_base_version,
+        synced_world,
         head,
         origin,
         progress,
     )
     .await?;
+    // What is persisted is the signature of the walk whose files went up (L-1):
+    // after a re-walk, or a change between the walk above and the upload's own,
+    // this walk's would read as a change on the next tick. Its content half is
+    // left out, since those bytes were not read as a whole: the cheap half
+    // alone skips an unchanged folder, and a changed one is uploaded rather than
+    // matched against content of a walk that did not go up.
+    let (signature, world) = match outcome.walk.clone() {
+        Some((walked, walked_world)) if walked != cheap => (walked, walked_world),
+        _ => (join_signature(&cheap, &content), world),
+    };
     // The content was already up there (D.8.3): there was no upload, but there is a
     // version we are now synced to. It is kept apart from `Uploaded` because the
     // caller must NOT count it as a committing backup: moving the min-interval
@@ -2142,13 +2752,13 @@ where
     if outcome.landed {
         return Ok(BackupResult::AlreadyLanded {
             version_num: outcome.snapshot.version_num,
-            signature: join_signature(&cheap, &content),
+            signature,
             world,
         });
     }
     Ok(BackupResult::Uploaded {
         outcome,
-        signature: join_signature(&cheap, &content),
+        signature,
         world,
     })
 }
@@ -2276,6 +2886,89 @@ mod trim_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A file that stays unreadable is warned about once, not on every pass
+    /// (every held attempt hashes the folder); read again and lost again, it
+    /// warns again.
+    #[tokio::test(flavor = "current_thread")]
+    async fn an_unreadable_file_warns_once_while_it_stays_unreadable() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::sync::{Arc, Mutex};
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let locked = root.join("a.sav");
+        std::fs::write(&locked, b"aaaa").unwrap();
+        let set = |mode| {
+            std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(mode)).unwrap()
+        };
+        set(0o000);
+        if std::fs::read(&locked).is_ok() {
+            set(0o644);
+            return; // root reads it anyway
+        }
+        let files = walk_source(root, Scope::default()).unwrap();
+        let log: Arc<Mutex<Vec<u8>>> = Arc::default();
+        let sink = log.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::WARN)
+            .with_writer(move || LockedLog(sink.clone()))
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+        let warnings = || {
+            String::from_utf8(log.lock().unwrap().clone())
+                .unwrap()
+                .matches("skipping unreadable file")
+                .count()
+        };
+        for _ in 0..3 {
+            compute_content_signature(&files).await;
+        }
+        assert_eq!(warnings(), 1, "three passes, one warning");
+        set(0o644);
+        compute_content_signature(&files).await;
+        set(0o000);
+        compute_content_signature(&files).await;
+        set(0o644);
+        assert_eq!(warnings(), 2, "unreadable again after a read");
+    }
+
+    /// A re-walk does not read an unchanged file again: a file at the size and
+    /// mtime an earlier walk of the same upload hashed takes that hash, and
+    /// one whose mtime moved is read.
+    #[tokio::test]
+    async fn a_rewalk_reuses_the_hashes_of_unchanged_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(root.join("a.sav"), b"aaaa").unwrap();
+        std::fs::write(root.join("b.sav"), b"bbbb").unwrap();
+        let mut cache = HashCache::new();
+        let walk = || walk_source(root, Scope::default()).unwrap();
+        let first = walk();
+        let before: HashMap<String, String> = hash_manifest(&first, &mut cache)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|(k, v)| (k.to_string(), v))
+            .collect();
+        assert_eq!(cache.len(), 2);
+        // Same size and mtime, other bytes: taken from the cache, not read.
+        let mtime = |p: &Path| {
+            filetime::FileTime::from_last_modification_time(&std::fs::metadata(p).unwrap())
+        };
+        let a = root.join("a.sav");
+        let kept = mtime(&a);
+        std::fs::write(&a, b"AAAA").unwrap();
+        filetime::set_file_mtime(&a, kept).unwrap();
+        // A moved mtime: read again.
+        let b = root.join("b.sav");
+        std::fs::write(&b, b"BBBB").unwrap();
+        filetime::set_file_mtime(&b, filetime::FileTime::from_unix_time(2_000_000_000, 0)).unwrap();
+        let second = walk();
+        let after = hash_manifest(&second, &mut cache).await.unwrap();
+        assert_eq!(after["a.sav"], before["a.sav"]);
+        assert_ne!(after["b.sav"], before["b.sav"]);
+        assert_eq!(after["b.sav"], hash_file(&b).await.unwrap());
+    }
 
     fn uf(rel: &str, size: u64, mtime_secs: u64) -> UploadFile {
         UploadFile {
@@ -2609,6 +3302,144 @@ mod tests {
         );
     }
 
+    /// A file deleted between the walk and the probe (Valheim 1.0 removes the
+    /// previous generation on every save) is dropped, not reported unreadable:
+    /// otherwise a shared world's push would be held on every save the game
+    /// makes mid-walk (H-A).
+    #[tokio::test]
+    async fn a_file_gone_after_the_walk_is_dropped_not_unreadable() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        for rel in [
+            "worlds_local/Alpha/_main.1.db2",
+            "worlds_local/Alpha/_main.2.db2",
+        ] {
+            std::fs::create_dir_all(root.join(rel).parent().unwrap()).unwrap();
+            std::fs::write(root.join(rel), rel).unwrap();
+        }
+        let walked = walk_source(root, Scope::default()).unwrap();
+        std::fs::remove_file(root.join("worlds_local/Alpha/_main.1.db2")).unwrap();
+
+        let (ok, skipped) = split_unreadable(walked).await;
+        assert_eq!(
+            ok.iter()
+                .map(|f| f.relative_path.as_str())
+                .collect::<Vec<_>>(),
+            ["worlds_local/Alpha/_main.2.db2"]
+        );
+        assert!(skipped.is_empty(), "{skipped:?}");
+        let world = vec!["worlds_local/Alpha".to_string()];
+        assert!(refuse_partial_world(
+            &world,
+            skipped
+                .iter()
+                .map(|u| (u.relative_path.as_str(), u.error.as_str())),
+            false,
+        )
+        .is_ok());
+    }
+
+    /// A shared world is never uploaded without one of its files: the upload
+    /// stops before the network with [`PartialWorld`]. A file outside the
+    /// world (an owner's character) and an unshared save keep the old rule,
+    /// the file left out and reported.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_unreadable_world_file_refuses_the_upload() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        for rel in [
+            "worlds_local/Alpha/_main.2.db2",
+            "worlds_local/Alpha/0_0.chunk",
+            "characters_local/Me.fch",
+        ] {
+            std::fs::create_dir_all(root.join(rel).parent().unwrap()).unwrap();
+            std::fs::write(root.join(rel), rel).unwrap();
+        }
+        let world = crate::worldfiles::template("valheim", "Alpha")
+            .unwrap()
+            .unwrap();
+        let client = ApiClient::new("http://127.0.0.1:1", "t").unwrap();
+        let upload = |include: Vec<String>, world: Vec<String>| {
+            let client = client.clone();
+            let root = root.to_path_buf();
+            async move {
+                upload_directory(
+                    &client,
+                    "w1",
+                    "valheim",
+                    &include,
+                    &world,
+                    "main",
+                    &root,
+                    None,
+                    None,
+                    None,
+                    None,
+                    VersionOrigin::Automatic,
+                    |_, _| {},
+                )
+                .await
+            }
+        };
+        let lock = |rel: &str, mode: u32| {
+            std::fs::set_permissions(root.join(rel), std::fs::Permissions::from_mode(mode)).unwrap()
+        };
+
+        lock("worlds_local/Alpha/0_0.chunk", 0o000);
+        let member = upload(world.clone(), world.clone()).await;
+        let owner = upload(Vec::new(), world.clone()).await;
+        let unshared = upload(Vec::new(), Vec::new()).await;
+        lock("worlds_local/Alpha/0_0.chunk", 0o644);
+
+        for (who, result) in [("member", member), ("owner", owner)] {
+            let err = result.expect_err(who);
+            let partial = err
+                .downcast_ref::<PartialWorld>()
+                .unwrap_or_else(|| panic!("{who}: {err:#}"));
+            assert_eq!(partial.count, 1);
+            assert_eq!(partial.first, "worlds_local/Alpha/0_0.chunk");
+            assert!(!partial.over_cap, "{who}: unreadable, not the cap");
+        }
+        let err = unshared.expect_err("the fake server is not there");
+        assert!(err.downcast_ref::<PartialWorld>().is_none(), "{err:#}");
+
+        // The owner's character is outside the world: left out and reported,
+        // as before, not a reason to hold the push.
+        lock("characters_local/Me.fch", 0o000);
+        let owner = upload(Vec::new(), world.clone()).await;
+        lock("characters_local/Me.fch", 0o644);
+        let err = owner.expect_err("the fake server is not there");
+        assert!(err.downcast_ref::<PartialWorld>().is_none(), "{err:#}");
+    }
+
+    /// The cap trim's side of the same rule: a trim that leaves a world file
+    /// out refuses, one that only drops files outside the world does not.
+    #[test]
+    fn a_cap_trim_that_drops_a_world_file_refuses() {
+        let file = |rel: &str, size: u64| UploadFile {
+            relative_path: rel.to_string(),
+            absolute_path: PathBuf::from(rel),
+            size_bytes: size,
+            modified: None,
+        };
+        let files = vec![
+            file("worlds_local/Alpha/0_0.chunk", 10),
+            file("characters_local/Me.fch", 10),
+        ];
+        let world = vec!["worlds_local/Alpha".to_string()];
+        let only_world: Vec<&UploadFile> = vec![&files[0]];
+        let only_character: Vec<&UploadFile> = vec![&files[1]];
+        assert!(refuse_trimmed_world(&world, &files, &only_world, "free").is_ok());
+        let err = refuse_trimmed_world(&world, &files, &only_character, "free").unwrap_err();
+        assert_eq!(err.first, "worlds_local/Alpha/0_0.chunk");
+        assert!(err.reason.contains("free"), "{}", err.reason);
+        // M-3: said as the cap, not as a file that can't be read.
+        assert!(err.over_cap);
+        assert!(refuse_trimmed_world(&[], &files, &only_character, "free").is_ok());
+    }
+
     /// A subfolder without permission cannot bring down the whole game's backup:
     /// on Windows the profile's legacy junctions return access denied as a matter
     /// of course.
@@ -2685,6 +3516,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             VersionOrigin::Automatic,
             |_, _| {},
             || {},
@@ -2716,6 +3548,7 @@ mod tests {
             &[],
             "main",
             &save_dir,
+            None,
             None,
             None,
             None,

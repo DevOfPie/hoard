@@ -65,13 +65,23 @@ pub struct RestorePreview {
     /// How many get created in total, listed or not.
     #[serde(default)]
     pub added_count: usize,
-    /// Only on disk. They are not deleted, since a restore writes over rather
-    /// than mirroring, but the user deserves to see them: they are the saves made
-    /// after the version about to be brought back. Listed up to [`MAX_LISTED`].
+    /// Only on disk, and left there: a restore writes over rather than
+    /// mirroring, but the user deserves to see them, since they are the saves
+    /// made after the version about to be brought back. Listed up to
+    /// [`MAX_LISTED`]. Never the files in [`Self::world_set_aside`].
     pub local_only: Vec<String>,
-    /// How many exist only on disk in total, listed or not.
+    /// How many exist only on disk and stay, in total, listed or not.
     #[serde(default)]
     pub local_only_count: usize,
+    /// Only on disk, inside a shared world the version replaces whole: moved
+    /// into the conflicts folder before the version is written, and kept there
+    /// for the retention period (`crate::restore::stale_world_files`). A Valheim
+    /// 1.0 world's other generation, say. Listed up to [`MAX_LISTED`].
+    #[serde(default)]
+    pub world_set_aside: Vec<String>,
+    /// How many of those in total, listed or not.
+    #[serde(default)]
+    pub world_set_aside_count: usize,
     /// Bytes that have to be written (modified plus added).
     pub bytes_to_write: u64,
     /// On an owner's restore of a shared save, the files outside the share's
@@ -335,6 +345,8 @@ pub async fn overwritten_outside_share(
 /// The full preview: it fetches the manifest and crosses it with the disk.
 /// `share_include` names the files an owner's restore keeps a copy of when it
 /// overwrites them outside the share (see [`overwritten_outside_share`]).
+/// `world` is the share's world when `dest` is the save's own folder, empty
+/// otherwise: the files the restore moves out of it ([`set_aside_in`]).
 ///
 /// An empty manifest (a legacy version, or a version with no files) comes out as
 /// not comparable, never as "nothing changes".
@@ -345,6 +357,7 @@ pub async fn restore_preview(
     dest: &Path,
     gate: &RestoreGate,
     share_include: &[String],
+    world: &[String],
 ) -> Result<RestorePreview> {
     let remote = remote_files(client, save_id, version).await?;
     if remote.is_empty() {
@@ -357,7 +370,33 @@ pub async fn restore_preview(
     let outside = overwritten_outside_share(&remote, dest, gate, share_include).await;
     preview.outside_share_count = outside.len();
     preview.outside_share = outside.into_iter().take(MAX_LISTED).collect();
+    set_aside_in(&mut preview, &remote, dest, gate, world)?;
     Ok(preview)
+}
+
+/// Moves what the restore will move aside ([`crate::restore::stale_world_files`],
+/// the same decision the restore makes) out of `local_only`, where the diff put
+/// it, into `world_set_aside`: those files do not stay.
+pub fn set_aside_in(
+    preview: &mut RestorePreview,
+    remote: &[RemoteFile],
+    dest: &Path,
+    gate: &RestoreGate,
+    world: &[String],
+) -> Result<()> {
+    let names: Vec<String> = remote.iter().map(|f| f.relative_path.clone()).collect();
+    let stale = crate::restore::stale_world_files(dest, &names, &gate.shields, world)?;
+    if stale.is_empty() {
+        return Ok(());
+    }
+    let moving: HashSet<&str> = stale.iter().map(String::as_str).collect();
+    preview
+        .local_only
+        .retain(|rel| !moving.contains(rel.as_str()));
+    preview.local_only_count = preview.local_only_count.saturating_sub(stale.len());
+    preview.world_set_aside_count = stale.len();
+    preview.world_set_aside = stale.into_iter().take(MAX_LISTED).collect();
+    Ok(())
 }
 
 #[cfg(test)]
@@ -380,6 +419,56 @@ mod tests {
         let p = diff(&remote, &[], |_| false);
         assert_eq!(p.added.len(), MAX_LISTED, "the listing is still capped");
         assert_eq!(p.added_count, MAX_LISTED + 50, "the count is the real one");
+    }
+
+    /// A restore into a shared save's folder moves a world generation the
+    /// version lacks aside: the preview says so, and does not call those
+    /// files "left untouched". The converted world's flat leftover counts too;
+    /// a character only on this disk does stay.
+    #[tokio::test]
+    async fn the_preview_counts_what_the_restore_moves_aside() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dest = tmp.path();
+        for rel in [
+            "worlds_local/Alpha/_main.9.db2",
+            "worlds_local/Alpha/_main.9.fwl2",
+            "worlds_local/Alpha.db",
+            "characters_local/Me.fch",
+        ] {
+            std::fs::create_dir_all(dest.join(rel).parent().unwrap()).unwrap();
+            std::fs::write(dest.join(rel), rel).unwrap();
+        }
+        let remote = vec![
+            r("worlds_local/Alpha/_main.7.db2", 5, Some(&"a".repeat(64))),
+            r("worlds_local/Alpha/_main.7.fwl2", 5, Some(&"b".repeat(64))),
+        ];
+        let gate = RestoreGate::default();
+        let world = crate::worldfiles::template("valheim", "Alpha")
+            .unwrap()
+            .unwrap();
+
+        let mut preview = against_disk(&remote, dest, &gate).await.unwrap();
+        assert_eq!(preview.local_only_count, 4);
+        set_aside_in(&mut preview, &remote, dest, &gate, &world).unwrap();
+        assert_eq!(preview.world_set_aside_count, 3);
+        assert_eq!(
+            preview.world_set_aside,
+            vec![
+                "worlds_local/Alpha.db",
+                "worlds_local/Alpha/_main.9.db2",
+                "worlds_local/Alpha/_main.9.fwl2",
+            ]
+        );
+        assert_eq!(preview.local_only, vec!["characters_local/Me.fch"]);
+        assert_eq!(preview.local_only_count, 1);
+
+        // Not the save's folder (no world): everything on disk stays.
+        let mut preview = against_disk(&remote, dest, &gate).await.unwrap();
+        set_aside_in(&mut preview, &remote, dest, &gate, &[]).unwrap();
+        assert_eq!(
+            (preview.world_set_aside_count, preview.local_only_count),
+            (0, 4)
+        );
     }
 
     fn r(path: &str, size: u64, sha: Option<&str>) -> RemoteFile {

@@ -101,6 +101,42 @@ pub struct ConflictStall {
     pub needs_attention: bool,
 }
 
+/// A shared world's push held because one of its files cannot go up
+/// (unreadable, or over the plan's cap): publishing without it would move good
+/// copies out of every puller's folder (HRD-Q-0027).
+///
+/// Not a [`ConflictStall`]: a new cloud head says nothing about whether a file
+/// on this disk reads again, so it does not reset. What does is the file
+/// changing ([`reconcile::retry_held_world`], off a watcher hit on the save),
+/// the user asking by hand, or a push that goes up.
+///
+/// Only the ladder's own attempts count toward the give-up budget. A retry a
+/// change asked for does not: a burst of saves would otherwise spend the
+/// budget in seconds and park a push whose file merely stayed locked a moment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct WorldHeld {
+    /// Held pushes on the ladder. Non-zero means the push is being held.
+    pub consecutive: u32,
+    /// Budget spent: retrying on a clock stops, and the save asks for the user.
+    /// A watcher hit on the save still retries.
+    pub needs_attention: bool,
+    /// When the ladder's next attempt is due. Its own deadline, apart from
+    /// `State::next_backup_at`: a change retrying the push clears nothing but
+    /// this hold, not a 429's Retry-After or a failure backoff.
+    pub retry_at: Option<OffsetDateTime>,
+    /// The next attempt was asked for by a change to the save (or the user),
+    /// not by the ladder: a hold it ends in is not counted, and the ladder's
+    /// deadline stands.
+    pub by_change: bool,
+}
+
+impl WorldHeld {
+    /// The push is being held, on the backoff or parked.
+    pub fn active(&self) -> bool {
+        self.consecutive > 0 || self.needs_attention
+    }
+}
+
 /// How the last IO operation ended, reported by the shell as part of the next
 /// tick's [`Observation`]. With the authority inverted, finishing an op is an
 /// *input* to the reducer rather than an event that mutates state behind its
@@ -166,6 +202,17 @@ pub enum OpResult {
     /// a human. Like [`Self::Failed`] on an upload it keeps `has_pending`: the
     /// changes are still unversioned.
     ConflictStalled,
+    /// A shared world's push held because one of its files cannot go up
+    /// ([`WorldHeld`]). Escalates on [`reconcile::WORLD_HELD_BACKOFF_SECS`] and,
+    /// past [`reconcile::WORLD_HELD_GIVE_UP_AFTER`], parks until the file
+    /// changes or the user asks. Keeps `has_pending`: nothing went up.
+    WorldHeld,
+    /// A pull downloaded the head but did not merge it: the game started, or
+    /// took a save file, during the download. Nothing was written, so it is
+    /// neither a landed pull (no bookkeeping, `pull_pending` stays) nor a
+    /// failure (no escalation): the pull waits, on the short cooldown, for the
+    /// vetoes to lift.
+    Deferred,
     /// Anything else (network, sha, permissions, timeout) once the executor has
     /// burned its internal retries. What it does depends on the op in flight. On
     /// a **download** it escalates the per-cloud-version failure counter and the
@@ -277,6 +324,8 @@ pub struct State {
     /// Counter and escalation for the 409 reconciliation cannot resolve. The
     /// brake that stops that case retrying forever.
     pub backup_conflict: ConflictStall,
+    /// A shared world's push held for a file that cannot go up.
+    pub world_held: WorldHeld,
 }
 
 /// The world as sampled this tick (ADR C.1): what the shell read off the disk,

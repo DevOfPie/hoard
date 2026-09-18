@@ -42,8 +42,9 @@ pub fn restore_include(shared: Option<&SharedRef>) -> &[String] {
 /// The share's list when this account owns the shared save
 /// ([`SharedRef::caller_owns`]), nothing otherwise. The owner's restore writes
 /// the whole folder: a file outside the list that the restore overwrites is
-/// copied aside first ([`crate::restore::keep_outside_share`]), so its current
-/// bytes survive whatever version the restore brings back. The other half of
+/// moved to the conflicts tree first, as everything the restore replaces is
+/// ([`crate::restore::restore_staged`]), so its current bytes survive whatever
+/// version the restore brings back. The preview names them. The other half of
 /// [`restore_include`].
 pub fn owner_share_include(shared: Option<&SharedRef>) -> &[String] {
     match shared {
