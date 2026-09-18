@@ -1940,6 +1940,53 @@ mod tests {
     /// archive lands: the world's folder is the version's, the older
     /// generation and the replaced chunk are in the conflicts folder, and the
     /// member's own character is untouched.
+    /// An owner's explicit restore that replaces a character outside the
+    /// shared world keeps the character's current bytes once, in the folder
+    /// the restore moves what it replaces to: not also in a second side copy.
+    #[tokio::test]
+    async fn an_owners_restore_keeps_a_replaced_character_once() {
+        let tmp = tempfile::tempdir().unwrap();
+        let save = tmp.path().join("save");
+        let conflicts = tmp.path().join("conflicts");
+        put(&save, "worlds_local/Alpha/0_0.chunk", b"chunk now");
+        put(&save, "characters_local/Me.fch", b"me now");
+        let version: Vec<(&str, &[u8])> = vec![
+            ("worlds_local/Alpha/0_0.chunk", b"chunk at v4"),
+            ("characters_local/Me.fch", b"me at v4"),
+        ];
+        let world = crate::worldfiles::template("valheim", "Alpha")
+            .unwrap()
+            .unwrap();
+        let routes = crate::testserver::selfhosted_version("w1", 4, &version).await;
+        let (url, _) = crate::testserver::serve(move |_| routes).await;
+        let client = ApiClient::new(url, "t").unwrap();
+        let done = restore_staged(
+            &client,
+            "w1",
+            4,
+            &save,
+            RestoreOptions {
+                force: true,
+                ..Default::default()
+            },
+            &world,
+            &conflicts,
+            |_| {},
+            |_, _| {},
+        )
+        .await
+        .unwrap();
+        assert_eq!(done.replaced_set_aside, 2);
+        let kept: Vec<String> = tree(&conflicts)
+            .into_keys()
+            .filter(|k| k.ends_with("characters_local/Me.fch"))
+            .collect();
+        assert_eq!(kept.len(), 1, "{kept:?}");
+        let moved = tree(done.moved_to.as_deref().unwrap());
+        assert_eq!(moved.get("characters_local/Me.fch").unwrap(), b"me now");
+        assert_eq!(tree(&save).get("characters_local/Me.fch").unwrap(), b"me at v4");
+    }
+
     #[tokio::test]
     async fn a_restore_whose_download_fails_leaves_the_folder_untouched() {
         let tmp = tempfile::tempdir().unwrap();

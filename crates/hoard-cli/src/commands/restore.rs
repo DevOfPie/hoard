@@ -61,10 +61,6 @@ pub struct RestoredOut {
     pub files_reused: u64,
     pub bytes_reused: u64,
     pub destination: String,
-    /// The folder the files in `preview.outside_share` were copied to before
-    /// the restore wrote over them. Absent when nothing needed keeping.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub set_aside: Option<String>,
     /// The folder the shared world's files that the version does not have
     /// were moved to, so the world's folder ends as the version's. Absent
     /// when nothing moved.
@@ -166,7 +162,8 @@ pub async fn apply(
     let include = hoard_agent::savefilter::restore_include(shared);
     let gate = hoard_agent::savefilter::gate_for_save(slug, include, allow_ini);
     // The owner's side of the same list, by the server's owner mark: what the
-    // restore overwrites outside it is copied aside before writing.
+    // restore overwrites outside it is announced, and moved aside with the
+    // rest of what it replaces.
     let outside = hoard_agent::savefilter::owner_share_include(shared);
 
     // The share's world, owner and member alike, when `dest` is (or is about to
@@ -276,19 +273,10 @@ pub async fn apply(
         bar.set_position(downloaded);
     };
 
-    // Kept before anything is written. Only with `--force`: without it a folder
-    // with files in it is refused, so there is nothing to overwrite.
-    let set_aside = if force {
-        let root = CliConfig::state_dir()?.join("conflicts");
-        hoard_agent::restore::keep_outside_share(
-            &client, &save_id, version, &dest, &gate, outside, &root,
-        )
-        .await
-        .context("couldn't copy the files outside the shared world aside; nothing was restored")?
-    } else {
-        None
-    };
-
+    // Files outside the shared world that the version replaces are no longer
+    // copied aside first: the staged restore below moves every local copy it
+    // replaces into the conflicts tree, theirs included, and a copy made here
+    // as well put the same file in two folders.
     let root = CliConfig::state_dir()?.join("conflicts");
     // Downloaded whole into a staging folder first; the save's folder is only
     // touched once that succeeded, so a download that fails or is killed
@@ -359,7 +347,6 @@ pub async fn apply(
             files_reused: outcome.files_reused as u64,
             bytes_reused: outcome.bytes_reused,
             destination: outcome.destination.display().to_string(),
-            set_aside: set_aside.as_ref().map(|s| s.dir.display().to_string()),
             world_set_aside: staged
                 .moved_to
                 .as_ref()
@@ -389,12 +376,6 @@ pub async fn apply(
                 "  {} of them ({}) were already on disk — copied, not downloaded",
                 r.files_reused,
                 fmt_bytes(r.bytes_reused)
-            );
-        }
-        if let (Some(dir), Some(kept)) = (&r.set_aside, &set_aside) {
-            println!(
-                "  {} file(s) outside the shared world were copied to {dir} first",
-                kept.files
             );
         }
         if let Some(dir) = &r.world_set_aside {
@@ -468,8 +449,8 @@ fn print_preview(out: &RestoreOut, full: bool) {
     );
     if p.outside_share_count > 0 {
         println!(
-            "{} of the overwritten file(s) are outside the shared world: they are copied to \
-             the side-copy folder first",
+            "{} of the overwritten file(s) are outside the shared world: they are moved to \
+             the conflicts folder first, with anything else it replaces",
             p.outside_share_count
         );
     }
@@ -500,7 +481,7 @@ fn print_preview(out: &RestoreOut, full: bool) {
     };
     listed("overwritten", &p.modified, p.modified_count);
     listed(
-        "outside the shared world (copied aside first)",
+        "outside the shared world (moved aside first)",
         &p.outside_share,
         p.outside_share_count,
     );

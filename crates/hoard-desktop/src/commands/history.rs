@@ -531,26 +531,10 @@ pub async fn restore_snapshot(
     );
 
     // 1b) The owner's restore writes the whole folder, and a file outside the
-    //     share it overwrites may hold bytes no version has yet. Those files
-    //     are copied into the side-copy tree first, and a copy that fails stops
-    //     the restore before it writes.
-    let outside = hoard_agent::savefilter::owner_share_include(shared.as_ref());
-    if !outside.is_empty() {
-        let root = CliConfig::state_dir()
-            .map_err(|e| e.to_string())?
-            .join("conflicts");
-        restore::keep_outside_share(
-            &client,
-            &save_id,
-            version,
-            &local_path,
-            &gate,
-            outside,
-            &root,
-        )
-        .await
-        .map_err(pretty_error)?;
-    }
+    //     share it overwrites may hold bytes no version has yet. It is not
+    //     copied aside here: the staged restore below moves every local copy
+    //     it replaces into the conflicts tree first, those included, and a
+    //     copy made here as well put the same file in two folders.
 
     // 2) Download + verify into a staging folder, then apply locally, all or
     //    nothing: the version wins every file it carries, and a different
