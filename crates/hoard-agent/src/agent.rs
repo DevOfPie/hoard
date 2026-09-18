@@ -4866,14 +4866,33 @@ async fn local_mtime_wins(local: &Path, remote: &Path) -> bool {
 /// in tracked saves are small enough that chunk-streaming would only matter for
 /// pathological archives, and the per-file allocation cost is much smaller than the
 /// network and zstd cost we already paid to land them in staging.
+///
+/// `a` is the version's copy in staging and `b` the local one. A local copy
+/// that cannot be read counts as different, not as an error (M-3): it is the
+/// file "restore without the safety copy" exists for, and failing on it again
+/// made that restore fail on the same file. Different, it is backed up by a
+/// rename, which needs no read, and replaced. A staging copy that cannot be
+/// read is still an error: the version's bytes are not there to write.
 async fn files_have_equal_bytes(a: &Path, b: &Path) -> Result<bool> {
     let meta_a = tokio::fs::metadata(a).await?;
-    let meta_b = tokio::fs::metadata(b).await?;
+    let meta_b = match tokio::fs::metadata(b).await {
+        Ok(m) => m,
+        Err(e) => {
+            tracing::debug!(path = %b.display(), error = %e, "restore: the local copy can't be read; it counts as different");
+            return Ok(false);
+        }
+    };
     if meta_a.len() != meta_b.len() {
         return Ok(false);
     }
     let bytes_a = tokio::fs::read(a).await?;
-    let bytes_b = tokio::fs::read(b).await?;
+    let bytes_b = match tokio::fs::read(b).await {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            tracing::debug!(path = %b.display(), error = %e, "restore: the local copy can't be read; it counts as different");
+            return Ok(false);
+        }
+    };
     Ok(bytes_a == bytes_b)
 }
 
@@ -9031,6 +9050,44 @@ mod tests {
         assert_eq!(seen.len(), 2, "{seen:?}");
         assert!(seen[1].1.contains("worlds_local/Alpha.db"), "{seen:?}");
         assert!(!seen[1].1.contains("characters_local"), "{seen:?}");
+    }
+
+    /// M-3: a local copy that cannot be read is different from the version's,
+    /// not a reason to fail: an explicit restore backs it up (a rename needs no
+    /// read) and writes the version's. Before, "restore without the safety
+    /// copy" failed again on the very file that held the safety copy.
+    #[tokio::test]
+    async fn a_restore_replaces_a_local_copy_it_cannot_read() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp.path().join("save");
+        let source = tmp.path().join("staging");
+        let backup = tmp.path().join("conflicts");
+        // Same size, so only reading the bytes could tell them apart.
+        write_file(&target.join("worlds_local/Alpha.db"), b"old");
+        write_file(&source.join("worlds_local/Alpha.db"), b"new");
+        let local = target.join("worlds_local/Alpha.db");
+        std::fs::set_permissions(&local, std::fs::Permissions::from_mode(0o000)).unwrap();
+        if std::fs::read(&local).is_ok() {
+            return; // root reads it anyway
+        }
+        let world = vec!["worlds_local/Alpha.db".to_string()];
+        let stats = restore_files_into_as(
+            &target,
+            &source,
+            Some(&backup),
+            Scope::default(),
+            &world,
+            true,
+        )
+        .await
+        .expect("an unreadable local copy is replaced, not an error");
+        assert_eq!(stats.conflicts_backed_up, 1);
+        assert_eq!(stats.conflicts_resolved_remote, 1);
+        assert_eq!(std::fs::read(&local).unwrap(), b"new");
+        let kept = backup.join("worlds_local/Alpha.db");
+        std::fs::set_permissions(&kept, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert_eq!(std::fs::read(&kept).unwrap(), b"old", "the local copy is kept");
     }
 
     /// M-2: an owner's push whose world is the synced one, file for file, is
