@@ -9804,6 +9804,62 @@ mod tests {
         assert!(seen.lock().unwrap().is_empty(), "the server was not asked");
     }
 
+    /// L-6: the synced version an unreadable world file would be carried from
+    /// is gone from the server (purged): the push is held for the file, as
+    /// with any world file that cannot go up, not failed as an error.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_carry_from_a_purged_version_holds_the_world() {
+        use std::os::unix::fs::PermissionsExt;
+        let lock = |p: &Path, mode: u32| {
+            std::fs::set_permissions(p, std::fs::Permissions::from_mode(mode)).unwrap()
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        owner_folder(root);
+        let alpha = root.join("worlds_local/Alpha.db");
+        let mut slot = test_slot(owner_save(root));
+        slot.known_version = Some(3);
+        test_sync_now(&mut slot);
+        write_file(&root.join("characters_local/Me.fch"), b"me, later");
+        lock(&alpha, 0o000);
+        if std::fs::read(&alpha).is_ok() {
+            lock(&alpha, 0o644);
+            return;
+        }
+        let (url, seen) = refusing_server(vec![(404, r#"{"error":"not found"}"#)]).await;
+        let (events_tx, _events_rx) = mpsc::channel(64);
+        let (done_tx, mut done_rx) = mpsc::channel(8);
+        let (cmd_tx, mut cmd_rx) = mpsc::channel(8);
+        run_backup_with_retry(
+            ApiClient::new(&url, "fake").unwrap(),
+            slot.save.clone(),
+            None,
+            slot.known_version,
+            None,
+            slot.synced_world_fingerprint,
+            None,
+            VersionOrigin::Automatic,
+            false,
+            events_tx,
+            done_tx,
+            cmd_tx,
+            0,
+            false,
+            None,
+            14,
+        )
+        .await;
+        lock(&alpha, 0o644);
+        assert!(done_rx.try_recv().is_err(), "nothing landed");
+        let cmd = cmd_rx.try_recv().ok();
+        assert!(
+            matches!(&cmd, Some(AgentCommand::ParkBackupPartialWorld { path, .. }) if path == "worlds_local/Alpha.db"),
+            "held for the world file"
+        );
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 1, "only the version was asked for: {seen:?}");
+    }
+
     /// H-1: the world was the synced one when the push was decided, and a
     /// chunk the game rewrote in place (same size) since, before the attempt
     /// walked, while the unreadable file stayed locked. The attempt's own walk

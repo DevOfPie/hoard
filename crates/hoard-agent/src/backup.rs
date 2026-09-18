@@ -430,10 +430,30 @@ async fn carry_unreadable_world(
     if client.probed_is_cloud() != Some(false) || client.probed_supports_cas() != Some(true) {
         return Err(held(&in_world));
     }
-    let detail = client
-        .snapshot_detail(save_id, from)
-        .await
-        .with_context(|| format!("reading version {from}'s files to carry its world"))?;
+    let detail = match client.snapshot_detail(save_id, from).await {
+        Ok(detail) => detail,
+        // The version is gone (purged since): there is nothing to carry the
+        // file from, which is a held world like any other, not a failure to
+        // retry as one (L-6).
+        Err(e)
+            if e.chain().any(|c| {
+                matches!(
+                    c.downcast_ref::<crate::api::ApiError>(),
+                    Some(crate::api::ApiError::NotFound)
+                )
+            }) =>
+        {
+            tracing::info!(
+                save_id,
+                version = from,
+                "upload: the synced version is gone from the server; nothing to carry the world's unreadable files from"
+            );
+            return Err(held(&in_world));
+        }
+        Err(e) => {
+            return Err(e.context(format!("reading version {from}'s files to carry its world")))
+        }
+    };
     let mut carried = Vec::with_capacity(in_world.len());
     for u in &in_world {
         let entry = detail
