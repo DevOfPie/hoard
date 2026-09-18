@@ -3772,6 +3772,7 @@ fn spawn_auto_restore(
             shared_manifest,
             true,
             still_quiet.as_ref(),
+            crate::config::CliConfig::state_dir().ok().as_deref(),
         )
         .await
         {
@@ -4158,6 +4159,9 @@ async fn run_auto_restore(
     // game started, or holds a save file open) and nothing is written. `None`
     // for the reconcile of a refused push, which runs where the push did.
     still_quiet: Option<&StillQuiet>,
+    // The state folder (`CliConfig::state_dir`): staging goes under it
+    // ([`staging_root_in`]), and the save's folder is checked against it.
+    state_dir: Option<&Path>,
 ) -> Result<AutoRestorePull> {
     // Prefer the version the cloud_pull poller already learned this tick: it
     // fetched the whole manifest once, so reusing it spares us a per-save
@@ -4256,7 +4260,11 @@ async fn run_auto_restore(
     // user's local files during extraction. The staging dir is empty by
     // construction, so `download_snapshot` extracts into it cleanly even
     // with `force=false`. Cleanup happens in `cleanup_staging` at the end.
-    let staging = staging_dir_for(&save.save_id);
+    // The shape check belongs on the folder this writes into, the save's; the
+    // staging folder is Hoard's own, under the state folder the check refuses
+    // (`crate::restore::download_snapshot`).
+    crate::library::validate_path_shape_in(&save.local_path, state_dir)?;
+    let staging = staging_dir_in(&staging_root_in(state_dir), &save.save_id);
     tokio::fs::create_dir_all(&staging)
         .await
         .with_context(|| format!("creating staging dir {}", staging.display()))?;
@@ -4456,31 +4464,23 @@ pub(crate) type StillQuiet = Arc<dyn Fn() -> bool + Send + Sync>;
 /// filesystem as the conflicts. Not the system temp folder: that is a tmpfs
 /// on many Linux systems (this VM's among them), where a staged version is a
 /// whole save held in RAM, and a small or quota'd one fails the pull (L-7).
-/// The unit tests stage under the temp folder, not the user's state.
 pub(crate) fn staging_root() -> PathBuf {
-    #[cfg(test)]
-    {
-        std::env::temp_dir()
-    }
-    #[cfg(not(test))]
-    {
-        staging_root_in(crate::config::CliConfig::state_dir().ok())
-    }
+    staging_root_in(crate::config::CliConfig::state_dir().ok().as_deref())
 }
 
 /// [`staging_root`] for a state folder: its `staging`, or the temp folder when
 /// there is none to resolve.
-fn staging_root_in(state_dir: Option<PathBuf>) -> PathBuf {
+pub(crate) fn staging_root_in(state_dir: Option<&Path>) -> PathBuf {
     match state_dir {
         Some(dir) => dir.join("staging"),
         None => std::env::temp_dir(),
     }
 }
 
-/// The name every staging folder starts with ([`staging_dir_for`]).
+/// The name every staging folder starts with ([`staging_dir_in`]).
 const STAGING_PREFIX: &str = "hoard-restore-";
 
-/// Removes the staging folders ([`staging_dir_for`]) whose process is gone:
+/// Removes the staging folders ([`staging_dir_in`]) whose process is gone:
 /// a pull or restore killed mid-download leaves a whole version behind. The
 /// folder's name ends in the pid that made it; one of a process still alive
 /// (this one, a CLI or desktop restore running now) is left alone. Run once
@@ -4536,7 +4536,7 @@ fn sweep_stale_staging_in(root: &Path, alive: &dyn Fn(u32) -> bool) -> usize {
 /// the save_id (sanitised to alphanumeric+dash), a counter, and the pid, so
 /// concurrent restores for the same save never collide and a stale one can be
 /// told from a live one ([`sweep_stale_staging`]).
-pub(crate) fn staging_dir_for(save_id: &str) -> PathBuf {
+pub(crate) fn staging_dir_in(root: &Path, save_id: &str) -> PathBuf {
     use std::sync::atomic::{AtomicU64, Ordering};
     static COUNTER: AtomicU64 = AtomicU64::new(0);
     let n = COUNTER.fetch_add(1, Ordering::Relaxed);
@@ -4550,7 +4550,7 @@ pub(crate) fn staging_dir_for(save_id: &str) -> PathBuf {
             }
         })
         .collect();
-    staging_root().join(format!(
+    root.join(format!(
         "{STAGING_PREFIX}{safe_id}-{n}-{}",
         std::process::id()
     ))
@@ -5741,6 +5741,7 @@ async fn run_backup_with_retry(
                         None,
                         false,
                         None,
+                        crate::config::CliConfig::state_dir().ok().as_deref(),
                     )
                     .await
                     {
@@ -9428,11 +9429,11 @@ mod tests {
     #[test]
     fn staging_is_beside_the_conflicts_under_the_state_folder() {
         let state = PathBuf::from("/home/u/.local/share/hoard");
-        let root = staging_root_in(Some(state.clone()));
+        let root = staging_root_in(Some(&state));
         assert_eq!(root, state.join("staging"));
         assert_eq!(root.parent(), state.join("conflicts").parent());
         assert_eq!(staging_root_in(None), std::env::temp_dir());
-        assert!(staging_dir_for("w/1")
+        assert!(staging_dir_in(&root, "w/1")
             .file_name()
             .unwrap()
             .to_string_lossy()
@@ -10588,6 +10589,7 @@ mod tests {
             None,
             true,
             None,
+            Some(&tmp.path().join("state")),
         )
         .await
         .unwrap();
@@ -10648,6 +10650,83 @@ mod tests {
             .collect()
     }
 
+    /// The blocker of the fourth end-to-end run: the daemon's pull stages under
+    /// the state folder's `staging`, as in production, and merges. The shape
+    /// check runs on the save's folder, not on staging (which it refuses).
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_pull_stages_under_the_state_folder_and_merges() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = tmp.path().join("state");
+        let root = &tmp.path().join("save");
+        let v4_dir = &tmp.path().join("v4");
+        let conflict_root = &state.join("conflicts");
+        valheim_generation(root, "Alpha", 6, &["0_0.chunk"]);
+        valheim_generation(v4_dir, "Alpha", 8, &["0_0.chunk"]);
+        let v4 = files_under(v4_dir);
+        let routes = crate::testserver::selfhosted_version("w1", 4, &as_routes_files(&v4)).await;
+        let (url, _) = crate::testserver::serve(move |_| routes).await;
+        let api = ApiClient::new(url, "t").unwrap();
+        let save = member_world(root);
+        let staging_root = staging_root_in(Some(&state));
+        let seen = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let seen_in = seen.clone();
+        let root_in = staging_root.clone();
+        // Asked once the version is staged, right before the merge.
+        let quiet: StillQuiet = Arc::new(move || {
+            let staged = std::fs::read_dir(&root_in)
+                .map(|d| {
+                    d.flatten()
+                        .any(|e| e.file_name().to_string_lossy().starts_with(STAGING_PREFIX))
+                })
+                .unwrap_or(false);
+            seen_in.store(staged, std::sync::atomic::Ordering::Relaxed);
+            true
+        });
+        let pulled = run_auto_restore(
+            &api,
+            &save,
+            Some(conflict_root),
+            Duration::from_secs(14 * 86_400),
+            Some(1),
+            None,
+            None,
+            true,
+            Some(&quiet),
+            Some(&state),
+        )
+        .await
+        .unwrap();
+        let AutoRestorePull::Merged(_) = pulled else {
+            panic!("v4 is ahead of v1: it is merged");
+        };
+        assert!(seen.load(std::sync::atomic::Ordering::Relaxed));
+        assert_eq!(files_under(root), v4);
+        assert!(std::fs::read_dir(&staging_root).unwrap().next().is_none());
+
+        // A save's folder inside the state folder is still refused.
+        let inside = member_world(&state.join("save"));
+        let err = run_auto_restore(
+            &api,
+            &inside,
+            Some(conflict_root),
+            Duration::from_secs(14 * 86_400),
+            Some(1),
+            None,
+            None,
+            true,
+            None,
+            Some(&state),
+        )
+        .await;
+        let Err(err) = err else {
+            panic!("the state folder is Hoard's own");
+        };
+        assert!(
+            format!("{err:#}").contains("Hoard's own data folder"),
+            "{err:#}"
+        );
+    }
+
     /// A game started during the download: the version is staged but not
     /// merged, so nothing is moved aside and nothing is written, and the pull
     /// comes back `Deferred` for the reducer to ask again. Once the folder is
@@ -10683,6 +10762,7 @@ mod tests {
             None,
             true,
             Some(&running),
+            Some(&tmp.path().join("state")),
         )
         .await
         .unwrap();
@@ -10706,6 +10786,7 @@ mod tests {
             None,
             true,
             Some(&quiet),
+            Some(&tmp.path().join("state")),
         )
         .await
         .unwrap();

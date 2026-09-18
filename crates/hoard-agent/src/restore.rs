@@ -436,14 +436,56 @@ pub async fn restore_staged<F>(
 where
     F: Fn(u64, u64) + Send + Sync + 'static,
 {
-    crate::library::validate_path_shape(dest)?;
+    let state_dir = crate::config::CliConfig::state_dir().ok();
+    restore_staged_in(
+        state_dir.as_deref(),
+        client,
+        save_id,
+        version,
+        dest,
+        options,
+        world,
+        conflict_root,
+        on_moving,
+        progress,
+    )
+    .await
+}
+
+/// [`restore_staged`] with the state folder resolved by the caller: staging
+/// goes under its `staging` ([`crate::agent::staging_root_in`]), and `dest`
+/// is checked against it.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn restore_staged_in<F>(
+    state_dir: Option<&Path>,
+    client: &ApiClient,
+    save_id: &str,
+    version: i64,
+    dest: &Path,
+    options: RestoreOptions,
+    world: &[String],
+    conflict_root: &Path,
+    on_moving: impl FnOnce(&Path),
+    progress: F,
+) -> Result<StagedRestore>
+where
+    F: Fn(u64, u64) + Send + Sync + 'static,
+{
+    // The same shape rule as adding, and for the same reason: a restore over
+    // `C:\Users\<x>` or over `~` would dump a snapshot on top of the user's
+    // profile. It matters even more here, because this WRITES, and the path can
+    // come from a `state.json` poisoned by an old detection or from another
+    // machine. The folder may not exist yet (a new machine), so only the shape
+    // is checked. On the live folder: staging is Hoard's own, under the state
+    // folder the rule refuses ([`download_snapshot`]).
+    crate::library::validate_path_shape_in(dest, state_dir)?;
     if dest.is_dir() && std::fs::read_dir(dest)?.next().is_some() && !options.force {
         bail!(
             "destination is not empty: {} (set force = true to extract anyway)",
             dest.display()
         );
     }
-    let staging = crate::agent::staging_dir_for(save_id);
+    let staging = crate::agent::staging_dir_in(&crate::agent::staging_root_in(state_dir), save_id);
     tokio::fs::create_dir_all(&staging)
         .await
         .with_context(|| format!("creating staging dir {}", staging.display()))?;
@@ -640,7 +682,15 @@ pub async fn resolve_version(
 /// `tar.zst`** per snapshot: the server streams the whole archive and there's
 /// no per-file GET to skip, so knowing a file is already on disk saves
 /// nothing. That path is left exactly as it was.
-pub async fn download_snapshot<F>(
+///
+/// `dest` is not shape-checked here: it is a staging folder Hoard made itself
+/// ([`crate::agent::staging_dir_in`]), under the state folder, which the shape
+/// check refuses by design (the fourth end-to-end run's blocker: every pull
+/// and restore failed on it). The check belongs on the folder the staged
+/// version is merged INTO, and both callers ([`restore_staged_in`] and the
+/// engine's pull) run it on the save's folder before downloading. Never pass
+/// a path that came from state or from the user.
+pub(crate) async fn download_snapshot<F>(
     client: &ApiClient,
     save_id: &str,
     version: i64,
@@ -651,13 +701,6 @@ pub async fn download_snapshot<F>(
 where
     F: Fn(u64, u64) + Send + Sync + 'static,
 {
-    // The same shape rule as adding, and for the same reason: a restore over
-    // `C:\Users\<x>` or over `~` would dump a snapshot on top of the user's
-    // profile. It matters even more here, because this WRITES, and the path can
-    // come from a `state.json` poisoned by an old detection or from another
-    // machine. The folder may not exist yet (a new machine), so only the shape is
-    // checked.
-    crate::library::validate_path_shape(dest)?;
     if client.is_cloud().await {
         return download_snapshot_cloud(client, save_id, version, dest, options, progress).await;
     }
@@ -1960,7 +2003,8 @@ mod tests {
         let routes = crate::testserver::selfhosted_version("w1", 4, &version).await;
         let (url, _) = crate::testserver::serve(move |_| routes).await;
         let client = ApiClient::new(url, "t").unwrap();
-        let done = restore_staged(
+        let done = restore_staged_in(
+            Some(&tmp.path().join("state")),
             &client,
             "w1",
             4,
@@ -1990,6 +2034,83 @@ mod tests {
         );
     }
 
+    /// The blocker of the fourth end-to-end run: an explicit restore stages
+    /// under the state folder's `staging`, which the shape check refuses, so
+    /// the check runs on the save's folder and never on staging. Staged there
+    /// for real (seen mid-download), cleaned after, and a save's folder inside
+    /// the state folder is still refused.
+    #[tokio::test]
+    async fn an_explicit_restore_stages_under_the_state_folder() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = tmp.path().join("state");
+        let save = tmp.path().join("save");
+        let conflicts = state.join("conflicts");
+        put(&save, "worlds_local/Alpha/0_0.chunk", b"chunk now");
+        let version: Vec<(&str, &[u8])> = vec![("worlds_local/Alpha/0_0.chunk", b"chunk at v4")];
+        let world = crate::worldfiles::template("valheim", "Alpha")
+            .unwrap()
+            .unwrap();
+        let routes = crate::testserver::selfhosted_version("w1", 4, &version).await;
+        let (url, _) = crate::testserver::serve(move |_| routes).await;
+        let client = ApiClient::new(url, "t").unwrap();
+        let staging_root = crate::agent::staging_root_in(Some(&state));
+        let seen = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let seen_in = seen.clone();
+        let root_in = staging_root.clone();
+        let done = restore_staged_in(
+            Some(&state),
+            &client,
+            "w1",
+            4,
+            &save,
+            RestoreOptions {
+                force: true,
+                ..Default::default()
+            },
+            &world,
+            &conflicts,
+            |_| {},
+            move |_, _| {
+                let staged = std::fs::read_dir(&root_in)
+                    .map(|mut d| d.next().is_some())
+                    .unwrap_or(false);
+                if staged {
+                    seen_in.store(true, std::sync::atomic::Ordering::Relaxed);
+                }
+            },
+        )
+        .await
+        .unwrap();
+        assert!(seen.load(std::sync::atomic::Ordering::Relaxed));
+        assert_eq!(done.replaced_set_aside, 1);
+        assert_eq!(
+            tree(&save).get("worlds_local/Alpha/0_0.chunk").unwrap(),
+            b"chunk at v4"
+        );
+        assert!(std::fs::read_dir(&staging_root).unwrap().next().is_none());
+
+        let inside = state.join("save");
+        let err = restore_staged_in(
+            Some(&state),
+            &client,
+            "w1",
+            4,
+            &inside,
+            RestoreOptions::default(),
+            &world,
+            &conflicts,
+            |_| {},
+            |_, _| {},
+        )
+        .await
+        .expect_err("the state folder is Hoard's own");
+        assert!(
+            format!("{err:#}").contains("Hoard's own data folder"),
+            "{err:#}"
+        );
+        assert!(!inside.exists());
+    }
+
     #[tokio::test]
     async fn a_restore_whose_download_fails_leaves_the_folder_untouched() {
         let tmp = tempfile::tempdir().unwrap();
@@ -2012,12 +2133,14 @@ mod tests {
             .unwrap()
             .unwrap();
         let restore = |url: String| {
+            let state = tmp.path().join("state");
             let save = save.clone();
             let conflicts = conflicts.clone();
             let world = world.clone();
             async move {
                 let client = ApiClient::new(url, "t").unwrap();
-                restore_staged(
+                restore_staged_in(
+                    Some(&state),
                     &client,
                     "w1",
                     4,
