@@ -3051,14 +3051,7 @@ async fn run_agent(
 
             // ----- Filesystem debounce hits -----
             Some(hit) = fs_rx.recv() => {
-                // A side copy's own renames are not writes (`claim::hit_is_side_copy`),
-                // and nor, for this save, is a write its walk never reads.
-                let save_id = match_save_for_path(&slots, &hit.root).filter(|id| {
-                    !slots.get(id).is_some_and(|s| {
-                        crate::claim::hit_is_side_copy(s, TokioInstant::now())
-                            || !hit_reaches_walk(s, &hit.paths)
-                    })
-                });
+                let save_id = save_for_hit(&slots, &hit, TokioInstant::now());
                 if let Some(save_id) = save_id {
                     let now = OffsetDateTime::now_utc();
                     // Per-save preset overrides win over the global config.
@@ -5216,7 +5209,10 @@ pub(crate) struct FsHit {
 
 /// Turns a debounced batch into the hit the loop receives, or `None` when
 /// nothing in it concerns the save. An event with no path stands for the save's
-/// own path, which claims as a write to the world.
+/// own path, which claims as a write to the world. A restore's staged copy
+/// (`*.hoard-restore.tmp`) is never save data (`classify`): made by a merge or
+/// removed by a sweep, it is not a write, and marked as one it deferred the
+/// pull as a game's and took the lease (L-A).
 pub(crate) fn fs_hit(
     watch_root: &Path,
     want_name: Option<&std::ffi::OsStr>,
@@ -5228,6 +5224,11 @@ pub(crate) fn fs_hit(
     let mut paths: Vec<PathBuf> = events
         .iter()
         .filter(|e| want_name.is_none_or(|name| e.path.file_name() == Some(name)))
+        .filter(|e| {
+            !e.path
+                .file_name()
+                .is_some_and(|name| kernel::fileclass::is_restore_tmp(&name.to_string_lossy()))
+        })
         .map(|e| {
             if e.path.as_os_str().is_empty() {
                 watch_root.to_path_buf()
@@ -5288,6 +5289,38 @@ fn build_watcher(
     };
     debouncer.watcher().watch(&watch_target, mode)?;
     Ok(debouncer)
+}
+
+/// The save a watcher hit is a write to, or `None`. A side copy's own renames
+/// are not writes (`claim::hit_is_side_copy`), and nor, for this save, is a
+/// write its walk never reads.
+fn save_for_hit(
+    slots: &HashMap<String, SaveSlot>,
+    hit: &FsHit,
+    now: TokioInstant,
+) -> Option<String> {
+    match_save_for_path(slots, &hit.root).filter(|id| {
+        !slots.get(id).is_some_and(|s| {
+            crate::claim::hit_is_side_copy(s, now) || !hit_reaches_walk(s, &hit.paths)
+        })
+    })
+}
+
+/// A debounced batch on `root`, taken as the loop takes it: turned into a hit
+/// ([`fs_hit`]), matched to its save ([`save_for_hit`]) and marked on it
+/// ([`mark_fs_hit`]). The save it marked, if any.
+#[cfg(test)]
+pub(crate) fn deliver_fs_events(
+    slots: &mut HashMap<String, SaveSlot>,
+    root: &Path,
+    events: &[notify_debouncer_mini::DebouncedEvent],
+    wall: OffsetDateTime,
+    now: TokioInstant,
+) -> Option<String> {
+    let hit = fs_hit(root, None, events)?;
+    let save_id = save_for_hit(slots, &hit, now)?;
+    mark_fs_hit(slots.get_mut(&save_id)?, wall);
+    Some(save_id)
 }
 
 /// Can a watcher hit on `paths` change what this save's backup walks? Always
@@ -11618,6 +11651,56 @@ mod tests {
             "nothing was pushed: {:?}",
             seen.lock().unwrap()
         );
+    }
+
+    /// L-A: a restore's staged copies (`*.hoard-restore.tmp`, any case), made
+    /// by our own merge or removed by a sweep, are not writes: a batch of only
+    /// them marks nothing pending and counts no write. A real file beside them
+    /// still counts.
+    #[tokio::test(start_paused = true)]
+    async fn a_restores_temps_are_not_writes() {
+        use notify_debouncer_mini::{DebouncedEvent, DebouncedEventKind};
+        use std::sync::atomic::Ordering;
+        let root = Path::new("/saves/valheim");
+        let events = |rels: &[&str]| -> Vec<DebouncedEvent> {
+            rels.iter()
+                .map(|r| DebouncedEvent {
+                    path: root.join(r),
+                    kind: DebouncedEventKind::Any,
+                })
+                .collect()
+        };
+        for save in [owner_save(root), member_world(root)] {
+            let mut slots = HashMap::from([("w1".to_string(), test_slot(save))]);
+            let wall = OffsetDateTime::now_utc();
+            let temps = events(&[
+                "worlds_local/Alpha.db.4242.hoard-restore.tmp",
+                "worlds_local/Alpha.fwl.4242.HOARD-RESTORE.TMP",
+                "worlds_local/Alpha.db.hoard-restore.tmp",
+            ]);
+            assert_eq!(
+                deliver_fs_events(&mut slots, root, &temps, wall, TokioInstant::now()),
+                None
+            );
+            let slot = &slots["w1"];
+            assert!(!slot.has_pending);
+            assert_eq!(slot.fs_writes.load(Ordering::Relaxed), 0);
+            assert_eq!(slot.last_fs_event_at, None);
+
+            let mut mixed = temps;
+            mixed.extend(events(&["worlds_local/Alpha.db"]));
+            assert_eq!(
+                fs_hit(root, None, &mixed).unwrap().paths,
+                vec![root.join("worlds_local/Alpha.db")]
+            );
+            assert_eq!(
+                deliver_fs_events(&mut slots, root, &mixed, wall, TokioInstant::now()),
+                Some("w1".to_string())
+            );
+            let slot = &slots["w1"];
+            assert!(slot.has_pending);
+            assert_eq!(slot.fs_writes.load(Ordering::Relaxed), 1);
+        }
     }
 
     /// A member's walk is the shared world, so a write beside it (their own

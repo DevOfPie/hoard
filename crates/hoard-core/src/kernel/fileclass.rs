@@ -363,6 +363,12 @@ impl RestoreGate {
 /// is swept at the save's start and before the next merge.
 pub const RESTORE_TMP_SUFFIX: &str = ".hoard-restore.tmp";
 
+/// Is `path` (a name, or a path whose last part is the name) a restore's
+/// staged copy? The suffix whatever its case, as [`classify`] takes it.
+pub fn is_restore_tmp(path: &str) -> bool {
+    path.to_ascii_lowercase().ends_with(RESTORE_TMP_SUFFIX)
+}
+
 pub fn classify(rel_path: &str, scope: Scope<'_>) -> FileClass {
     // 0. A shared save is its named files and nothing else.
     if !included(scope.include, rel_path) {
@@ -375,7 +381,7 @@ pub fn classify(rel_path: &str, scope: Scope<'_>) -> FileClass {
     // 0b. Hoard's own restore staging, ahead of the shields: a shield ending
     //     in `*` (438 catalog games) would take a crash's leftover for save
     //     data and push it (L-1).
-    if name.ends_with(RESTORE_TMP_SUFFIX) {
+    if is_restore_tmp(name) {
         return FileClass::Junk;
     }
 
