@@ -136,6 +136,11 @@ tokio-tungstenite = { version = "0.24", features = [
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 bytes = "1"
 regex = "1"
+# Version precedence for the update checks (client, desktop, server). Pre-release
+# tags (`1.2.0-1`) have to order below their release and above the one before it,
+# which a hand-rolled `(major, minor, patch)` tuple cannot say. Already in the
+# tree transitively.
+semver = "1"
 strsim = "0.11"
 
 # Process & filesystem watching (Phase 4)

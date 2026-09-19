@@ -25,27 +25,25 @@ pub fn current() -> &'static str {
     env!("CARGO_PKG_VERSION")
 }
 
-/// `(major, minor, patch)` from a version string, tolerant of a leading `v` and
-/// a pre-release/build suffix on the patch (`1.0.4-rc1` → `(1,0,4)`).
-fn parse(v: &str) -> Option<(u64, u64, u64)> {
-    let v = v.trim().trim_start_matches('v');
-    let mut it = v.split('.');
-    let major = it.next()?.trim().parse().ok()?;
-    let minor = it.next()?.trim().parse().ok()?;
-    let patch_raw = it.next().unwrap_or("0");
-    let digits: String = patch_raw
-        .chars()
-        .take_while(|c| c.is_ascii_digit())
-        .collect();
-    let patch = digits.parse().ok()?;
-    Some((major, minor, patch))
+/// A version string as SemVer, tolerant of surrounding whitespace and the tag's
+/// leading `v`. `None` for anything SemVer does not accept (`1.2`, `nightly`).
+///
+/// The pre-release suffix is kept, and it is what this is for: `1.2.0-1` is a
+/// test build *before* `1.2.0`, so an install on it must be offered `1.2.0`
+/// when it ships. Dropping the suffix made the two equal, and a tester stayed
+/// on the pre-release for ever (HRD-F-0031).
+pub fn parse(v: &str) -> Option<semver::Version> {
+    let v = v.trim();
+    semver::Version::parse(v.strip_prefix('v').unwrap_or(v)).ok()
 }
 
-/// True when `candidate` is a strictly newer semver than `base`. Unparseable
-/// input → `false` (never nag on a version we can't compare).
+/// True when `candidate` is strictly newer than `base` by SemVer precedence:
+/// `1.1.7 < 1.2.0-1 < 1.2.0-2 < 1.2.0`. Build metadata (`+…`) is ignored, as
+/// SemVer says. Unparseable input on either side → `false`: never nag, and never
+/// install, on a version we can't compare.
 pub fn is_newer(candidate: &str, base: &str) -> bool {
     match (parse(candidate), parse(base)) {
-        (Some(a), Some(b)) => a > b,
+        (Some(a), Some(b)) => a.cmp_precedence(&b).is_gt(),
         _ => false,
     }
 }
@@ -156,16 +154,38 @@ mod tests {
         assert!(!is_newer("1.0.2", "1.0.3"));
     }
 
+    /// The ordering the pre-release channel stands on:
+    /// `1.1.7 < 1.2.0-1 < 1.2.0-2 < 1.2.0`.
     #[test]
-    fn tolerates_v_prefix_and_prerelease_suffix() {
-        assert_eq!(parse("v1.0.4"), Some((1, 0, 4)));
-        assert_eq!(parse("1.0.4-rc1"), Some((1, 0, 4)));
+    fn prereleases_order_between_their_neighbours() {
+        let chain = ["1.1.7", "1.2.0-1", "1.2.0-2", "1.2.0"];
+        for (i, lower) in chain.iter().enumerate() {
+            for higher in &chain[i + 1..] {
+                assert!(is_newer(higher, lower), "{higher} > {lower}");
+                assert!(!is_newer(lower, higher), "{lower} < {higher}");
+            }
+            assert!(!is_newer(lower, lower), "{lower} is not newer than itself");
+        }
+        // Numeric identifiers compare as numbers, not text.
+        assert!(is_newer("1.2.0-10", "1.2.0-9"));
+        // Build metadata carries no precedence.
+        assert!(!is_newer("1.2.0+build.5", "1.2.0"));
+    }
+
+    #[test]
+    fn tolerates_v_prefix() {
+        assert_eq!(parse("v1.0.4"), parse("1.0.4"));
+        assert!(parse("v1.0.4").is_some());
         assert!(is_newer("v1.0.4", "1.0.3"));
+        assert!(is_newer("v1.2.0", "v1.2.0-2"));
+        assert!(is_newer(" 1.2.0-2 ", "v1.2.0-1"));
     }
 
     #[test]
     fn unparseable_never_nags() {
         assert!(!is_newer("garbage", "1.0.3"));
         assert!(!is_newer("1.0.4", "nightly"));
+        assert!(!is_newer("1.3", "1.2.0"));
+        assert!(!is_newer("", "1.2.0"));
     }
 }

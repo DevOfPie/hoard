@@ -3,10 +3,9 @@
 //! Two independent probes:
 //!
 //! - **Client**: hits `https://api.github.com/repos/DevOfPie/hoard/releases/latest`
-//!   and compares the tag to our compile-time `CARGO_PKG_VERSION`. We treat a
-//!   newer GitHub release as "update available" without parsing semver: a
-//!   simple string inequality is enough since our tags are always
-//!   `vMAJOR.MINOR.PATCH` and tag-sort order matches release order.
+//!   and compares the tag to our compile-time `CARGO_PKG_VERSION` by SemVer
+//!   precedence (`hoard_agent::update::is_newer`), so a pre-release such as
+//!   `1.2.0-1` sits below `1.2.0` and above `1.1.7`.
 //! - **Server**: hits the user's `<server>/v1/health` (anonymous endpoint)
 //!   to read `version`, then compares against the latest known client
 //!   version. Older servers won't have all the bug fixes the client expects
@@ -35,8 +34,8 @@ pub struct ComponentUpdate {
     /// failed, and the UI should fall back to "no update info" rather than
     /// "you're up to date".
     pub latest: Option<String>,
-    /// `true` when `latest` is strictly greater than `current` (string
-    /// compare; works for our `vX.Y.Z` tags).
+    /// `true` when `latest` is strictly greater than `current` by SemVer
+    /// precedence. An unparseable version on either side is never "available".
     pub available: bool,
     /// Human-readable error from the failed probe, for the Logs view.
     /// Never shown to end users on its own.
@@ -310,33 +309,9 @@ async fn fetch_server_health(server_url: &str) -> Result<String, String> {
     Ok(h.version)
 }
 
-/// Lexicographic comparison is good enough for our `MAJOR.MINOR.PATCH` tags
-/// because each component is zero-padded only conceptually: we use the
-/// fact that semver strings up to `9.9.9` sort correctly as long as all
-/// components have the same digit count, which they do for hoard.
-///
-/// For the rare case of crossing 9 to 10 we'd want a real semver parse,
-/// but it's not worth pulling a crate for one comparison; we'll switch
-/// when we ship 1.10.0.
-fn is_newer(candidate: &str, baseline: &str) -> bool {
-    parse_version(candidate) > parse_version(baseline)
-}
-
-/// Cheap `(major, minor, patch)` tuple parser. Returns zeros on failure
-/// so a malformed string is treated as "older than everything"; that's
-/// the safer default for an update prompt: never nag on garbage input.
-fn parse_version(s: &str) -> (u32, u32, u32) {
-    let s = s.trim_start_matches('v');
-    let mut it = s.split('.');
-    let major = it.next().and_then(|x| x.parse().ok()).unwrap_or(0);
-    let minor = it.next().and_then(|x| x.parse().ok()).unwrap_or(0);
-    let patch = it
-        .next()
-        .map(|x| x.split('-').next().unwrap_or(x))
-        .and_then(|x| x.parse().ok())
-        .unwrap_or(0);
-    (major, minor, patch)
-}
+/// SemVer precedence, shared with the service and the CLI: the window must not
+/// disagree with them about whether `1.2.0` is newer than `1.2.0-1`.
+use hoard_agent::update::is_newer;
 
 /// Outcome of `apply_desktop_update`. The UI uses `kind` to decide what to
 /// show: on `installer_launched` we close the app so the OS installer can
@@ -1072,5 +1047,23 @@ mod tests {
     fn tolerates_v_prefix_and_prerelease() {
         assert!(is_newer("v1.3.0", "1.2.5"));
         assert!(is_newer("1.3.0-rc1", "1.2.5"));
+    }
+
+    /// `1.1.7 < 1.2.0-1 < 1.2.0-2 < 1.2.0`: the release beats its own
+    /// pre-releases, which the old `(major, minor, patch)` tuple called equal.
+    #[test]
+    fn prereleases_order_below_their_release() {
+        assert!(is_newer("1.2.0-1", "1.1.7"));
+        assert!(is_newer("1.2.0-2", "1.2.0-1"));
+        assert!(is_newer("1.2.0", "1.2.0-2"));
+        assert!(is_newer("v1.2.0", "1.2.0-1"));
+        assert!(!is_newer("1.2.0-2", "1.2.0"));
+        assert!(!is_newer("1.2.0-1", "1.2.0-1"));
+    }
+
+    #[test]
+    fn unparseable_is_never_newer() {
+        assert!(!is_newer("garbage", "1.2.0"));
+        assert!(!is_newer("1.3.0", "?"));
     }
 }

@@ -21,6 +21,7 @@ import { _ } from "svelte-i18n";
 import { writable, type Writable } from "svelte/store";
 
 import { prefs, updatePrefs } from "./prefs";
+import { semverIsNewer } from "../semver";
 
 export type ComponentUpdate = {
   current: string;
@@ -211,22 +212,9 @@ export function windowIsBehind(
   return semverIsNewer(state.current, windowVersion);
 }
 
-/** Compara `a > b` como semver, tolerando la `v` del tag y un sufijo de
- *  pre-release. Ilegible → `false`: nunca se avisa por algo que no se sabe
- *  comparar. */
-export function semverIsNewer(a: string, b: string): boolean {
-  const parse = (v: string): [number, number, number] | null => {
-    const m = /^v?(\d+)\.(\d+)\.(\d+)/.exec(v.trim());
-    return m ? [Number(m[1]), Number(m[2]), Number(m[3])] : null;
-  };
-  const x = parse(a);
-  const y = parse(b);
-  if (!x || !y) return false;
-  for (let i = 0; i < 3; i++) {
-    if (x[i] !== y[i]) return x[i] > y[i];
-  }
-  return false;
-}
+/** `a > b` by SemVer precedence, in `lib/semver.ts` so it can be tested
+ *  without a window. Re-exported for the components that import it from here. */
+export { semverIsNewer };
 
 /**
  * Result of `apply_desktop_update`. `installer_launched` means we spawned the

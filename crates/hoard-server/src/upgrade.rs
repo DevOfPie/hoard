@@ -297,25 +297,22 @@ async fn extract_binary(tarball: &[u8], dest: &Path) -> Result<()> {
     bail!("tarball did not contain a `hoard-server` binary")
 }
 
-/// Lexicographic semver compare.
+/// True when `latest` is strictly newer than `current` by SemVer precedence
+/// (`1.1.7 < 1.2.0-1 < 1.2.0-2 < 1.2.0`), tolerating the tag's leading `v`.
+///
+/// An unparseable version on either side is **not** newer. This used to treat
+/// any string difference as an upgrade, which would install whatever GitHub
+/// named, older included, as root.
 fn is_newer(latest: &str, current: &str) -> bool {
-    let l = parse_version(latest);
-    let c = parse_version(current);
-    match (l, c) {
-        (Some(l), Some(c)) => l > c,
-        _ => latest != current, // any string difference counts as newer
+    match (parse_version(latest), parse_version(current)) {
+        (Some(l), Some(c)) => l.cmp_precedence(&c).is_gt(),
+        _ => false,
     }
 }
 
-fn parse_version(s: &str) -> Option<(u32, u32, u32)> {
-    let s = s.trim().trim_start_matches('v');
-    let core = s.split(['-', '+']).next()?;
-    let mut it = core.split('.');
-    Some((
-        it.next()?.parse().ok()?,
-        it.next()?.parse().ok()?,
-        it.next()?.parse().ok()?,
-    ))
+fn parse_version(s: &str) -> Option<semver::Version> {
+    let s = s.trim();
+    semver::Version::parse(s.strip_prefix('v').unwrap_or(s)).ok()
 }
 
 #[cfg(test)]
@@ -340,6 +337,26 @@ mod tests {
     fn newer_double_digit() {
         assert!(is_newer("1.10.0", "1.9.0"));
         assert!(is_newer("2.0.0", "1.99.99"));
+    }
+
+    /// `1.1.7 < 1.2.0-1 < 1.2.0-2 < 1.2.0`.
+    #[test]
+    fn prereleases_order_below_their_release() {
+        assert!(is_newer("1.2.0-1", "1.1.7"));
+        assert!(is_newer("1.2.0-2", "1.2.0-1"));
+        assert!(is_newer("1.2.0", "1.2.0-2"));
+        assert!(is_newer("v1.2.0", "1.2.0-1"));
+        assert!(!is_newer("1.2.0-2", "1.2.0"));
+        assert!(!is_newer("1.2.0-1", "1.2.0-1"));
+    }
+
+    /// Unparseable is not newer. Before, any difference was, so a garbled tag
+    /// would have been installed.
+    #[test]
+    fn unparseable_is_not_newer() {
+        assert!(!is_newer("garbage", "1.2.0"));
+        assert!(!is_newer("1.3.0", "dev"));
+        assert!(!is_newer("1.3", "1.2.0"));
     }
 
     #[test]
