@@ -538,7 +538,10 @@ mod tests {
         };
         from_window.keep_external_fields(&on_disk);
         assert!(from_window.prerelease_updates);
-        assert_eq!(from_window.last_update_notified_version.as_deref(), Some("1.2.0"));
+        assert_eq!(
+            from_window.last_update_notified_version.as_deref(),
+            Some("1.2.0")
+        );
     }
 
     #[test]

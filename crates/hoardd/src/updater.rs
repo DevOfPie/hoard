@@ -665,12 +665,7 @@ mod tests {
 
     /// What the cycle decides after checking on `channel`, for a machine
     /// running `current`: the tick's own [`latest_on`] and the real policy.
-    fn decide_on(
-        current: &str,
-        ledger: &Ledger,
-        channel: Channel,
-        now: OffsetDateTime,
-    ) -> Stance {
+    fn decide_on(current: &str, ledger: &Ledger, channel: Channel, now: OffsetDateTime) -> Stance {
         auto::decide(
             now,
             &Situation {
@@ -711,7 +706,10 @@ mod tests {
 
         assert!(check_if_due(&mut ledger, now, Channel::Stable, false, &api).await);
         assert_eq!(ledger.latest_seen.as_deref(), Some("1.1.7"));
-        assert_eq!(decide_on("1.1.7", &ledger, Channel::Stable, now), Stance::Idle);
+        assert_eq!(
+            decide_on("1.1.7", &ledger, Channel::Stable, now),
+            Stance::Idle
+        );
         assert_eq!(*asked.lock().unwrap(), vec![LATEST_PATH.to_string()]);
     }
 
@@ -798,13 +796,21 @@ mod tests {
         let (api, asked) = canned_github(vec![]).await;
         assert!(check_if_due(&mut ledger, now, Channel::Stable, true, &api).await);
         assert_eq!(asked.lock().unwrap().len(), 1, "the switch asked once");
-        assert_eq!(ledger.channel, Channel::Prerelease, "no answer, no switch on record");
+        assert_eq!(
+            ledger.channel,
+            Channel::Prerelease,
+            "no answer, no switch on record"
+        );
         assert_eq!(
             decide_on("1.2.0-1", &ledger, Channel::Stable, now),
             Stance::Idle,
             "the stale pre-release must not be applied"
         );
-        assert_eq!(latest_on(&ledger, Channel::Stable), None, "nor shown to clients");
+        assert_eq!(
+            latest_on(&ledger, Channel::Stable),
+            None,
+            "nor shown to clients"
+        );
 
         // The cycles that follow (every RETRY while something is pending) do not
         // ask again until the backoff has passed.
@@ -815,8 +821,15 @@ mod tests {
         assert_eq!(asked.lock().unwrap().len(), 1, "no retry storm");
         let t = now + time::Duration::minutes(15);
         assert!(check_if_due(&mut ledger, t, Channel::Stable, false, &api).await);
-        assert_eq!(asked.lock().unwrap().len(), 2, "tried again after the backoff");
-        assert_eq!(decide_on("1.2.0-1", &ledger, Channel::Stable, t), Stance::Idle);
+        assert_eq!(
+            asked.lock().unwrap().len(),
+            2,
+            "tried again after the backoff"
+        );
+        assert_eq!(
+            decide_on("1.2.0-1", &ledger, Channel::Stable, t),
+            Stance::Idle
+        );
     }
 
     /// A stable check that keeps failing is spaced out too, not only a switch.

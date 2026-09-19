@@ -1119,18 +1119,36 @@ mod tests {
 
     #[test]
     fn installs_only_the_newer_release_the_user_agreed_to() {
-        assert_eq!(install_verdict("1.2.0", "1.2.0-1", Some("1.2.0")), Verdict::Install);
-        assert_eq!(install_verdict("v1.2.0", "1.2.0-1", Some("1.2.0")), Verdict::Install);
+        assert_eq!(
+            install_verdict("1.2.0", "1.2.0-1", Some("1.2.0")),
+            Verdict::Install
+        );
+        assert_eq!(
+            install_verdict("v1.2.0", "1.2.0-1", Some("1.2.0")),
+            Verdict::Install
+        );
         assert_eq!(install_verdict("1.2.0", "1.2.0-1", None), Verdict::Install);
         // A newer one landed since the modal opened.
-        assert_eq!(install_verdict("1.2.1", "1.2.0-1", Some("1.2.0")), Verdict::Superseded);
+        assert_eq!(
+            install_verdict("1.2.1", "1.2.0-1", Some("1.2.0")),
+            Verdict::Superseded
+        );
         // Opted out with a stale badge: stable is older than what runs.
-        assert_eq!(install_verdict("1.1.7", "1.2.0-1", Some("1.2.0-2")), Verdict::NotNewer);
+        assert_eq!(
+            install_verdict("1.1.7", "1.2.0-1", Some("1.2.0-2")),
+            Verdict::NotNewer
+        );
         assert_eq!(install_verdict("1.1.7", "1.2.0-1", None), Verdict::NotNewer);
         // Same version: a reinstall, not an update.
-        assert_eq!(install_verdict("1.2.0-1", "1.2.0-1", Some("1.2.0-1")), Verdict::NotNewer);
+        assert_eq!(
+            install_verdict("1.2.0-1", "1.2.0-1", Some("1.2.0-1")),
+            Verdict::NotNewer
+        );
         // Newer than this build but older than what the modal promised.
-        assert_eq!(install_verdict("1.2.0-2", "1.2.0-1", Some("1.2.0")), Verdict::Superseded);
+        assert_eq!(
+            install_verdict("1.2.0-2", "1.2.0-1", Some("1.2.0")),
+            Verdict::Superseded
+        );
     }
 
     /// An opted-in client on 1.2.0-2 must not flag a server on the newest
