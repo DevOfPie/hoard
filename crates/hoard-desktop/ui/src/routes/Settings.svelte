@@ -553,7 +553,13 @@
         await updatePrefs({ [field]: value });
       }
     } catch (e) {
-      toastError(typeof e === "string" ? e : (e as Error).message);
+      if (field === "prerelease_updates") {
+        // `set_prerelease_updates` answers an `AppError` ({ title, body,
+        // detail }), which has no `.message`: the error dialog renders it.
+        showError(e);
+      } else {
+        toastError(typeof e === "string" ? e : (e as Error).message);
+      }
     } finally {
       saving = null;
     }
