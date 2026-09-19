@@ -133,7 +133,21 @@ impl Release {
 pub async fn discover(client: &reqwest::Client, api: &str, channel: Channel) -> Result<Release> {
     let api = api.trim_end_matches('/');
     match channel {
-        Channel::Stable => get_json(client, &format!("{api}/repos/{REPO}/releases/latest")).await,
+        Channel::Stable => {
+            let url = format!("{api}/repos/{REPO}/releases/latest");
+            let release: Release = get_json(client, &url).await?;
+            // GitHub's "latest" never names a release flagged as a pre-release,
+            // but the flag and the tag are set by different steps of the release
+            // workflow (HRD-F-0033). A stable machine must not take a test build
+            // because one step ran before the other.
+            if release.prerelease || parse(&release.tag_name).is_some_and(|v| !v.pre.is_empty()) {
+                bail!(
+                    "{url} named {}, a pre-release; the stable channel takes full releases only",
+                    release.tag_name
+                );
+            }
+            Ok(release)
+        }
         Channel::Prerelease => {
             let url = format!("{api}/repos/{REPO}/releases?per_page={LISTED}");
             let listed: Vec<Release> = get_json(client, &url).await?;
@@ -410,6 +424,23 @@ mod tests {
                 .as_deref(),
             Some("1.2.0")
         );
+    }
+
+    /// Insurance for HRD-F-0033: `latest` naming a pre-release tag is refused.
+    #[tokio::test]
+    async fn stable_refuses_a_prerelease_named_latest() {
+        let (api, _) = canned_github(vec![(
+            LATEST_PATH,
+            release_json("v1.2.0-3", false, false).to_string(),
+        )])
+        .await;
+        assert_eq!(fetch_latest_from(&api, Channel::Stable).await, None);
+        let (api, _) = canned_github(vec![(
+            LATEST_PATH,
+            release_json("v1.2.0", true, false).to_string(),
+        )])
+        .await;
+        assert_eq!(fetch_latest_from(&api, Channel::Stable).await, None);
     }
 
     #[tokio::test]
