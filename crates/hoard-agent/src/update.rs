@@ -240,12 +240,15 @@ struct Cache {
     channel: Channel,
 }
 
-fn cache_path() -> Option<std::path::PathBuf> {
-    Some(
-        crate::config::CliConfig::cache_dir()
-            .ok()?
-            .join("update-check.json"),
-    )
+/// One file per channel, so asking for both (the window's server badge wants the
+/// stable answer on a machine that follows pre-releases) does not make them
+/// evict each other. The stable one keeps the name it always had.
+fn cache_path(channel: Channel) -> Option<std::path::PathBuf> {
+    let name = match channel {
+        Channel::Stable => "update-check.json",
+        Channel::Prerelease => "update-check-prerelease.json",
+    };
+    Some(crate::config::CliConfig::cache_dir().ok()?.join(name))
 }
 
 fn now_secs() -> u64 {
@@ -283,7 +286,7 @@ fn write_cache(path: &Path, latest: &str, channel: Channel) {
 /// re-cached. Best-effort: it falls back to a stale cache value (same channel
 /// only) if the refresh fails, or `None` if there's nothing to go on.
 pub async fn cached_latest(channel: Channel) -> Option<String> {
-    match cache_path() {
+    match cache_path(channel) {
         Some(path) => cached_latest_in(&path, GITHUB_API, channel).await,
         None => fetch_latest(channel).await,
     }

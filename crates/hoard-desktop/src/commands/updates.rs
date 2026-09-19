@@ -9,10 +9,10 @@
 //!   (`hoard_agent::update::is_newer`), so a pre-release such as `1.2.0-1` sits
 //!   below `1.2.0` and above `1.1.7`.
 //! - **Server**: hits the user's `<server>/v1/health` (anonymous endpoint)
-//!   to read `version`, then compares against the latest known client
-//!   version. Older servers won't have all the bug fixes the client expects
-//!   (e.g. games-table self-heal landed in 1.3.0), so the UI nudges the user
-//!   to upgrade their server when it falls behind.
+//!   to read `version`, then compares it with the newest full release (the
+//!   stable channel, the only one `hoard-server upgrade` takes), so the UI
+//!   nudges the user to upgrade their server only when there is something it
+//!   can upgrade to.
 //!
 //! Both probes are best-effort: a GitHub outage or a self-hosted server
 //! that's offline must not break Settings. We swallow errors and report
@@ -225,27 +225,43 @@ async fn probe_client() -> ComponentUpdate {
     }
 }
 
+/// The server's badge. A server upgrades only to full releases
+/// (`hoard-server upgrade` has no pre-release channel), so it is compared with
+/// the newest **stable** release, not with this client: on a client that
+/// follows pre-releases the old comparison lit the badge for an upgrade the
+/// server could never take. The stable answer comes through the shared
+/// update-check cache (six hours), so this adds at most one GitHub request per
+/// six hours, and none on a client whose own probe already asked on stable.
 async fn probe_server(url: String) -> ComponentUpdate {
-    // The server's "current" version is what /v1/health reports; the
-    // "latest" we know about is the running client's version (servers
-    // upgrade in lockstep with clients, so any client newer than the
-    // server means the server's behind).
-    match fetch_server_health(&url).await {
-        Ok(server_version) => {
-            let latest = CLIENT_VERSION.to_string();
-            let available = is_newer(&latest, &server_version);
-            ComponentUpdate {
-                current: server_version,
-                latest: Some(latest),
-                available,
-                error: None,
-            }
-        }
+    let (health, newest_stable) = tokio::join!(
+        fetch_server_health(&url),
+        hoard_agent::update::cached_latest(hoard_agent::update::Channel::Stable)
+    );
+    match health {
+        Ok(server_version) => server_component(server_version, newest_stable),
         Err(e) => ComponentUpdate {
             current: "?".to_string(),
             latest: None,
             available: false,
             error: Some(e),
+        },
+    }
+}
+
+/// Pure half of [`probe_server`]: the server against the newest full release.
+fn server_component(server_version: String, newest_stable: Option<String>) -> ComponentUpdate {
+    match newest_stable {
+        Some(latest) => ComponentUpdate {
+            available: is_newer(&latest, &server_version),
+            current: server_version,
+            latest: Some(latest),
+            error: None,
+        },
+        None => ComponentUpdate {
+            current: server_version,
+            latest: None,
+            available: false,
+            error: Some("couldn't learn the newest full release".to_string()),
         },
     }
 }
@@ -1115,5 +1131,21 @@ mod tests {
         assert_eq!(install_verdict("1.2.0-1", "1.2.0-1", Some("1.2.0-1")), Verdict::NotNewer);
         // Newer than this build but older than what the modal promised.
         assert_eq!(install_verdict("1.2.0-2", "1.2.0-1", Some("1.2.0")), Verdict::Superseded);
+    }
+
+    /// An opted-in client on 1.2.0-2 must not flag a server on the newest
+    /// full release: the server has nothing to upgrade to.
+    #[test]
+    fn the_server_is_compared_with_the_newest_full_release() {
+        let up_to_date = server_component("1.1.7".into(), Some("1.1.7".into()));
+        assert!(!up_to_date.available);
+        assert_eq!(up_to_date.latest.as_deref(), Some("1.1.7"));
+
+        let behind = server_component("1.1.6".into(), Some("1.1.7".into()));
+        assert!(behind.available);
+
+        let unknown = server_component("1.1.6".into(), None);
+        assert!(!unknown.available, "no answer is not an upgrade");
+        assert!(unknown.error.is_some());
     }
 }
