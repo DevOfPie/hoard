@@ -305,13 +305,16 @@ async fn tick(
     let burnt = ledger.failures >= MAX_FAILURES;
 
     // The prefs are read every cycle, so switching the update channel needs no
-    // restart; `check_if_due` treats a switch as a check that is due now.
+    // restart; `check_if_due` treats a switch as a check that is due now. The
+    // recheck flag is taken *before* the prefs are read: a client sets it after
+    // writing them, so taken first it can never pair with the old channel and
+    // leave the new one waiting out the backoff.
     let now = OffsetDateTime::now_utc();
+    let forced = updater.take_recheck();
     let prefs = hoard_agent::prefs::Prefs::load_default()
         .map(|(p, _)| p)
         .unwrap_or_default();
     let channel = Channel::from_prerelease(prefs.prerelease_updates);
-    let forced = updater.take_recheck();
     if check_if_due(&mut ledger, now, channel, forced, update::GITHUB_API).await {
         let _ = ledger.save();
     }
