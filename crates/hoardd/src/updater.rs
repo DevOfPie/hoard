@@ -318,23 +318,19 @@ async fn tick(
     if check_if_due(&mut ledger, now, channel, forced, update::GITHUB_API).await {
         let _ = ledger.save();
     }
-    // What the ledger saw on the other channel is no answer on this one.
-    let latest = latest_on(&ledger, channel);
-
-    let situation = Situation {
-        current: update::current().to_string(),
-        latest: latest.clone(),
-        staged: ledger.staged.clone(),
-        first_seen_at: ledger.first_seen_at,
+    let situation = situation_on(
+        &ledger,
+        channel,
+        update::current(),
         unattended,
-        transfer_in_flight: engine.transfers_in_flight(),
-        game_running: game_running(engine).await,
-    };
+        engine.transfers_in_flight(),
+        game_running(engine).await,
+    );
     let stance = auto::decide(now, &situation);
 
     {
         let mut live = updater.lock();
-        live.latest = latest;
+        live.latest.clone_from(&situation.latest);
         live.staged.clone_from(&ledger.staged);
         live.deadline = ledger.deadline();
         live.mandatory = matches!(stance, Stance::Force { .. });
@@ -503,6 +499,29 @@ async fn check_if_due(
     true
 }
 
+/// What [`auto::decide`] is asked about, and (its `latest`) what clients are
+/// shown. The one place the cycle builds it, so the channel masking of
+/// [`latest_on`] cannot be skipped by one caller and kept by another.
+fn situation_on(
+    ledger: &Ledger,
+    channel: Channel,
+    current: &str,
+    unattended: bool,
+    transfer_in_flight: bool,
+    game_running: bool,
+) -> Situation {
+    Situation {
+        current: current.to_string(),
+        // What the ledger saw on the other channel is no answer on this one.
+        latest: latest_on(ledger, channel),
+        staged: ledger.staged.clone(),
+        first_seen_at: ledger.first_seen_at,
+        unattended,
+        transfer_in_flight,
+        game_running,
+    }
+}
+
 /// The newest version the ledger knows **on `channel`**, or `None` when its
 /// answer came from the other one.
 ///
@@ -667,19 +686,11 @@ mod tests {
     }
 
     /// What the cycle decides after checking on `channel`, for a machine
-    /// running `current`: the tick's own [`latest_on`] and the real policy.
+    /// running `current`: the tick's own [`situation_on`] and the real policy.
     fn decide_on(current: &str, ledger: &Ledger, channel: Channel, now: OffsetDateTime) -> Stance {
         auto::decide(
             now,
-            &Situation {
-                current: current.to_string(),
-                latest: latest_on(ledger, channel),
-                staged: ledger.staged.clone(),
-                first_seen_at: ledger.first_seen_at,
-                unattended: true,
-                transfer_in_flight: false,
-                game_running: false,
-            },
+            &situation_on(ledger, channel, current, true, false, false),
         )
     }
 
@@ -810,7 +821,7 @@ mod tests {
             "the stale pre-release must not be applied"
         );
         assert_eq!(
-            latest_on(&ledger, Channel::Stable),
+            situation_on(&ledger, Channel::Stable, "1.2.0-1", true, false, false).latest,
             None,
             "nor shown to clients"
         );
