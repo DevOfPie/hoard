@@ -32,8 +32,8 @@ pub fn get_prefs() -> Result<Prefs, String> {
 /// object so there's nothing to lose, and partial-update semantics tend to
 /// surprise users who edit prefs.json by hand.
 ///
-/// Side-effect: if `prerelease_updates` changed, the service is told to check
-/// for an update now (`Request::RecheckUpdate`).
+/// `prerelease_updates` is kept as it is on disk, whatever the struct says: see
+/// [`Prefs::keep_external_fields`] and [`set_prerelease_updates`].
 ///
 /// Side-effect: if `auto_restore` changed, push the new value into the sync
 /// service's engine (`Request::SetAutoRestore`). The engine applies it to its
@@ -45,6 +45,13 @@ pub fn get_prefs() -> Result<Prefs, String> {
 pub async fn save_prefs(state: State<'_, AppState>, prefs: Prefs) -> Result<Prefs, String> {
     let path = Prefs::default_path().map_err(|e| e.to_string())?;
     let prev = Prefs::load(&path).ok();
+    // The store this came from can be hours old; the update channel is also
+    // written by `hoard config set`, and the window changes it only through
+    // `set_prerelease_updates`.
+    let mut prefs = prefs;
+    if let Some(on_disk) = &prev {
+        prefs.keep_external_fields(on_disk);
+    }
     prefs.save(&path).map_err(|e| e.to_string())?;
 
     let auto_restore_changed = match &prev {
@@ -77,14 +84,30 @@ pub async fn save_prefs(state: State<'_, AppState>, prefs: Prefs) -> Result<Pref
         .await;
     }
 
-    // The update channel. The service reads the preference itself on every
-    // cycle; this only tells it to run one now, so opting in or out shows up
-    // in seconds rather than within the hour. No prior file means the default,
-    // stable, so only a real change is worth a check.
-    let prerelease_changed = prev.as_ref().map_or(prefs.prerelease_updates, |p| {
-        p.prerelease_updates != prefs.prerelease_updates
-    });
-    if prerelease_changed {
+    Ok(prefs)
+}
+
+/// The Settings switch for pre-release updates (HRD-D-0024). Its own command,
+/// not `save_prefs`, because `hoard config set updates.prerelease` writes the
+/// same field: this reads the file, changes that field alone and saves, so
+/// neither writer undoes the other's other settings.
+///
+/// On a change the service is told to check now (`Request::RecheckUpdate`);
+/// it reads the preference itself, so opting in or out shows up in seconds
+/// rather than within the hour.
+#[tauri::command]
+pub async fn set_prerelease_updates(
+    state: State<'_, AppState>,
+    enabled: bool,
+) -> Result<Prefs, AppError> {
+    let path = Prefs::default_path().map_err(|e| AppError::plain(e.to_string()))?;
+    let mut prefs = Prefs::load(&path).map_err(|e| AppError::plain(e.to_string()))?;
+    let changed = prefs.prerelease_updates != enabled;
+    prefs.prerelease_updates = enabled;
+    prefs
+        .save(&path)
+        .map_err(|e| AppError::plain(e.to_string()))?;
+    if changed {
         push_pref(&state, Request::RecheckUpdate).await;
     }
     Ok(prefs)

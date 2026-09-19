@@ -541,15 +541,16 @@
         // stable to run from). `set_autostart` waits for it, so by now the
         // outcome is there to read.
         await refreshServiceAutostart();
+      } else if (field === "prerelease_updates") {
+        // Its own command: `save_prefs` keeps this field as it is on disk,
+        // since the CLI writes it too. The service re-checks when told to; the
+        // window's badge is its own probe, so it asks again on the new channel.
+        prefs.set(await api.setPrereleaseUpdates(value));
+        checkForUpdates().catch((e) =>
+          console.warn("update probe after a channel switch failed:", e),
+        );
       } else {
         await updatePrefs({ [field]: value });
-        // The service re-checks on its own (`save_prefs` tells it to); the
-        // window's badge is its own probe, so it asks again on the new channel.
-        if (field === "prerelease_updates") {
-          checkForUpdates().catch((e) =>
-            console.warn("update probe after a channel switch failed:", e),
-          );
-        }
       }
     } catch (e) {
       toastError(typeof e === "string" ? e : (e as Error).message);

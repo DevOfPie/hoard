@@ -1025,6 +1025,12 @@ export function savePrefs(prefs: Prefs): Promise<Prefs> {
   return invoke<Prefs>("save_prefs", { prefs });
 }
 
+/** The pre-release switch. Its own command: `save_prefs` keeps this field as it
+ *  is on disk, because `hoard config set updates.prerelease` writes it too. */
+export function setPrereleaseUpdates(enabled: boolean): Promise<Prefs> {
+  return invoke<Prefs>("set_prerelease_updates", { enabled });
+}
+
 /** Toggle the sidebar's persisted automatic-mode flag. Returns the
  *  full updated prefs so the caller can hydrate every dependent store with
  *  the cascaded value (activation also flips `auto_restore` to true). The

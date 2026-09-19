@@ -89,7 +89,8 @@ pub async fn run(cmd: ConfigCommand) -> Result<()> {
 async fn set_prerelease(value: &str) -> Result<()> {
     let enabled = parse_bool(value)
         .ok_or_else(|| anyhow::anyhow!("updates.prerelease takes true or false, not {value:?}"))?;
-    let (mut prefs, path) = Prefs::load_default()?;
+    let path = Prefs::default_path()?;
+    let mut prefs = Prefs::load_strict(&path)?;
     let changed = prefs.prerelease_updates != enabled;
     prefs.prerelease_updates = enabled;
     prefs.save(&path)?;

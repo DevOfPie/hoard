@@ -389,6 +389,43 @@ impl Prefs {
         }
     }
 
+    /// Like [`Self::load`], but a file that is there and does not parse is an
+    /// error instead of defaults. For a writer that changes one field and saves
+    /// the rest back (`hoard config set`): with the lenient load, a corrupt file
+    /// would be replaced by defaults plus that one field, wiping every other
+    /// choice the user made. Missing or empty (a crash mid-write) is defaults,
+    /// since there is nothing to lose.
+    pub fn load_strict(path: &Path) -> Result<Self> {
+        if !path.exists() {
+            return Ok(Self::default());
+        }
+        let text =
+            std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+        if text.trim().is_empty() {
+            return Ok(Self::default());
+        }
+        serde_json::from_str(&text).with_context(|| {
+            format!(
+                "{} is not valid preferences; fix or remove it before changing a setting",
+                path.display()
+            )
+        })
+    }
+
+    /// Carries over the fields a program other than the desktop writes, from
+    /// what is on disk into a full struct the window is about to save.
+    ///
+    /// The window saves prefs wholesale from a store that can be hours old (a
+    /// window left in the tray), so a field the CLI changed meanwhile would be
+    /// put back by any unrelated save, an automatic
+    /// `last_update_notified_version` write included. Today the only such
+    /// field is [`Self::prerelease_updates`] (`hoard config set
+    /// updates.prerelease`); the window changes it through its own command,
+    /// which reads the file first.
+    pub fn keep_external_fields(&mut self, on_disk: &Prefs) {
+        self.prerelease_updates = on_disk.prerelease_updates;
+    }
+
     /// Convenience that picks the standard path automatically.
     pub fn load_default() -> Result<(Self, PathBuf)> {
         let path = Self::default_path()?;
@@ -486,6 +523,34 @@ mod tests {
         assert_eq!(p.data_saving, 0.3);
         // 1.2.0-1: full releases only, unless the user opts in (HRD-D-0024).
         assert!(!p.prerelease_updates);
+    }
+
+    /// A stale window saving its whole struct keeps what the CLI wrote.
+    #[test]
+    fn a_wholesale_save_keeps_the_cli_owned_field() {
+        let on_disk = Prefs {
+            prerelease_updates: true,
+            ..Prefs::default()
+        };
+        let mut from_window = Prefs {
+            last_update_notified_version: Some("1.2.0".into()),
+            ..Prefs::default()
+        };
+        from_window.keep_external_fields(&on_disk);
+        assert!(from_window.prerelease_updates);
+        assert_eq!(from_window.last_update_notified_version.as_deref(), Some("1.2.0"));
+    }
+
+    #[test]
+    fn a_strict_load_refuses_a_corrupt_file_but_not_an_empty_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("prefs.json");
+        assert!(Prefs::load_strict(&path).is_ok(), "missing is defaults");
+        std::fs::write(&path, "").unwrap();
+        assert!(Prefs::load_strict(&path).is_ok(), "empty is defaults");
+        std::fs::write(&path, "{ \"close_to_tray\": fal").unwrap();
+        assert!(Prefs::load_strict(&path).is_err(), "corrupt is an error");
+        assert!(Prefs::load(&path).is_ok(), "the lenient load still resets");
     }
 
     /// A prefs file written before the pre-release switch existed keeps full
