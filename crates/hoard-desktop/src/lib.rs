@@ -303,6 +303,7 @@ pub fn run() {
             commands::groups::list_worlds,
             commands::prefs::get_prefs,
             commands::prefs::save_prefs,
+            commands::prefs::set_prerelease_updates,
             commands::prefs::set_autostart,
             commands::prefs::is_autostart_enabled,
             commands::prefs::service_autostart_state,

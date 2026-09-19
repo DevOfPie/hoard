@@ -72,6 +72,7 @@ tokio-util = { workspace = true }
 futures = { workspace = true }
 bytes = { workspace = true }
 reqwest = { workspace = true }
+semver = { workspace = true }
 # Object-safe async trait for the `BlobStore` abstraction (local disk vs S3).
 # Already in the tree transitively (aws-sdk-s3, sqlx); naming it directly just
 # lets us derive `#[async_trait]` on our own trait.

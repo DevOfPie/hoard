@@ -45,6 +45,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   rows say who hosts each world, their menu releases it or takes over a lease
   nobody has pushed under, and a session that could not push ends in a side
   copy with a notice that opens it.
+- **A client can opt into pre-releases.** Clients keep taking full releases
+  by default. Turning on *Pre-release updates* in Settings > About, or
+  running `hoard config set updates.prerelease true`, lets this machine update
+  to test builds such as `1.2.0-1` too, so a tester stays matched with a demo
+  server that runs them. The service, `hoard upgrade`, the status panel and
+  the app's own check all follow the switch, and a running service checks
+  again the moment it changes. Turning it off does not downgrade: the machine
+  stays on its pre-release until a newer full release ships, and the full
+  release always beats its own pre-releases. `hoard-server upgrade` has no
+  such switch and takes full releases only.
+
+### Fixed
+- **A pre-release is no longer the same version as its release.** Every
+  version check (the service, the CLI, the app, the server's `upgrade`)
+  dropped the pre-release suffix, so `1.2.0-1` and `1.2.0` compared equal and
+  a machine on the pre-release would never have been offered the release. They
+  now compare by SemVer precedence (`1.1.7 < 1.2.0-1 < 1.2.0-2 < 1.2.0`), and
+  a version that cannot be parsed is never treated as newer; the server used
+  to upgrade on any difference.
 
 ## [1.1.7] - 2026-09-13
 

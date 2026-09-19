@@ -50,6 +50,8 @@ pub mod state;
 pub mod steam;
 pub mod supervisor;
 pub mod telemetry;
+#[cfg(any(test, feature = "test-support"))]
+pub mod testing;
 pub mod tls;
 pub mod update;
 pub mod wine_prefixes;

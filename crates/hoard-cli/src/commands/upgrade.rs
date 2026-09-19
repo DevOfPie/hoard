@@ -53,8 +53,14 @@ pub async fn run(version: Option<String>) -> Result<()> {
         return through_the_service(current, state).await;
     }
 
-    println!("hoard {current} — checking for updates…");
-    match update::fetch_latest().await {
+    let channel = update::Channel::from_prefs();
+    match channel {
+        update::Channel::Stable => println!("hoard {current} — checking for updates…"),
+        update::Channel::Prerelease => {
+            println!("hoard {current} — checking for updates (pre-releases included)…")
+        }
+    }
+    match update::fetch_latest(channel).await {
         Some(latest) if update::is_newer(&latest, current) => {
             println!("new version available: {latest}\n");
             install(Some(&latest)).await
@@ -75,6 +81,11 @@ pub async fn run(version: Option<String>) -> Result<()> {
     }
 }
 
+/// A pre-release offered to a machine on the stable channel: not ours to apply.
+fn off_channel(channel: update::Channel, latest: &str) -> bool {
+    channel == update::Channel::Stable && update::parse(latest).is_some_and(|v| !v.pre.is_empty())
+}
+
 /// The normal path: the service already knows what there is and has it
 /// downloaded.
 async fn through_the_service(current: &str, state: UpdateState) -> Result<()> {
@@ -84,6 +95,14 @@ async fn through_the_service(current: &str, state: UpdateState) -> Result<()> {
     };
     if !update::is_newer(&latest, current) {
         println!("hoard {current} — already up to date.");
+        return Ok(());
+    }
+    // A service older than the channel switch, or one whose last answer came
+    // from the pre-release channel, can still name a test build. Opted out, it
+    // is not ours to apply.
+    if off_channel(update::Channel::from_prefs(), &latest) {
+        println!("hoard {current} — {latest} is a pre-release and this machine takes full");
+        println!("releases only; the service will offer the next full release when it ships.");
         return Ok(());
     }
 
@@ -256,9 +275,11 @@ async fn upgrade_desktop_only(manifest: &Manifest, version: Option<&str>) -> Res
     }
     let target = match version {
         Some(v) => v.trim_start_matches('v').to_string(),
-        None => update::fetch_latest().await.ok_or_else(|| {
-            anyhow::anyhow!("couldn't reach GitHub to resolve the latest version")
-        })?,
+        None => update::fetch_latest(update::Channel::from_prefs())
+            .await
+            .ok_or_else(|| {
+                anyhow::anyhow!("couldn't reach GitHub to resolve the latest version")
+            })?,
     };
     crate::commands::install::run(crate::commands::install::Want::Detect, Some(target)).await
 }
@@ -306,4 +327,17 @@ fn missing_tool_hint() -> String {
 #[cfg(not(unix))]
 fn missing_tool_hint() -> String {
     format!("`powershell` not found — can't run the installer. Install manually from {BASE}/cli.")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_stable_machine_does_not_apply_a_prerelease_from_the_service() {
+        use hoard_agent::update::Channel;
+        assert!(off_channel(Channel::Stable, "1.2.0-2"));
+        assert!(!off_channel(Channel::Stable, "1.2.0"));
+        assert!(!off_channel(Channel::Prerelease, "1.2.0-2"));
+    }
 }

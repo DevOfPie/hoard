@@ -34,6 +34,7 @@
     ServerCog,
     Gamepad2,
     ZoomIn,
+    FlaskConical,
   } from "@lucide/svelte";
 
   import Card from "../lib/components/Card.svelte";
@@ -540,11 +541,25 @@
         // stable to run from). `set_autostart` waits for it, so by now the
         // outcome is there to read.
         await refreshServiceAutostart();
+      } else if (field === "prerelease_updates") {
+        // Its own command: `save_prefs` keeps this field as it is on disk,
+        // since the CLI writes it too. The service re-checks when told to; the
+        // window's badge is its own probe, so it asks again on the new channel.
+        prefs.set(await api.setPrereleaseUpdates(value));
+        checkForUpdates().catch((e) =>
+          console.warn("update probe after a channel switch failed:", e),
+        );
       } else {
         await updatePrefs({ [field]: value });
       }
     } catch (e) {
-      toastError(typeof e === "string" ? e : (e as Error).message);
+      if (field === "prerelease_updates") {
+        // `set_prerelease_updates` answers an `AppError` ({ title, body,
+        // detail }), which has no `.message`: the error dialog renders it.
+        showError(e);
+      } else {
+        toastError(typeof e === "string" ? e : (e as Error).message);
+      }
     } finally {
       saving = null;
     }
@@ -644,6 +659,17 @@
       description: $_("settings.wrapple_telemetry_desc"),
       icon: Clock,
       alarmWhenOff: true,
+    },
+  ]);
+
+  // Opt-in to pre-releases (HRD-D-0024). Lives in About, next to the version it
+  // changes: a tester matched with a demo server that runs test builds.
+  const updateRows: Row[] = $derived([
+    {
+      field: "prerelease_updates",
+      label: $_("settings.prerelease_updates_label"),
+      description: $_("settings.prerelease_updates_desc"),
+      icon: FlaskConical,
     },
   ]);
 
@@ -1595,6 +1621,16 @@
                 {$_("settings.about_catalog_credit")}
               </p>
             </div>
+          </div>
+          <div class="mt-4 border-t border-white/[0.06] pt-4">
+            {#each updateRows as row (row.field)}
+              <SettingsRow
+                {row}
+                value={$prefs[row.field] as boolean}
+                disabled={saving === row.field}
+                onChange={(v) => toggle(row.field, v)}
+              />
+            {/each}
           </div>
         </Card>
       </section>

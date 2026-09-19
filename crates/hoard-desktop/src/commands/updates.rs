@@ -2,16 +2,17 @@
 //!
 //! Two independent probes:
 //!
-//! - **Client**: hits `https://api.github.com/repos/DevOfPie/hoard/releases/latest`
-//!   and compares the tag to our compile-time `CARGO_PKG_VERSION`. We treat a
-//!   newer GitHub release as "update available" without parsing semver: a
-//!   simple string inequality is enough since our tags are always
-//!   `vMAJOR.MINOR.PATCH` and tag-sort order matches release order.
+//! - **Client**: asks GitHub for the newest release on the user's update
+//!   channel (`hoard_agent::update::discover`: the "latest release" by default,
+//!   the highest pre-release or release when they opted in) and compares it to
+//!   our compile-time `CARGO_PKG_VERSION` by SemVer precedence
+//!   (`hoard_agent::update::is_newer`), so a pre-release such as `1.2.0-1` sits
+//!   below `1.2.0` and above `1.1.7`.
 //! - **Server**: hits the user's `<server>/v1/health` (anonymous endpoint)
-//!   to read `version`, then compares against the latest known client
-//!   version. Older servers won't have all the bug fixes the client expects
-//!   (e.g. games-table self-heal landed in 1.3.0), so the UI nudges the user
-//!   to upgrade their server when it falls behind.
+//!   to read `version`, then compares it with the newest full release (the
+//!   stable channel, the only one `hoard-server upgrade` takes), so the UI
+//!   nudges the user to upgrade their server only when there is something it
+//!   can upgrade to.
 //!
 //! Both probes are best-effort: a GitHub outage or a self-hosted server
 //! that's offline must not break Settings. We swallow errors and report
@@ -35,8 +36,8 @@ pub struct ComponentUpdate {
     /// failed, and the UI should fall back to "no update info" rather than
     /// "you're up to date".
     pub latest: Option<String>,
-    /// `true` when `latest` is strictly greater than `current` (string
-    /// compare; works for our `vX.Y.Z` tags).
+    /// `true` when `latest` is strictly greater than `current` by SemVer
+    /// precedence. An unparseable version on either side is never "available".
     pub available: bool,
     /// Human-readable error from the failed probe, for the Logs view.
     /// Never shown to end users on its own.
@@ -51,14 +52,10 @@ pub struct UpdateReport {
     pub server: Option<ComponentUpdate>,
 }
 
-/// GitHub releases API. For `check_for_updates` we only need the tag; for
-/// `apply_desktop_update` we also need to pick the right downloadable asset.
-#[derive(serde::Deserialize)]
-struct GhRelease {
-    tag_name: String,
-    #[serde(default)]
-    assets: Vec<GhAsset>,
-}
+/// A release as discovery returns it. For `check_for_updates` we only need the
+/// tag; for `apply_desktop_update` we also need to pick the right downloadable
+/// asset.
+use hoard_agent::update::Release as GhRelease;
 
 /// The release's files are described by `hoard_agent::install::fetch`: the same
 /// GitHub JSON the terminal reads, and having two structs for it is how two updaters
@@ -72,7 +69,6 @@ struct HealthResp {
 }
 
 const CLIENT_VERSION: &str = env!("CARGO_PKG_VERSION");
-const GH_RELEASES_URL: &str = "https://api.github.com/repos/DevOfPie/hoard/releases/latest";
 const PROBE_TIMEOUT: Duration = Duration::from_secs(8);
 
 /// The result of checking a freshly downloaded installer against the release key.
@@ -229,22 +225,21 @@ async fn probe_client() -> ComponentUpdate {
     }
 }
 
+/// The server's badge. A server upgrades only to full releases
+/// (`hoard-server upgrade` has no pre-release channel), so it is compared with
+/// the newest **stable** release, not with this client: on a client that
+/// follows pre-releases the old comparison lit the badge for an upgrade the
+/// server could never take. The stable answer comes from the CLI's on-disk
+/// update-check cache (six hours), which this refills when it is stale; the
+/// window's own probe neither reads nor writes that cache. So the badge costs
+/// at most one extra GitHub request per six hours.
 async fn probe_server(url: String) -> ComponentUpdate {
-    // The server's "current" version is what /v1/health reports; the
-    // "latest" we know about is the running client's version (servers
-    // upgrade in lockstep with clients, so any client newer than the
-    // server means the server's behind).
-    match fetch_server_health(&url).await {
-        Ok(server_version) => {
-            let latest = CLIENT_VERSION.to_string();
-            let available = is_newer(&latest, &server_version);
-            ComponentUpdate {
-                current: server_version,
-                latest: Some(latest),
-                available,
-                error: None,
-            }
-        }
+    let (health, newest_stable) = tokio::join!(
+        fetch_server_health(&url),
+        hoard_agent::update::cached_latest(hoard_agent::update::Channel::Stable)
+    );
+    match health {
+        Ok(server_version) => server_component(server_version, newest_stable),
         Err(e) => ComponentUpdate {
             current: "?".to_string(),
             latest: None,
@@ -254,42 +249,48 @@ async fn probe_server(url: String) -> ComponentUpdate {
     }
 }
 
+/// Pure half of [`probe_server`]: the server against the newest full release.
+fn server_component(server_version: String, newest_stable: Option<String>) -> ComponentUpdate {
+    match newest_stable {
+        Some(latest) => ComponentUpdate {
+            available: is_newer(&latest, &server_version),
+            current: server_version,
+            latest: Some(latest),
+            error: None,
+        },
+        None => ComponentUpdate {
+            current: server_version,
+            latest: None,
+            available: false,
+            error: Some("couldn't learn the newest full release".to_string()),
+        },
+    }
+}
+
 async fn fetch_gh_latest() -> Result<String, String> {
-    let client = reqwest::Client::builder()
-        .user_agent(concat!("hoard-desktop/", env!("CARGO_PKG_VERSION")))
-        .timeout(PROBE_TIMEOUT)
-        .build()
-        .map_err(|e| e.to_string())?;
-    let resp = client
-        .get(GH_RELEASES_URL)
-        .header("accept", "application/vnd.github+json")
-        .send()
-        .await
-        .map_err(|e| e.to_string())?
-        .error_for_status()
-        .map_err(|e| e.to_string())?;
-    let release: GhRelease = resp.json().await.map_err(|e| e.to_string())?;
-    Ok(release.tag_name)
+    fetch_gh(PROBE_TIMEOUT).await.map(|r| r.tag_name)
 }
 
 /// A full release fetch, used by `apply_desktop_update` to discover the asset
 /// list at install time (we don't cache it because the user might leave the
 /// app open for days between detection and applying).
 async fn fetch_gh_release() -> Result<GhRelease, String> {
+    fetch_gh(Duration::from_secs(20)).await
+}
+
+/// The newest release on the channel the user chose, read from the prefs now so
+/// the switch in Settings applies to the very next probe. The same discovery the
+/// service and the CLI use, so the window cannot offer a version they would not.
+async fn fetch_gh(timeout: Duration) -> Result<GhRelease, String> {
     let client = reqwest::Client::builder()
         .user_agent(concat!("hoard-desktop/", env!("CARGO_PKG_VERSION")))
-        .timeout(Duration::from_secs(20))
+        .timeout(timeout)
         .build()
         .map_err(|e| e.to_string())?;
-    let resp = client
-        .get(GH_RELEASES_URL)
-        .header("accept", "application/vnd.github+json")
-        .send()
+    let channel = hoard_agent::update::Channel::from_prefs();
+    hoard_agent::update::discover(&client, hoard_agent::update::GITHUB_API, channel)
         .await
-        .map_err(|e| e.to_string())?
-        .error_for_status()
-        .map_err(|e| e.to_string())?;
-    resp.json::<GhRelease>().await.map_err(|e| e.to_string())
+        .map_err(|e| format!("{e:#}"))
 }
 
 async fn fetch_server_health(server_url: &str) -> Result<String, String> {
@@ -310,33 +311,9 @@ async fn fetch_server_health(server_url: &str) -> Result<String, String> {
     Ok(h.version)
 }
 
-/// Lexicographic comparison is good enough for our `MAJOR.MINOR.PATCH` tags
-/// because each component is zero-padded only conceptually: we use the
-/// fact that semver strings up to `9.9.9` sort correctly as long as all
-/// components have the same digit count, which they do for hoard.
-///
-/// For the rare case of crossing 9 to 10 we'd want a real semver parse,
-/// but it's not worth pulling a crate for one comparison; we'll switch
-/// when we ship 1.10.0.
-fn is_newer(candidate: &str, baseline: &str) -> bool {
-    parse_version(candidate) > parse_version(baseline)
-}
-
-/// Cheap `(major, minor, patch)` tuple parser. Returns zeros on failure
-/// so a malformed string is treated as "older than everything"; that's
-/// the safer default for an update prompt: never nag on garbage input.
-fn parse_version(s: &str) -> (u32, u32, u32) {
-    let s = s.trim_start_matches('v');
-    let mut it = s.split('.');
-    let major = it.next().and_then(|x| x.parse().ok()).unwrap_or(0);
-    let minor = it.next().and_then(|x| x.parse().ok()).unwrap_or(0);
-    let patch = it
-        .next()
-        .map(|x| x.split('-').next().unwrap_or(x))
-        .and_then(|x| x.parse().ok())
-        .unwrap_or(0);
-    (major, minor, patch)
-}
+/// SemVer precedence, shared with the service and the CLI: the window must not
+/// disagree with them about whether `1.2.0` is newer than `1.2.0-1`.
+use hoard_agent::update::is_newer;
 
 /// Outcome of `apply_desktop_update`. The UI uses `kind` to decide what to
 /// show: on `installer_launched` we close the app so the OS installer can
@@ -356,6 +333,42 @@ pub enum ApplyOutcome {
     /// UI can refresh and re-offer it. Never install an older build than what
     /// GitHub currently calls "latest".
     Superseded { latest: String },
+}
+
+/// What to do with the release fetched at confirm time.
+#[derive(Debug, PartialEq, Eq)]
+enum Verdict {
+    /// Newer than this build, and the version the user agreed to.
+    Install,
+    /// Newer than this build, but not the version the modal showed: re-offer.
+    Superseded,
+    /// Not newer than this build. Installing it would be a downgrade or a
+    /// reinstall; this happens after opting out of pre-releases with a badge
+    /// still showing one.
+    NotNewer,
+}
+
+/// Pure so it can be tested without Tauri. `expected` is the version the modal
+/// showed; `None` from an older UI means "whatever is newest", which is still
+/// never older than what runs.
+fn install_verdict(fetched: &str, current: &str, expected: Option<&str>) -> Verdict {
+    if !is_newer(fetched, current) {
+        return Verdict::NotNewer;
+    }
+    let agreed = expected.is_none_or(|e| {
+        matches!(
+            (
+                hoard_agent::update::parse(fetched),
+                hoard_agent::update::parse(e),
+            ),
+            (Some(a), Some(b)) if a.cmp_precedence(&b).is_eq()
+        )
+    });
+    if agreed {
+        Verdict::Install
+    } else {
+        Verdict::Superseded
+    }
 }
 
 /// Tauri command. Downloads the right release asset for this OS and tries to
@@ -378,19 +391,32 @@ pub async fn apply_desktop_update(
     })?;
     let version = release.tag_name.trim_start_matches('v').to_string();
 
-    // Re-check at confirm time: if a newer release landed since the modal was
-    // painted (the badge can be up to 30 min stale, or the user sat on the
-    // dialog), don't silently install the version they *saw*: bail and tell
-    // the UI to re-offer the now-latest one. `is_newer` is strict, so this
-    // only triggers on a genuinely newer tag, not on an equal re-check.
-    if let Some(expected) = expected_version {
-        if is_newer(&version, &expected) {
+    // Re-check at confirm time against what is running and what the modal
+    // showed. The badge can be stale (up to 30 min, or longer if the user sat
+    // on the dialog, or switched the update channel in between), so the release
+    // fetched now is installed only when it is both newer than this build and
+    // the one the user agreed to.
+    match install_verdict(&version, CLIENT_VERSION, expected_version.as_deref()) {
+        Verdict::Install => {}
+        Verdict::Superseded => {
             tracing::info!(
-                expected = %expected,
+                expected = ?expected_version,
                 latest = %version,
-                "apply_desktop_update: newer release appeared, aborting stale install"
+                "apply_desktop_update: a different release is current now, aborting stale install"
             );
             return Ok(ApplyOutcome::Superseded { latest: version });
+        }
+        Verdict::NotNewer => {
+            tracing::info!(
+                current = CLIENT_VERSION,
+                latest = %version,
+                "apply_desktop_update: the current release is not newer than this build, refusing"
+            );
+            return Err(
+                AppError::new("updates.error.title", "updates.error.not_newer").with_detail(
+                    format!("running v{CLIENT_VERSION}, the current release is v{version}"),
+                ),
+            );
         }
     }
 
@@ -1072,5 +1098,73 @@ mod tests {
     fn tolerates_v_prefix_and_prerelease() {
         assert!(is_newer("v1.3.0", "1.2.5"));
         assert!(is_newer("1.3.0-rc1", "1.2.5"));
+    }
+
+    /// `1.1.7 < 1.2.0-1 < 1.2.0-2 < 1.2.0`: the release beats its own
+    /// pre-releases, which the old `(major, minor, patch)` tuple called equal.
+    #[test]
+    fn prereleases_order_below_their_release() {
+        assert!(is_newer("1.2.0-1", "1.1.7"));
+        assert!(is_newer("1.2.0-2", "1.2.0-1"));
+        assert!(is_newer("1.2.0", "1.2.0-2"));
+        assert!(is_newer("v1.2.0", "1.2.0-1"));
+        assert!(!is_newer("1.2.0-2", "1.2.0"));
+        assert!(!is_newer("1.2.0-1", "1.2.0-1"));
+    }
+
+    #[test]
+    fn unparseable_is_never_newer() {
+        assert!(!is_newer("garbage", "1.2.0"));
+        assert!(!is_newer("1.3.0", "?"));
+    }
+
+    #[test]
+    fn installs_only_the_newer_release_the_user_agreed_to() {
+        assert_eq!(
+            install_verdict("1.2.0", "1.2.0-1", Some("1.2.0")),
+            Verdict::Install
+        );
+        assert_eq!(
+            install_verdict("v1.2.0", "1.2.0-1", Some("1.2.0")),
+            Verdict::Install
+        );
+        assert_eq!(install_verdict("1.2.0", "1.2.0-1", None), Verdict::Install);
+        // A newer one landed since the modal opened.
+        assert_eq!(
+            install_verdict("1.2.1", "1.2.0-1", Some("1.2.0")),
+            Verdict::Superseded
+        );
+        // Opted out with a stale badge: stable is older than what runs.
+        assert_eq!(
+            install_verdict("1.1.7", "1.2.0-1", Some("1.2.0-2")),
+            Verdict::NotNewer
+        );
+        assert_eq!(install_verdict("1.1.7", "1.2.0-1", None), Verdict::NotNewer);
+        // Same version: a reinstall, not an update.
+        assert_eq!(
+            install_verdict("1.2.0-1", "1.2.0-1", Some("1.2.0-1")),
+            Verdict::NotNewer
+        );
+        // Newer than this build but older than what the modal promised.
+        assert_eq!(
+            install_verdict("1.2.0-2", "1.2.0-1", Some("1.2.0")),
+            Verdict::Superseded
+        );
+    }
+
+    /// An opted-in client on 1.2.0-2 must not flag a server on the newest
+    /// full release: the server has nothing to upgrade to.
+    #[test]
+    fn the_server_is_compared_with_the_newest_full_release() {
+        let up_to_date = server_component("1.1.7".into(), Some("1.1.7".into()));
+        assert!(!up_to_date.available);
+        assert_eq!(up_to_date.latest.as_deref(), Some("1.1.7"));
+
+        let behind = server_component("1.1.6".into(), Some("1.1.7".into()));
+        assert!(behind.available);
+
+        let unknown = server_component("1.1.6".into(), None);
+        assert!(!unknown.available, "no answer is not an upgrade");
+        assert!(unknown.error.is_some());
     }
 }

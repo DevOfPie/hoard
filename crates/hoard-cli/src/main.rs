@@ -431,7 +431,7 @@ async fn dispatch(cli: Cli) -> Result<()> {
         Commands::Status => commands::status::run().await,
         Commands::Devices => commands::devices::run().await,
         Commands::Doctor => commands::doctor::run().await,
-        Commands::Config { action } => commands::config::run(action),
+        Commands::Config { action } => commands::config::run(action).await,
         Commands::Login {
             token,
             server,

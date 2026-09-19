@@ -512,6 +512,13 @@ impl Daemon {
                 self.updater.snooze(hours);
                 Reply::Ok(Payload::Update(self.updater.state()))
             }
+            // The update channel changed. The updater re-reads the preference on
+            // its next cycle; this only makes that cycle happen now.
+            Request::RecheckUpdate => {
+                tracing::info!("hoardd: a client changed the update channel, checking now");
+                self.updater.recheck();
+                Reply::Ok(Payload::Update(self.updater.state()))
+            }
             // A request from a client newer than this service. It is answered, not
             // hung up on: the client has just updated and we are seconds from being
             // relieved.

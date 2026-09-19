@@ -76,6 +76,13 @@ In game mode there is nothing to keep open: the engine runs as a background
 service that starts with your session, so your saves sync with no window and no
 terminal.
 
+Updates follow full releases. To test builds before they ship, turn on
+*Pre-release updates* in Settings > About, or run `hoard config set
+updates.prerelease true`: the machine then also updates to pre-releases such as
+`1.2.0-1`. Turning it back off never downgrades; you stay on the pre-release
+until a newer full release ships. The server (`hoard-server upgrade`) takes full
+releases only.
+
 Prefer the terminal, or running on a headless box (NAS / server / Steam Deck)?
 Add `--headless` and it never fetches the app. Everything ships as standalone
 binaries with no GUI deps.

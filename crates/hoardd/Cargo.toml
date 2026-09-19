@@ -68,4 +68,5 @@ windows-sys = { version = "0.59", features = [
 ] }
 
 [dev-dependencies]
+hoard-agent = { path = "../hoard-agent", features = ["test-support"] }
 tempfile = { workspace = true }

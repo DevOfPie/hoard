@@ -10,6 +10,12 @@ description = "Shared client logic for the Hoard CLI and desktop app"
 name = "hoard_agent"
 path = "src/lib.rs"
 
+[features]
+# `hoard_agent::testing`: a canned GitHub server and release fixtures, for the
+# update tests of the crates above this one. Enabled only from their
+# `[dev-dependencies]`, so no production build carries it.
+test-support = []
+
 [dependencies]
 hoard-core = { path = "../hoard-core" }
 hoard-manifest = { path = "../hoard-manifest" }
@@ -23,6 +29,7 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 anyhow = { workspace = true }
 thiserror = { workspace = true }
+semver = { workspace = true }
 time = { workspace = true }
 directories = { workspace = true }
 async-compression = { workspace = true }

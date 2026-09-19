@@ -249,6 +249,16 @@ pub struct Ledger {
     pub last_error: Option<String>,
     #[serde(default)]
     pub failures: u32,
+    /// The update channel `latest_seen` was fetched on. When the user switches,
+    /// the next cycle checks at once instead of waiting out the hour. A ledger
+    /// from before channels existed reads as stable, which is what it was.
+    #[serde(default)]
+    pub channel: crate::update::Channel,
+    /// The last time GitHub was asked, answer or not. `last_check_at` moves
+    /// only on an answer; this is what spaces out the retries of a check that
+    /// keeps failing.
+    #[serde(default, with = "time::serde::rfc3339::option")]
+    pub last_attempt_at: Option<OffsetDateTime>,
 }
 
 impl Ledger {

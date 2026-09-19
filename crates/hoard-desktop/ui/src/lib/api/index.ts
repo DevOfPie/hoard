@@ -975,6 +975,11 @@ export type Prefs = {
    *  both the client's min-snapshot-interval and the server's retention policy.
    *  Default 0.3. */
   data_saving: number;
+  /** When `true`, this machine also updates to pre-releases (`1.2.0-1`), test
+   *  builds for staying matched with a demo server that runs them. Off by
+   *  default. Turning it off never downgrades: a pre-release stays until a
+   *  newer full release ships. */
+  prerelease_updates: boolean;
 };
 
 /** The single user-facing operating mode. Mirrors `hoard_agent::prefs::SyncMode`.
@@ -1018,6 +1023,12 @@ export function uiLog(topic: string, message: string): Promise<void> {
 /** Persist prefs. Returns the saved object so the caller can hydrate stores. */
 export function savePrefs(prefs: Prefs): Promise<Prefs> {
   return invoke<Prefs>("save_prefs", { prefs });
+}
+
+/** The pre-release switch. Its own command: `save_prefs` keeps this field as it
+ *  is on disk, because `hoard config set updates.prerelease` writes it too. */
+export function setPrereleaseUpdates(enabled: boolean): Promise<Prefs> {
+  return invoke<Prefs>("set_prerelease_updates", { enabled });
 }
 
 /** Toggle the sidebar's persisted automatic-mode flag. Returns the
