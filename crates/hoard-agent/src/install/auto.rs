@@ -254,6 +254,11 @@ pub struct Ledger {
     /// from before channels existed reads as stable, which is what it was.
     #[serde(default)]
     pub channel: crate::update::Channel,
+    /// The last time GitHub was asked, answer or not. `last_check_at` moves
+    /// only on an answer; this is what spaces out the retries of a check that
+    /// keeps failing.
+    #[serde(default, with = "time::serde::rfc3339::option")]
+    pub last_attempt_at: Option<OffsetDateTime>,
 }
 
 impl Ledger {

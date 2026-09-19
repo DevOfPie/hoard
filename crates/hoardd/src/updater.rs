@@ -64,6 +64,15 @@ const WARMUP: Duration = Duration::from_secs(90);
 /// retrying since July) written all over again.
 const MAX_FAILURES: u32 = 5;
 
+/// How long a **failed** version check waits before it is tried again.
+///
+/// A check that fails leaves no answer, so without its own clock it stays due
+/// and runs on every cycle, and while something is pending that is every
+/// [`RETRY`] (60 s): more than GitHub's unauthenticated limit of 60 an hour.
+/// Fifteen minutes keeps it at four an hour, and a client that changes the
+/// channel still gets a check at once ([`Updater::recheck`]).
+const CHECK_BACKOFF: Duration = Duration::from_secs(15 * 60);
+
 // ---- what the updater shows
 
 /// The updater's shared view: what [`hoard_core::ipc::Request::UpdateStatus`]
@@ -92,6 +101,10 @@ struct Live {
     last_error: Option<String>,
     /// The version a client asked to apply, waiting for the loop to pick it up.
     requested: Option<Option<String>>,
+    /// A client changed the update channel: the next cycle checks whatever the
+    /// gates say. A flag the loop takes, rather than an edit to the ledger, so
+    /// it cannot race the cycle writing the same file.
+    recheck: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -152,16 +165,16 @@ impl Updater {
     }
 
     /// Check for an update now rather than on the hour: the update channel just
-    /// changed ([`hoard_core::ipc::Request::RecheckUpdate`]). The gate on the
-    /// last check is cleared so the next cycle asks GitHub whatever the channel
-    /// on record, and the loop is woken to run that cycle.
+    /// changed ([`hoard_core::ipc::Request::RecheckUpdate`]). The next cycle
+    /// asks GitHub past both gates (the hour and the failure backoff), and the
+    /// loop is woken to run that cycle.
     pub fn recheck(&self) {
-        let mut ledger = Ledger::load();
-        ledger.last_check_at = None;
-        if let Err(err) = ledger.save() {
-            tracing::warn!(error = %format!("{err:#}"), "hoardd: couldn't clear the update check gate");
-        }
+        self.lock().recheck = true;
         self.poke.notify_one();
+    }
+
+    fn take_recheck(&self) -> bool {
+        std::mem::take(&mut self.lock().recheck)
     }
 
     /// "Not now", for `hours`. It does not move the deadline.
@@ -297,13 +310,17 @@ async fn tick(
     let prefs = hoard_agent::prefs::Prefs::load_default()
         .map(|(p, _)| p)
         .unwrap_or_default();
-    if check_if_due(&mut ledger, now, &prefs, update::GITHUB_API).await {
+    let channel = Channel::from_prerelease(prefs.prerelease_updates);
+    let forced = updater.take_recheck();
+    if check_if_due(&mut ledger, now, channel, forced, update::GITHUB_API).await {
         let _ = ledger.save();
     }
+    // What the ledger saw on the other channel is no answer on this one.
+    let latest = latest_on(&ledger, channel);
 
     let situation = Situation {
         current: update::current().to_string(),
-        latest: ledger.latest_seen.clone(),
+        latest: latest.clone(),
         staged: ledger.staged.clone(),
         first_seen_at: ledger.first_seen_at,
         unattended,
@@ -314,7 +331,7 @@ async fn tick(
 
     {
         let mut live = updater.lock();
-        live.latest.clone_from(&ledger.latest_seen);
+        live.latest = latest;
         live.staged.clone_from(&ledger.staged);
         live.deadline = ledger.deadline();
         live.mandatory = matches!(stance, Stance::Force { .. });
@@ -444,40 +461,61 @@ async fn tick(
     }
 }
 
-/// Asks GitHub for the newest release on the channel `prefs` name, when a check
-/// is due, and notes the answer in `ledger`. Returns whether the ledger changed.
+/// Asks GitHub for the newest release on `channel`, when a check is due, and
+/// notes the answer in `ledger`. Returns whether the ledger changed.
 ///
-/// Due means: never asked, asked more than [`POLL`] ago, or asked on the other
-/// channel. The last is what makes the switch prompt: a tester who opts in gets
-/// the pre-release on the next cycle (which the client pokes), and one who opts
-/// out stops being offered test builds, without either waiting out the hour. A
-/// cycle that comes back early because a game is open is looking at the brake,
-/// not at the version, and asks nothing.
+/// Due means: a client asked (`forced`, after changing the channel), or the
+/// channel on record is not this one, or the last successful check is more
+/// than [`POLL`] old. Only `forced` skips the [`CHECK_BACKOFF`] after a failed
+/// attempt, so GitHub down never turns into a request a minute. A cycle that
+/// comes back early because a game is open is looking at the brake, not at the
+/// version, and asks nothing.
 ///
 /// Opting out never downgrades: the stable answer replaces the pre-release in
 /// the ledger, and [`auto::decide`] only moves to a version newer than the one
-/// running.
+/// running. Until an answer arrives on the new channel, [`latest_on`] hides the
+/// old one from `decide`, so a failed check cannot install it either.
 async fn check_if_due(
     ledger: &mut Ledger,
     now: OffsetDateTime,
-    prefs: &hoard_agent::prefs::Prefs,
+    channel: Channel,
+    forced: bool,
     api: &str,
 ) -> bool {
-    let channel = Channel::from_prerelease(prefs.prerelease_updates);
-    let due = ledger.channel != channel
-        || ledger
-            .last_check_at
-            .is_none_or(|at| now - at >= time::Duration::seconds(POLL.as_secs() as i64));
+    let elapsed = |at: Option<OffsetDateTime>, gap: Duration| {
+        at.is_none_or(|at| now - at >= time::Duration::seconds(gap.as_secs() as i64))
+    };
+    let wanted = ledger.channel != channel || elapsed(ledger.last_check_at, POLL);
+    let due = forced || (wanted && elapsed(ledger.last_attempt_at, CHECK_BACKOFF));
     if !due {
         return false;
     }
-    match update::fetch_latest_from(api, channel).await {
-        Some(latest) => {
-            ledger.observe(&latest, now);
-            ledger.channel = channel;
-            true
-        }
-        None => false,
+    ledger.last_attempt_at = Some(now);
+    if let Some(latest) = update::fetch_latest_from(api, channel).await {
+        ledger.observe(&latest, now);
+        ledger.channel = channel;
+    } else {
+        tracing::debug!(?channel, "hoardd: the update check failed, backing off");
+    }
+    true
+}
+
+/// The newest version the ledger knows **on `channel`**, or `None` when its
+/// answer came from the other one.
+///
+/// This is what keeps a switch safe whatever the network does. After opting
+/// out, the ledger still holds the pre-release it saw (and may have staged)
+/// until a stable answer replaces it; handed to [`auto::decide`], a staged
+/// `1.2.0-2` above a running `1.2.0-1` would be applied, the opposite of what
+/// the user just asked. Hidden, `decide` sees nothing to do, clients are shown
+/// nothing to apply, and the first successful check on the new channel puts a
+/// real answer back. Masking rather than clearing keeps the rule the same in
+/// both directions and leaves the ledger to the one function that writes it.
+fn latest_on(ledger: &Ledger, channel: Channel) -> Option<String> {
+    if ledger.channel == channel {
+        ledger.latest_seen.clone()
+    } else {
+        None
     }
 }
 
@@ -610,7 +648,6 @@ mod tests {
 
     // ---- the channel, through the cycle's own check and the real policy
 
-    use hoard_agent::prefs::Prefs;
     use hoard_agent::testing::{canned_github, release_json, Asked, LATEST_PATH, LIST_PATH};
 
     /// GitHub with `latest` naming `stable` and the list holding `listed`.
@@ -626,20 +663,19 @@ mod tests {
         .await
     }
 
-    fn prefs(prerelease: bool) -> Prefs {
-        Prefs {
-            prerelease_updates: prerelease,
-            ..Prefs::default()
-        }
-    }
-
-    /// What the cycle decides after checking, for a machine running `current`.
-    fn decide_for(current: &str, ledger: &Ledger, now: OffsetDateTime) -> Stance {
+    /// What the cycle decides after checking on `channel`, for a machine
+    /// running `current`: the tick's own [`latest_on`] and the real policy.
+    fn decide_on(
+        current: &str,
+        ledger: &Ledger,
+        channel: Channel,
+        now: OffsetDateTime,
+    ) -> Stance {
         auto::decide(
             now,
             &Situation {
                 current: current.to_string(),
-                latest: ledger.latest_seen.clone(),
+                latest: latest_on(ledger, channel),
                 staged: ledger.staged.clone(),
                 first_seen_at: ledger.first_seen_at,
                 unattended: true,
@@ -655,11 +691,11 @@ mod tests {
         let now = OffsetDateTime::now_utc();
         let mut ledger = Ledger::default();
 
-        assert!(check_if_due(&mut ledger, now, &prefs(true), &api).await);
+        assert!(check_if_due(&mut ledger, now, Channel::Prerelease, false, &api).await);
         assert_eq!(ledger.latest_seen.as_deref(), Some("1.2.0-2"));
         assert_eq!(ledger.channel, Channel::Prerelease);
         assert_eq!(
-            decide_for("1.2.0-1", &ledger, now),
+            decide_on("1.2.0-1", &ledger, Channel::Prerelease, now),
             Stance::Stage {
                 version: "1.2.0-2".into()
             }
@@ -673,9 +709,9 @@ mod tests {
         let now = OffsetDateTime::now_utc();
         let mut ledger = Ledger::default();
 
-        assert!(check_if_due(&mut ledger, now, &prefs(false), &api).await);
+        assert!(check_if_due(&mut ledger, now, Channel::Stable, false, &api).await);
         assert_eq!(ledger.latest_seen.as_deref(), Some("1.1.7"));
-        assert_eq!(decide_for("1.1.7", &ledger, now), Stance::Idle);
+        assert_eq!(decide_on("1.1.7", &ledger, Channel::Stable, now), Stance::Idle);
         assert_eq!(*asked.lock().unwrap(), vec![LATEST_PATH.to_string()]);
     }
 
@@ -695,23 +731,23 @@ mod tests {
 
         let (api, asked) = github("v1.1.7", &[("v1.2.0-2", true)]).await;
         assert!(
-            check_if_due(&mut ledger, now, &prefs(false), &api).await,
+            check_if_due(&mut ledger, now, Channel::Stable, false, &api).await,
             "switching channel makes the check due at once"
         );
         assert_eq!(*asked.lock().unwrap(), vec![LATEST_PATH.to_string()]);
         assert_eq!(ledger.channel, Channel::Stable);
         assert_eq!(ledger.latest_seen.as_deref(), Some("1.1.7"));
         assert_eq!(
-            decide_for("1.2.0-2", &ledger, now),
+            decide_on("1.2.0-2", &ledger, Channel::Stable, now),
             Stance::Idle,
             "no downgrade"
         );
 
         let later = now + time::Duration::hours(2);
         let (api, _) = github("v1.2.0", &[("v1.2.0", false), ("v1.2.0-2", true)]).await;
-        assert!(check_if_due(&mut ledger, later, &prefs(false), &api).await);
+        assert!(check_if_due(&mut ledger, later, Channel::Stable, false, &api).await);
         assert_eq!(
-            decide_for("1.2.0-2", &ledger, later),
+            decide_on("1.2.0-2", &ledger, Channel::Stable, later),
             Stance::Stage {
                 version: "1.2.0".into()
             }
@@ -729,7 +765,77 @@ mod tests {
             last_check_at: Some(now),
             ..Ledger::default()
         };
-        assert!(!check_if_due(&mut ledger, now, &prefs(false), &api).await);
+        assert!(!check_if_due(&mut ledger, now, Channel::Stable, false, &api).await);
         assert!(asked.lock().unwrap().is_empty());
+    }
+
+    /// Opting out while GitHub fails: the staged pre-release is not applied,
+    /// clients are shown nothing to apply, and the failed check is not retried
+    /// every cycle.
+    #[tokio::test]
+    async fn opting_out_while_github_fails_applies_nothing_and_backs_off() {
+        let now = OffsetDateTime::now_utc();
+        // A tester on 1.2.0-1 with 1.2.0-2 seen, staged, and past its deadline:
+        // on the pre-release channel this is a forced install.
+        let mut ledger = Ledger {
+            latest_seen: Some("1.2.0-2".into()),
+            first_seen_at: Some(now - time::Duration::days(30)),
+            staged: Some("1.2.0-2".into()),
+            last_check_at: Some(now),
+            last_attempt_at: Some(now),
+            channel: Channel::Prerelease,
+            ..Ledger::default()
+        };
+        assert_eq!(
+            decide_on("1.2.0-1", &ledger, Channel::Prerelease, now),
+            Stance::Force {
+                version: "1.2.0-2".into()
+            },
+            "the fixture is one where applying would happen"
+        );
+
+        // Opted out; GitHub has no `latest` to give (404).
+        let (api, asked) = canned_github(vec![]).await;
+        assert!(check_if_due(&mut ledger, now, Channel::Stable, true, &api).await);
+        assert_eq!(asked.lock().unwrap().len(), 1, "the switch asked once");
+        assert_eq!(ledger.channel, Channel::Prerelease, "no answer, no switch on record");
+        assert_eq!(
+            decide_on("1.2.0-1", &ledger, Channel::Stable, now),
+            Stance::Idle,
+            "the stale pre-release must not be applied"
+        );
+        assert_eq!(latest_on(&ledger, Channel::Stable), None, "nor shown to clients");
+
+        // The cycles that follow (every RETRY while something is pending) do not
+        // ask again until the backoff has passed.
+        for minutes in [1, 2, 5, 14] {
+            let t = now + time::Duration::minutes(minutes);
+            assert!(!check_if_due(&mut ledger, t, Channel::Stable, false, &api).await);
+        }
+        assert_eq!(asked.lock().unwrap().len(), 1, "no retry storm");
+        let t = now + time::Duration::minutes(15);
+        assert!(check_if_due(&mut ledger, t, Channel::Stable, false, &api).await);
+        assert_eq!(asked.lock().unwrap().len(), 2, "tried again after the backoff");
+        assert_eq!(decide_on("1.2.0-1", &ledger, Channel::Stable, t), Stance::Idle);
+    }
+
+    /// A stable check that keeps failing is spaced out too, not only a switch.
+    #[tokio::test]
+    async fn a_failing_check_on_the_same_channel_backs_off() {
+        let (api, asked) = canned_github(vec![]).await;
+        let now = OffsetDateTime::now_utc();
+        let mut ledger = Ledger::default();
+        assert!(check_if_due(&mut ledger, now, Channel::Stable, false, &api).await);
+        let soon = now + time::Duration::minutes(1);
+        assert!(!check_if_due(&mut ledger, soon, Channel::Stable, false, &api).await);
+        assert_eq!(asked.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn a_recheck_is_taken_exactly_once() {
+        let u = Updater::new();
+        u.recheck();
+        assert!(u.take_recheck());
+        assert!(!u.take_recheck());
     }
 }

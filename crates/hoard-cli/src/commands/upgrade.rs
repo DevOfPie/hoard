@@ -92,6 +92,16 @@ async fn through_the_service(current: &str, state: UpdateState) -> Result<()> {
         println!("hoard {current} — already up to date.");
         return Ok(());
     }
+    // A service older than the channel switch, or one whose last answer came
+    // from the pre-release channel, can still name a test build. Opted out, it
+    // is not ours to apply.
+    if update::Channel::from_prefs() == update::Channel::Stable
+        && update::parse(&latest).is_some_and(|v| !v.pre.is_empty())
+    {
+        println!("hoard {current} — {latest} is a pre-release and this machine takes full");
+        println!("releases only; the service will offer the next full release when it ships.");
+        return Ok(());
+    }
 
     match state.phase {
         UpdatePhase::Managed => {
