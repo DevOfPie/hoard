@@ -238,6 +238,18 @@ pub struct Prefs {
     /// comes back, axis A comes back with it, and not before.
     #[serde(default = "default_data_saving")]
     pub data_saving: f64,
+
+    /// When `true`, this machine also updates to pre-releases (`1.2.0-1`): test
+    /// builds, published so a tester can stay matched with a demo server that
+    /// runs them (HRD-D-0024). Off by default, and off means exactly the old
+    /// behaviour: GitHub's "latest release", which never names a pre-release.
+    ///
+    /// Turning it off does not downgrade. A machine on `1.2.0-2` stays there
+    /// until a full release newer than it (`1.2.0`) ships. Read on every update
+    /// check (`hoardd::updater`, `hoard upgrade`, the window's own probe), so a
+    /// change needs no restart; see [`crate::update::Channel`].
+    #[serde(default)]
+    pub prerelease_updates: bool,
 }
 
 fn default_true() -> bool {
@@ -296,6 +308,7 @@ impl Default for Prefs {
             cloud_savings_mode: false,
             live_activity_visible: true,
             data_saving: default_data_saving(),
+            prerelease_updates: false,
         }
     }
 }
@@ -471,6 +484,27 @@ mod tests {
         assert!(p.live_activity_visible);
         // Storage-efficiency: "ahorro de datos" defaults to 0.3 (ADR 0018).
         assert_eq!(p.data_saving, 0.3);
+        // 1.2.0-1: full releases only, unless the user opts in (HRD-D-0024).
+        assert!(!p.prerelease_updates);
+    }
+
+    /// A prefs file written before the pre-release switch existed keeps full
+    /// releases only, and the switch survives a round trip once set.
+    #[test]
+    fn prerelease_updates_defaults_off_and_round_trips() {
+        let legacy = r#"{ "close_to_tray": true, "global_sync": true }"#;
+        let parsed: Prefs = serde_json::from_str(legacy).expect("legacy prefs parse");
+        assert!(!parsed.prerelease_updates);
+        assert!(parsed.global_sync, "the other fields survive");
+
+        let on = Prefs {
+            prerelease_updates: true,
+            ..Prefs::default()
+        };
+        let json = serde_json::to_string(&on).expect("serialising prefs");
+        assert!(json.contains("\"prerelease_updates\":true"), "{json}");
+        let back: Prefs = serde_json::from_str(&json).expect("round-trip");
+        assert!(back.prerelease_updates);
     }
 
     /// A prefs file that predates the `autostart` field must not read as "the

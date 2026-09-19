@@ -2,10 +2,12 @@
 //!
 //! Two independent probes:
 //!
-//! - **Client**: hits `https://api.github.com/repos/DevOfPie/hoard/releases/latest`
-//!   and compares the tag to our compile-time `CARGO_PKG_VERSION` by SemVer
-//!   precedence (`hoard_agent::update::is_newer`), so a pre-release such as
-//!   `1.2.0-1` sits below `1.2.0` and above `1.1.7`.
+//! - **Client**: asks GitHub for the newest release on the user's update
+//!   channel (`hoard_agent::update::discover`: the "latest release" by default,
+//!   the highest pre-release or release when they opted in) and compares it to
+//!   our compile-time `CARGO_PKG_VERSION` by SemVer precedence
+//!   (`hoard_agent::update::is_newer`), so a pre-release such as `1.2.0-1` sits
+//!   below `1.2.0` and above `1.1.7`.
 //! - **Server**: hits the user's `<server>/v1/health` (anonymous endpoint)
 //!   to read `version`, then compares against the latest known client
 //!   version. Older servers won't have all the bug fixes the client expects
@@ -50,14 +52,10 @@ pub struct UpdateReport {
     pub server: Option<ComponentUpdate>,
 }
 
-/// GitHub releases API. For `check_for_updates` we only need the tag; for
-/// `apply_desktop_update` we also need to pick the right downloadable asset.
-#[derive(serde::Deserialize)]
-struct GhRelease {
-    tag_name: String,
-    #[serde(default)]
-    assets: Vec<GhAsset>,
-}
+/// A release as discovery returns it. For `check_for_updates` we only need the
+/// tag; for `apply_desktop_update` we also need to pick the right downloadable
+/// asset.
+use hoard_agent::update::Release as GhRelease;
 
 /// The release's files are described by `hoard_agent::install::fetch`: the same
 /// GitHub JSON the terminal reads, and having two structs for it is how two updaters
@@ -71,7 +69,6 @@ struct HealthResp {
 }
 
 const CLIENT_VERSION: &str = env!("CARGO_PKG_VERSION");
-const GH_RELEASES_URL: &str = "https://api.github.com/repos/DevOfPie/hoard/releases/latest";
 const PROBE_TIMEOUT: Duration = Duration::from_secs(8);
 
 /// The result of checking a freshly downloaded installer against the release key.
@@ -254,41 +251,29 @@ async fn probe_server(url: String) -> ComponentUpdate {
 }
 
 async fn fetch_gh_latest() -> Result<String, String> {
-    let client = reqwest::Client::builder()
-        .user_agent(concat!("hoard-desktop/", env!("CARGO_PKG_VERSION")))
-        .timeout(PROBE_TIMEOUT)
-        .build()
-        .map_err(|e| e.to_string())?;
-    let resp = client
-        .get(GH_RELEASES_URL)
-        .header("accept", "application/vnd.github+json")
-        .send()
-        .await
-        .map_err(|e| e.to_string())?
-        .error_for_status()
-        .map_err(|e| e.to_string())?;
-    let release: GhRelease = resp.json().await.map_err(|e| e.to_string())?;
-    Ok(release.tag_name)
+    fetch_gh(PROBE_TIMEOUT).await.map(|r| r.tag_name)
 }
 
 /// A full release fetch, used by `apply_desktop_update` to discover the asset
 /// list at install time (we don't cache it because the user might leave the
 /// app open for days between detection and applying).
 async fn fetch_gh_release() -> Result<GhRelease, String> {
+    fetch_gh(Duration::from_secs(20)).await
+}
+
+/// The newest release on the channel the user chose, read from the prefs now so
+/// the switch in Settings applies to the very next probe. The same discovery the
+/// service and the CLI use, so the window cannot offer a version they would not.
+async fn fetch_gh(timeout: Duration) -> Result<GhRelease, String> {
     let client = reqwest::Client::builder()
         .user_agent(concat!("hoard-desktop/", env!("CARGO_PKG_VERSION")))
-        .timeout(Duration::from_secs(20))
+        .timeout(timeout)
         .build()
         .map_err(|e| e.to_string())?;
-    let resp = client
-        .get(GH_RELEASES_URL)
-        .header("accept", "application/vnd.github+json")
-        .send()
+    let channel = hoard_agent::update::Channel::from_prefs();
+    hoard_agent::update::discover(&client, hoard_agent::update::GITHUB_API, channel)
         .await
-        .map_err(|e| e.to_string())?
-        .error_for_status()
-        .map_err(|e| e.to_string())?;
-    resp.json::<GhRelease>().await.map_err(|e| e.to_string())
+        .map_err(|e| format!("{e:#}"))
 }
 
 async fn fetch_server_health(server_url: &str) -> Result<String, String> {

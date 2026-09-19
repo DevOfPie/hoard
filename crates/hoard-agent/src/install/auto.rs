@@ -249,6 +249,11 @@ pub struct Ledger {
     pub last_error: Option<String>,
     #[serde(default)]
     pub failures: u32,
+    /// The update channel `latest_seen` was fetched on. When the user switches,
+    /// the next cycle checks at once instead of waiting out the hour. A ledger
+    /// from before channels existed reads as stable, which is what it was.
+    #[serde(default)]
+    pub channel: crate::update::Channel,
 }
 
 impl Ledger {

@@ -53,8 +53,14 @@ pub async fn run(version: Option<String>) -> Result<()> {
         return through_the_service(current, state).await;
     }
 
-    println!("hoard {current} — checking for updates…");
-    match update::fetch_latest().await {
+    let channel = update::Channel::from_prefs();
+    match channel {
+        update::Channel::Stable => println!("hoard {current} — checking for updates…"),
+        update::Channel::Prerelease => {
+            println!("hoard {current} — checking for updates (pre-releases included)…")
+        }
+    }
+    match update::fetch_latest(channel).await {
         Some(latest) if update::is_newer(&latest, current) => {
             println!("new version available: {latest}\n");
             install(Some(&latest)).await
@@ -256,9 +262,11 @@ async fn upgrade_desktop_only(manifest: &Manifest, version: Option<&str>) -> Res
     }
     let target = match version {
         Some(v) => v.trim_start_matches('v').to_string(),
-        None => update::fetch_latest().await.ok_or_else(|| {
-            anyhow::anyhow!("couldn't reach GitHub to resolve the latest version")
-        })?,
+        None => update::fetch_latest(update::Channel::from_prefs())
+            .await
+            .ok_or_else(|| {
+                anyhow::anyhow!("couldn't reach GitHub to resolve the latest version")
+            })?,
     };
     crate::commands::install::run(crate::commands::install::Want::Detect, Some(target)).await
 }

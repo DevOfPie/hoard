@@ -40,41 +40,42 @@ pub struct Asset {
     pub url: String,
 }
 
-#[derive(Debug, Deserialize)]
-struct Release {
-    #[serde(default)]
-    assets: Vec<Asset>,
-    #[serde(default)]
-    tag_name: String,
+/// A release's files. `None` as the version means the newest one on the update
+/// channel the user chose ([`crate::update::Channel::from_prefs`]): GitHub's
+/// latest release by default, the highest pre-release or release when they
+/// opted in. `Some(v)` is that exact tag, pre-release or not.
+pub async fn release_assets(version: Option<&str>) -> Result<(String, Vec<Asset>)> {
+    release_assets_from(
+        crate::update::GITHUB_API,
+        version,
+        crate::update::Channel::from_prefs(),
+    )
+    .await
 }
 
-/// A release's files. `None` as the version means the latest published one.
-pub async fn release_assets(version: Option<&str>) -> Result<(String, Vec<Asset>)> {
-    let url = match version {
-        Some(v) => format!(
-            "https://api.github.com/repos/{REPO}/releases/tags/v{}",
-            v.trim_start_matches('v')
-        ),
-        None => format!("https://api.github.com/repos/{REPO}/releases/latest"),
-    };
+/// [`release_assets`] against another API root, on an explicit channel; for
+/// tests.
+pub async fn release_assets_from(
+    api: &str,
+    version: Option<&str>,
+    channel: crate::update::Channel,
+) -> Result<(String, Vec<Asset>)> {
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(30))
         .user_agent(concat!("hoard/", env!("CARGO_PKG_VERSION")))
         .build()?;
-    let resp = client
-        .get(&url)
-        .header("Accept", "application/vnd.github+json")
-        .send()
-        .await
-        .with_context(|| format!("asking GitHub for {url}"))?;
-    if !resp.status().is_success() {
-        bail!(
-            "GitHub answered {} for {url}; the release may not be published yet",
-            resp.status()
-        );
-    }
-    let rel: Release = resp.json().await.context("parsing the release")?;
-    Ok((rel.tag_name.trim_start_matches('v').to_string(), rel.assets))
+    let rel = match version {
+        Some(v) => {
+            let url = format!(
+                "{}/repos/{REPO}/releases/tags/v{}",
+                api.trim_end_matches('/'),
+                v.trim_start_matches('v')
+            );
+            crate::update::get_json(&client, &url).await?
+        }
+        None => crate::update::discover(&client, api, channel).await?,
+    };
+    Ok((rel.version(), rel.assets))
 }
 
 /// The file this delivery route needs.

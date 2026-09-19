@@ -362,6 +362,11 @@ pub enum Request {
     SnoozeUpdate {
         hours: u32,
     },
+    /// The update channel changed (the user opted in or out of pre-releases):
+    /// check GitHub now rather than on the hour. The service re-reads the
+    /// preference itself; the client only says it changed. Answers
+    /// [`Payload::Update`] with the state of the moment; the check runs after.
+    RecheckUpdate,
     /// Take a role on a shared world. `Host` acquires the lease; `View` only
     /// records the role. Answers `Ack`; the outcome arrives as
     /// [`events::AgentEvent::WorldClaimed`] or `WorldHostedElsewhere`.
@@ -482,6 +487,7 @@ impl Request {
             Request::UpdateStatus => "update_status",
             Request::ApplyUpdate { .. } => "apply_update",
             Request::SnoozeUpdate { .. } => "snooze_update",
+            Request::RecheckUpdate => "recheck_update",
             Request::ClaimWorld { .. } => "claim_world",
             Request::DismissWorld { .. } => "dismiss_world",
             Request::ReleaseWorld { .. } => "release_world",
@@ -1765,7 +1771,7 @@ mod tests {
     /// no sample fails the coverage check.
     #[test]
     fn every_request_kind_is_its_serde_tag() {
-        const VARIANTS: usize = 37;
+        const VARIANTS: usize = 38;
         fn index(r: &Request) -> usize {
             match r {
                 Request::Ping => 0,
@@ -1805,6 +1811,7 @@ mod tests {
                 Request::RemoveMember { .. } => 34,
                 Request::DeleteGroup { .. } => 35,
                 Request::ListWorlds { .. } => 36,
+                Request::RecheckUpdate => 37,
             }
         }
 
@@ -1848,6 +1855,7 @@ mod tests {
             Request::UpdateStatus,
             Request::ApplyUpdate { version: None },
             Request::SnoozeUpdate { hours: 2 },
+            Request::RecheckUpdate,
             Request::ClaimWorld {
                 save_id: id(),
                 role: WorldRole::View,
