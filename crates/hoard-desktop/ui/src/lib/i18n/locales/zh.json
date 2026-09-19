@@ -504,6 +504,8 @@
   "settings.about_cloud_line_1": "Hoard {version}，通过 Hoard Cloud 同步存档。",
   "settings.about_cloud_line_2": "服务器由我们来运维。源码与文档见 hoard.services。",
   "settings.about_catalog_credit": "存档路径目录来自 PCGamingWiki（经由 Ludusavi 清单），采用 CC BY-NC-SA 3.0 许可。",
+  "settings.prerelease_updates_label": "预发布版更新",
+  "settings.prerelease_updates_desc": "同时安装预发布版，即可能仍有缺陷的测试版本。关闭后不会降级：你会停留在预发布版，直到更新的正式版发布。",
   "logs.back_to_settings": "返回设置",
   "logs.title": "日志",
   "logs.source_app": "由应用窗口记录",

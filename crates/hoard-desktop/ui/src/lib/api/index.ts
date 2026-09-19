@@ -975,6 +975,11 @@ export type Prefs = {
    *  both the client's min-snapshot-interval and the server's retention policy.
    *  Default 0.3. */
   data_saving: number;
+  /** When `true`, this machine also updates to pre-releases (`1.2.0-1`), test
+   *  builds for staying matched with a demo server that runs them. Off by
+   *  default. Turning it off never downgrades: a pre-release stays until a
+   *  newer full release ships. */
+  prerelease_updates: boolean;
 };
 
 /** The single user-facing operating mode. Mirrors `hoard_agent::prefs::SyncMode`.

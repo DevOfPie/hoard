@@ -47,6 +47,7 @@ export async function hydratePrefs(): Promise<void> {
       cloud_savings_mode: false,
       live_activity_visible: true,
       data_saving: 0.3,
+      prerelease_updates: false,
     });
   }
 }

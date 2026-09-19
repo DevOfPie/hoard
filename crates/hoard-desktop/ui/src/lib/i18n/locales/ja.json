@@ -504,6 +504,8 @@
   "settings.about_cloud_line_1": "Hoard {version}、Hoard Cloud でセーブ同期。",
   "settings.about_cloud_line_2": "サーバーは私たちが運用します。ソース・ドキュメントは hoard.services。",
   "settings.about_catalog_credit": "セーブパスのカタログは Ludusavi マニフェスト経由の PCGamingWiki 提供（CC BY-NC-SA 3.0）。",
+  "settings.prerelease_updates_label": "プレリリース版の更新",
+  "settings.prerelease_updates_desc": "プレリリース版（不具合が残っている可能性のあるテストビルド）もインストールします。オフにしてもダウングレードはされず、より新しい正式版が出るまでプレリリース版のままです。",
   "logs.back_to_settings": "設定へ戻る",
   "logs.title": "ログ",
   "logs.source_app": "アプリのウィンドウが記録",

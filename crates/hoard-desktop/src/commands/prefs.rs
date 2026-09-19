@@ -32,6 +32,9 @@ pub fn get_prefs() -> Result<Prefs, String> {
 /// object so there's nothing to lose, and partial-update semantics tend to
 /// surprise users who edit prefs.json by hand.
 ///
+/// Side-effect: if `prerelease_updates` changed, the service is told to check
+/// for an update now (`Request::RecheckUpdate`).
+///
 /// Side-effect: if `auto_restore` changed, push the new value into the sync
 /// service's engine (`Request::SetAutoRestore`). The engine applies it to its
 /// config and, on a `false → true` flip, kicks an immediate reconciliation
@@ -72,6 +75,17 @@ pub async fn save_prefs(state: State<'_, AppState>, prefs: Prefs) -> Result<Pref
             },
         )
         .await;
+    }
+
+    // The update channel. The service reads the preference itself on every
+    // cycle; this only tells it to run one now, so opting in or out shows up
+    // in seconds rather than within the hour. No prior file means the default,
+    // stable, so only a real change is worth a check.
+    let prerelease_changed = prev.as_ref().map_or(prefs.prerelease_updates, |p| {
+        p.prerelease_updates != prefs.prerelease_updates
+    });
+    if prerelease_changed {
+        push_pref(&state, Request::RecheckUpdate).await;
     }
     Ok(prefs)
 }

@@ -504,6 +504,8 @@
   "settings.about_cloud_line_1": "Hoard {version}, sync com o Hoard Cloud.",
   "settings.about_cloud_line_2": "Nós mantemos o servidor por ti. Código e documentação em hoard.services.",
   "settings.about_catalog_credit": "Catálogo de caminhos de saves do PCGamingWiki através do manifesto do Ludusavi, licenciado CC BY-NC-SA 3.0.",
+  "settings.prerelease_updates_label": "Atualizações de pré-lançamento",
+  "settings.prerelease_updates_desc": "Instalar também versões de pré-lançamento, compilações de teste que ainda podem ter erros. Desativar não volta a uma versão anterior: a versão de pré-lançamento mantém-se até sair uma versão completa mais recente.",
   "logs.back_to_settings": "Voltar às Definições",
   "logs.title": "Registos",
   "logs.source_app": "Registado pela janela da app",

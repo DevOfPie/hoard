@@ -178,6 +178,17 @@ pub async fn reload() -> bool {
     notify("ask the service to reload its watch list", Request::Reload).await
 }
 
+/// The update channel changed on disk (`hoard config set updates.prerelease`),
+/// so have the service check for an update now instead of on the hour. `true`
+/// when a running service took it.
+pub async fn recheck_update() -> bool {
+    notify(
+        "ask the service to check for updates",
+        Request::RecheckUpdate,
+    )
+    .await
+}
+
 /// The on-disk session changed (login or logout), so have the service resolve
 /// from scratch. An account change invalidates its `ApiClient`, its context and
 /// its token rotator, and none of the three is fixed by re-reading the saves.

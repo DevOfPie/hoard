@@ -504,6 +504,8 @@
   "settings.about_cloud_line_1": "Hoard {version}, save sync on Hoard Cloud.",
   "settings.about_cloud_line_2": "We run the server for you. Source code & docs at hoard.services.",
   "settings.about_catalog_credit": "Save-path catalogue from PCGamingWiki via the Ludusavi manifest, licensed CC BY-NC-SA 3.0.",
+  "settings.prerelease_updates_label": "Pre-release updates",
+  "settings.prerelease_updates_desc": "Also install pre-releases, test builds that may still have bugs. Turning this off doesn't downgrade: you stay on the pre-release until a newer full release ships.",
   "logs.back_to_settings": "Back to Settings",
   "logs.title": "Logs",
   "logs.source_app": "Logged by the app window",

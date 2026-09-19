@@ -34,6 +34,7 @@
     ServerCog,
     Gamepad2,
     ZoomIn,
+    FlaskConical,
   } from "@lucide/svelte";
 
   import Card from "../lib/components/Card.svelte";
@@ -542,6 +543,13 @@
         await refreshServiceAutostart();
       } else {
         await updatePrefs({ [field]: value });
+        // The service re-checks on its own (`save_prefs` tells it to); the
+        // window's badge is its own probe, so it asks again on the new channel.
+        if (field === "prerelease_updates") {
+          checkForUpdates().catch((e) =>
+            console.warn("update probe after a channel switch failed:", e),
+          );
+        }
       }
     } catch (e) {
       toastError(typeof e === "string" ? e : (e as Error).message);
@@ -644,6 +652,17 @@
       description: $_("settings.wrapple_telemetry_desc"),
       icon: Clock,
       alarmWhenOff: true,
+    },
+  ]);
+
+  // Opt-in to pre-releases (HRD-D-0024). Lives in About, next to the version it
+  // changes: a tester matched with a demo server that runs test builds.
+  const updateRows: Row[] = $derived([
+    {
+      field: "prerelease_updates",
+      label: $_("settings.prerelease_updates_label"),
+      description: $_("settings.prerelease_updates_desc"),
+      icon: FlaskConical,
     },
   ]);
 
@@ -1595,6 +1614,16 @@
                 {$_("settings.about_catalog_credit")}
               </p>
             </div>
+          </div>
+          <div class="mt-4 border-t border-white/[0.06] pt-4">
+            {#each updateRows as row (row.field)}
+              <SettingsRow
+                {row}
+                value={$prefs[row.field] as boolean}
+                disabled={saving === row.field}
+                onChange={(v) => toggle(row.field, v)}
+              />
+            {/each}
           </div>
         </Card>
       </section>

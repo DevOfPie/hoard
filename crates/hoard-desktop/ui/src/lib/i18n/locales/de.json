@@ -504,6 +504,8 @@
   "settings.about_cloud_line_1": "Hoard {version}, Save-Sync über Hoard Cloud.",
   "settings.about_cloud_line_2": "Wir betreiben den Server für dich. Quellcode & Doku unter hoard.services.",
   "settings.about_catalog_credit": "Speicherpfad-Katalog von PCGamingWiki über das Ludusavi-Manifest, lizenziert unter CC BY-NC-SA 3.0.",
+  "settings.prerelease_updates_label": "Vorabversionen",
+  "settings.prerelease_updates_desc": "Auch Vorabversionen installieren, also Testversionen, die noch Fehler enthalten können. Ausschalten führt kein Downgrade durch: Du bleibst auf der Vorabversion, bis eine neuere vollständige Version erscheint.",
   "logs.back_to_settings": "Zurück zu Einstellungen",
   "logs.title": "Protokolle",
   "logs.source_app": "Vom App-Fenster protokolliert",

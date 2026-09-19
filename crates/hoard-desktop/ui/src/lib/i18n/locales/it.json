@@ -504,6 +504,8 @@
   "settings.about_cloud_line_1": "Hoard {version}, sync con Hoard Cloud.",
   "settings.about_cloud_line_2": "Il server lo gestiamo noi. Codice e doc su hoard.services.",
   "settings.about_catalog_credit": "Catalogo dei percorsi di salvataggio da PCGamingWiki tramite il manifest di Ludusavi, con licenza CC BY-NC-SA 3.0.",
+  "settings.prerelease_updates_label": "Aggiornamenti preliminari",
+  "settings.prerelease_updates_desc": "Installa anche le versioni preliminari, build di prova che possono ancora contenere bug. Disattivarlo non torna a una versione precedente: resti sulla versione preliminare finché non esce una versione completa più recente.",
   "logs.back_to_settings": "Torna alle Impostazioni",
   "logs.title": "Log",
   "logs.source_app": "Registrato dalla finestra dell'app",
