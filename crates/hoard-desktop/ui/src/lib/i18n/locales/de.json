@@ -619,6 +619,7 @@
   "updates.error.signature_invalid": "Die Signatur des Updates konnte nicht überprüft werden, daher wurde es nicht installiert. Das kann auf einen manipulierten Download hindeuten. Versuche es erneut und lade Hoard andernfalls von der offiziellen Seite.",
   "updates.error.launch_failed": "Der Installer konnte nicht gestartet werden.",
   "updates.error.unknown": "Beim Update ist ein unerwarteter Fehler aufgetreten.",
+  "updates.error.not_newer": "Es gibt keine neuere Version zum Installieren: Die aktuelle Version ist nicht neuer als die, die du verwendest. Es wurde nichts geändert.",
   "updates.error.server_unknown": "Beim Aktualisieren des Servers ist ein unerwarteter Fehler aufgetreten.",
   "updates.error.server_pkexec_failed": "Privilegien für das Server-Update konnten nicht erhöht werden.",
   "updates.error.server_not_logged_in": "Melde dich zuerst an deinem Server an.",

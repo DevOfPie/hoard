@@ -619,6 +619,7 @@
   "updates.error.signature_invalid": "Non è stato possibile verificare la firma dell'aggiornamento, quindi non è stato installato. Può indicare un download manomesso: riprova e, se persiste, scarica Hoard dal sito ufficiale.",
   "updates.error.launch_failed": "Non è stato possibile avviare l'installer.",
   "updates.error.unknown": "Si è verificato un errore inatteso durante l'aggiornamento.",
+  "updates.error.not_newer": "Non c'è una versione più recente da installare: la versione attuale non è più nuova di quella in uso. Non è stato modificato nulla.",
   "updates.error.server_unknown": "Si è verificato un errore inatteso durante l'aggiornamento del server.",
   "updates.error.server_pkexec_failed": "Non è stato possibile elevare i privilegi per aggiornare il server.",
   "updates.error.server_not_logged_in": "Accedi prima al tuo server.",

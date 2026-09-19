@@ -639,6 +639,7 @@
   "updates.error.signature_invalid": "The update's signature didn't verify, so it wasn't installed. This can mean a tampered download. Try again, and if it keeps failing, get Hoard from the official site.",
   "updates.error.launch_failed": "The installer couldn't be launched.",
   "updates.error.unknown": "An unexpected error occurred during the update.",
+  "updates.error.not_newer": "There is no newer version to install: the current release isn't newer than the one you're running. Nothing was changed.",
   "updates.error.server_unknown": "An unexpected error occurred while upgrading the server.",
   "updates.error.server_pkexec_failed": "Could not elevate privileges to upgrade the server.",
   "updates.error.server_not_logged_in": "Sign in to your server first.",

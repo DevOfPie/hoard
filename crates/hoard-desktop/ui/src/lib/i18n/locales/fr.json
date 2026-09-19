@@ -619,6 +619,7 @@
   "updates.error.signature_invalid": "La signature de la mise à jour n'a pas pu être vérifiée, elle n'a donc pas été installée. Cela peut indiquer un téléchargement altéré : réessaie, et si le problème persiste, télécharge Hoard depuis le site officiel.",
   "updates.error.launch_failed": "Impossible de lancer l'installeur.",
   "updates.error.unknown": "Une erreur inattendue s'est produite pendant la mise à jour.",
+  "updates.error.not_newer": "Aucune version plus récente à installer : la version actuelle n'est pas plus récente que celle que vous utilisez. Rien n'a été modifié.",
   "updates.error.server_unknown": "Une erreur inattendue s'est produite lors de la mise à jour du serveur.",
   "updates.error.server_pkexec_failed": "Impossible d'élever les privilèges pour mettre à jour le serveur.",
   "updates.error.server_not_logged_in": "Connectez-vous d'abord à votre serveur.",

@@ -318,6 +318,42 @@ pub enum ApplyOutcome {
     Superseded { latest: String },
 }
 
+/// What to do with the release fetched at confirm time.
+#[derive(Debug, PartialEq, Eq)]
+enum Verdict {
+    /// Newer than this build, and the version the user agreed to.
+    Install,
+    /// Newer than this build, but not the version the modal showed: re-offer.
+    Superseded,
+    /// Not newer than this build. Installing it would be a downgrade or a
+    /// reinstall; this happens after opting out of pre-releases with a badge
+    /// still showing one.
+    NotNewer,
+}
+
+/// Pure so it can be tested without Tauri. `expected` is the version the modal
+/// showed; `None` from an older UI means "whatever is newest", which is still
+/// never older than what runs.
+fn install_verdict(fetched: &str, current: &str, expected: Option<&str>) -> Verdict {
+    if !is_newer(fetched, current) {
+        return Verdict::NotNewer;
+    }
+    let agreed = expected.is_none_or(|e| {
+        matches!(
+            (
+                hoard_agent::update::parse(fetched),
+                hoard_agent::update::parse(e),
+            ),
+            (Some(a), Some(b)) if a.cmp_precedence(&b).is_eq()
+        )
+    });
+    if agreed {
+        Verdict::Install
+    } else {
+        Verdict::Superseded
+    }
+}
+
 /// Tauri command. Downloads the right release asset for this OS and tries to
 /// launch the platform installer.
 ///
@@ -338,19 +374,32 @@ pub async fn apply_desktop_update(
     })?;
     let version = release.tag_name.trim_start_matches('v').to_string();
 
-    // Re-check at confirm time: if a newer release landed since the modal was
-    // painted (the badge can be up to 30 min stale, or the user sat on the
-    // dialog), don't silently install the version they *saw*: bail and tell
-    // the UI to re-offer the now-latest one. `is_newer` is strict, so this
-    // only triggers on a genuinely newer tag, not on an equal re-check.
-    if let Some(expected) = expected_version {
-        if is_newer(&version, &expected) {
+    // Re-check at confirm time against what is running and what the modal
+    // showed. The badge can be stale (up to 30 min, or longer if the user sat
+    // on the dialog, or switched the update channel in between), so the release
+    // fetched now is installed only when it is both newer than this build and
+    // the one the user agreed to.
+    match install_verdict(&version, CLIENT_VERSION, expected_version.as_deref()) {
+        Verdict::Install => {}
+        Verdict::Superseded => {
             tracing::info!(
-                expected = %expected,
+                expected = ?expected_version,
                 latest = %version,
-                "apply_desktop_update: newer release appeared, aborting stale install"
+                "apply_desktop_update: a different release is current now, aborting stale install"
             );
             return Ok(ApplyOutcome::Superseded { latest: version });
+        }
+        Verdict::NotNewer => {
+            tracing::info!(
+                current = CLIENT_VERSION,
+                latest = %version,
+                "apply_desktop_update: the current release is not newer than this build, refusing"
+            );
+            return Err(
+                AppError::new("updates.error.title", "updates.error.not_newer").with_detail(
+                    format!("running v{CLIENT_VERSION}, the current release is v{version}"),
+                ),
+            );
         }
     }
 
@@ -1050,5 +1099,21 @@ mod tests {
     fn unparseable_is_never_newer() {
         assert!(!is_newer("garbage", "1.2.0"));
         assert!(!is_newer("1.3.0", "?"));
+    }
+
+    #[test]
+    fn installs_only_the_newer_release_the_user_agreed_to() {
+        assert_eq!(install_verdict("1.2.0", "1.2.0-1", Some("1.2.0")), Verdict::Install);
+        assert_eq!(install_verdict("v1.2.0", "1.2.0-1", Some("1.2.0")), Verdict::Install);
+        assert_eq!(install_verdict("1.2.0", "1.2.0-1", None), Verdict::Install);
+        // A newer one landed since the modal opened.
+        assert_eq!(install_verdict("1.2.1", "1.2.0-1", Some("1.2.0")), Verdict::Superseded);
+        // Opted out with a stale badge: stable is older than what runs.
+        assert_eq!(install_verdict("1.1.7", "1.2.0-1", Some("1.2.0-2")), Verdict::NotNewer);
+        assert_eq!(install_verdict("1.1.7", "1.2.0-1", None), Verdict::NotNewer);
+        // Same version: a reinstall, not an update.
+        assert_eq!(install_verdict("1.2.0-1", "1.2.0-1", Some("1.2.0-1")), Verdict::NotNewer);
+        // Newer than this build but older than what the modal promised.
+        assert_eq!(install_verdict("1.2.0-2", "1.2.0-1", Some("1.2.0")), Verdict::Superseded);
     }
 }

@@ -619,6 +619,7 @@
   "updates.error.signature_invalid": "更新の署名を検証できなかったため、インストールしませんでした。ダウンロードが改ざんされている可能性があります。もう一度お試しいただき、それでも失敗する場合は公式サイトから Hoard を入手してください。",
   "updates.error.launch_failed": "インストーラーを起動できませんでした。",
   "updates.error.unknown": "更新中に予期しないエラーが発生しました。",
+  "updates.error.not_newer": "インストールできる新しいバージョンはありません。現在のリリースは使用中のバージョンより新しくありません。何も変更していません。",
   "updates.error.server_unknown": "サーバーの更新中に予期しないエラーが発生しました。",
   "updates.error.server_pkexec_failed": "サーバーを更新するための権限を昇格できませんでした。",
   "updates.error.server_not_logged_in": "先にサーバーにログインしてください。",
