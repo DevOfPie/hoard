@@ -32,10 +32,18 @@ const REPO: &str = "DevOfPie/hoard";
 /// point it at a canned server; production always passes this.
 pub const GITHUB_API: &str = "https://api.github.com";
 
-/// How many releases the pre-release channel looks at. One page, newest first:
-/// the highest version is always among the most recent ones, and a second
-/// request would double the rate-limit cost of every check.
-const LISTED: u32 = 30;
+/// How many releases the pre-release channel looks at: one page, newest first.
+///
+/// Ten, because the page carries every release's asset list, about 100 KB a
+/// release at 48 assets: thirty was ~3 MB an hour per opted-in machine and
+/// could outrun the 8 s timeout on a slow link, which fails silently. Ten is
+/// ~1 MB. It still holds the highest version: GitHub lists by creation date,
+/// a release line ships its pre-releases and then its full release, so the
+/// newest full release and every pre-release above it are among the last few
+/// published. It takes ten releases (a `1.1.x` patch published after the
+/// `1.2.0` pre-releases counts as one) created after the highest to push it off
+/// the page, and "highest SemVer wins" is kept among what is on it.
+const LISTED: u32 = 10;
 
 /// How long a cached "latest version" answer is trusted before we re-check. Keeps
 /// the status panel instant on repeated `hoard` runs and stays well under

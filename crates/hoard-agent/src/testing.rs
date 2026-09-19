@@ -77,4 +77,4 @@ pub fn release_json(tag: &str, prerelease: bool, draft: bool) -> serde_json::Val
 /// The path the stable channel asks.
 pub const LATEST_PATH: &str = "/repos/DevOfPie/hoard/releases/latest";
 /// The path the pre-release channel asks.
-pub const LIST_PATH: &str = "/repos/DevOfPie/hoard/releases?per_page=30";
+pub const LIST_PATH: &str = "/repos/DevOfPie/hoard/releases?per_page=10";
