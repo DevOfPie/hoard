@@ -229,9 +229,10 @@ async fn probe_client() -> ComponentUpdate {
 /// (`hoard-server upgrade` has no pre-release channel), so it is compared with
 /// the newest **stable** release, not with this client: on a client that
 /// follows pre-releases the old comparison lit the badge for an upgrade the
-/// server could never take. The stable answer comes through the shared
-/// update-check cache (six hours), so this adds at most one GitHub request per
-/// six hours, and none on a client whose own probe already asked on stable.
+/// server could never take. The stable answer comes from the CLI's on-disk
+/// update-check cache (six hours), which this refills when it is stale; the
+/// window's own probe neither reads nor writes that cache. So the badge costs
+/// at most one extra GitHub request per six hours.
 async fn probe_server(url: String) -> ComponentUpdate {
     let (health, newest_stable) = tokio::join!(
         fetch_server_health(&url),
